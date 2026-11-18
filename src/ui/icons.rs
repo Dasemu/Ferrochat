@@ -1,0 +1,141 @@
+//! Lucide icons (ISC licence, see assets/icons/LICENSE), embedded with
+//! `include_bytes!`. Generated from the files in `assets/icons/`.
+
+use iced::widget::svg;
+
+/// Every icon the UI uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Icon {
+    /// `archive`
+    Archive,
+    /// `arrow-left`
+    ArrowLeft,
+    /// `bell-off`
+    BellOff,
+    /// `check-check`
+    CheckCheck,
+    /// `check`
+    Check,
+    /// `chevron-down`
+    ChevronDown,
+    /// `circle-alert`
+    CircleAlert,
+    /// `circle-dashed`
+    CircleDashed,
+    /// `clock`
+    Clock,
+    /// `download`
+    Download,
+    /// `ellipsis-vertical`
+    EllipsisVertical,
+    /// `file-text`
+    FileText,
+    /// `image`
+    Image,
+    /// `laptop`
+    Laptop,
+    /// `list-filter`
+    ListFilter,
+    /// `lock`
+    Lock,
+    /// `log-out`
+    LogOut,
+    /// `message-circle`
+    MessageCircle,
+    /// `message-square-plus`
+    MessageSquarePlus,
+    /// `mic`
+    Mic,
+    /// `paperclip`
+    Paperclip,
+    /// `pause`
+    Pause,
+    /// `phone`
+    Phone,
+    /// `pin`
+    Pin,
+    /// `play`
+    Play,
+    /// `plus`
+    Plus,
+    /// `refresh-cw`
+    RefreshCw,
+    /// `search`
+    Search,
+    /// `send-horizontal`
+    SendHorizontal,
+    /// `settings`
+    Settings,
+    /// `smile`
+    Smile,
+    /// `square`
+    Square,
+    /// `star`
+    Star,
+    /// `trash-2`
+    Trash2,
+    /// `user`
+    User,
+    /// `users-round`
+    UsersRound,
+    /// `users`
+    Users,
+    /// `video`
+    Video,
+    /// `wifi-off`
+    WifiOff,
+    /// `x`
+    X,
+}
+
+impl Icon {
+    fn bytes(self) -> &'static [u8] {
+        match self {
+            Icon::Archive => include_bytes!("../../assets/icons/archive.svg"),
+            Icon::ArrowLeft => include_bytes!("../../assets/icons/arrow-left.svg"),
+            Icon::BellOff => include_bytes!("../../assets/icons/bell-off.svg"),
+            Icon::CheckCheck => include_bytes!("../../assets/icons/check-check.svg"),
+            Icon::Check => include_bytes!("../../assets/icons/check.svg"),
+            Icon::ChevronDown => include_bytes!("../../assets/icons/chevron-down.svg"),
+            Icon::CircleAlert => include_bytes!("../../assets/icons/circle-alert.svg"),
+            Icon::CircleDashed => include_bytes!("../../assets/icons/circle-dashed.svg"),
+            Icon::Clock => include_bytes!("../../assets/icons/clock.svg"),
+            Icon::Download => include_bytes!("../../assets/icons/download.svg"),
+            Icon::EllipsisVertical => include_bytes!("../../assets/icons/ellipsis-vertical.svg"),
+            Icon::FileText => include_bytes!("../../assets/icons/file-text.svg"),
+            Icon::Image => include_bytes!("../../assets/icons/image.svg"),
+            Icon::Laptop => include_bytes!("../../assets/icons/laptop.svg"),
+            Icon::ListFilter => include_bytes!("../../assets/icons/list-filter.svg"),
+            Icon::Lock => include_bytes!("../../assets/icons/lock.svg"),
+            Icon::LogOut => include_bytes!("../../assets/icons/log-out.svg"),
+            Icon::MessageCircle => include_bytes!("../../assets/icons/message-circle.svg"),
+            Icon::MessageSquarePlus => include_bytes!("../../assets/icons/message-square-plus.svg"),
+            Icon::Mic => include_bytes!("../../assets/icons/mic.svg"),
+            Icon::Paperclip => include_bytes!("../../assets/icons/paperclip.svg"),
+            Icon::Pause => include_bytes!("../../assets/icons/pause.svg"),
+            Icon::Phone => include_bytes!("../../assets/icons/phone.svg"),
+            Icon::Pin => include_bytes!("../../assets/icons/pin.svg"),
+            Icon::Play => include_bytes!("../../assets/icons/play.svg"),
+            Icon::Plus => include_bytes!("../../assets/icons/plus.svg"),
+            Icon::RefreshCw => include_bytes!("../../assets/icons/refresh-cw.svg"),
+            Icon::Search => include_bytes!("../../assets/icons/search.svg"),
+            Icon::SendHorizontal => include_bytes!("../../assets/icons/send-horizontal.svg"),
+            Icon::Settings => include_bytes!("../../assets/icons/settings.svg"),
+            Icon::Smile => include_bytes!("../../assets/icons/smile.svg"),
+            Icon::Square => include_bytes!("../../assets/icons/square.svg"),
+            Icon::Star => include_bytes!("../../assets/icons/star.svg"),
+            Icon::Trash2 => include_bytes!("../../assets/icons/trash-2.svg"),
+            Icon::User => include_bytes!("../../assets/icons/user.svg"),
+            Icon::UsersRound => include_bytes!("../../assets/icons/users-round.svg"),
+            Icon::Users => include_bytes!("../../assets/icons/users.svg"),
+            Icon::Video => include_bytes!("../../assets/icons/video.svg"),
+            Icon::WifiOff => include_bytes!("../../assets/icons/wifi-off.svg"),
+            Icon::X => include_bytes!("../../assets/icons/x.svg"),
+        }
+    }
+
+    /// An svg handle; iced caches the rasterisation by content hash.
+    pub fn handle(self) -> svg::Handle {
+        svg::Handle::from_memory(self.bytes())
+    }
+}
