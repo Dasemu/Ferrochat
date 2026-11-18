@@ -241,3 +241,62 @@ pub struct FerroTheme { pub palette: Palette, pub metrics: Metrics, pub dark: bo
 * Protocol client design and library choice → `docs/protocol.md`.
 * Screens and navigation map.
 * Palette table.
+
+### 11.1 Ferrochat: extra modules
+
+Two small modules sit next to the shared layout; neither imports `iced`
+widgets or `ui`:
+
+| Module | Purpose |
+|---|---|
+| `src/media/` | Ogg/Opus voice notes (decode, encode, waveform), `rodio` playback thread, `cpal` microphone capture, JPEG thumbnails, the byte-budgeted `ByteLru`. |
+| `src/notify.rs` | Desktop notifications (`notify-rust`), opening files with `xdg-open`, file-name sanitising. |
+
+`src/net/` contains `types.rs` (domain types), `convert.rs` (pure protobuf ↔
+domain conversion), `whatsapp.rs` (live `whatsapp-rust` client) and
+`fake.rs` (scripted fake used by `--mock`, screenshots and integration
+tests). The app only sees the `WaClient` trait and the `net::Event` stream.
+
+### 11.2 Screens and navigation
+
+```
+             ┌─────────────── no session / unlinked ───────────────┐
+             ▼                                                     │
+  Login (QR pairing) ── PairSuccess ──▶ Main ── Log out / revoked ─┘
+   │  QR rotates every ~20 s                │
+   │  "Click to reload QR code" when        ├─ Rail (Chats active; Status /
+   │   the server stops rotating            │   Communities / Settings shown disabled)
+   └─ keyring / pairing errors inline       ├─ Chat list: header (new chat, ⋮ menu → Log out),
+                                            │   search, chips (All / Unread / Favourites / Groups),
+                                            │   connection + sync banners, rows
+                                            └─ Conversation: header, E2E notice, day chips,
+                                                bubbles (text / image / document / voice),
+                                                emoji panel, composer (+, 😊, text, mic ↔ send),
+                                                image viewer overlay
+```
+
+Keyboard: `Enter` sends, `Esc` closes overlays, then the open chat.
+
+### 11.3 Palette (dark, default)
+
+| Token | Hex | Used for |
+|---|---|---|
+| `bg_app` | `#0c1317` | Window / login background |
+| `bg_sidebar` | `#111b21` | Chat list, login card |
+| `bg_panel` | `#0b141a` | Conversation background (plain, no doodle pattern) |
+| `bg_elevated` | `#202c33` | Headers, composer bar, menus |
+| `bg_selected` | `#2a3942` | Selected row, composer field |
+| `text_primary` | `#e9edef` | Main text |
+| `text_secondary` | `#8696a0` | Previews, timestamps, icons |
+| `accent` / `badge` | `#00a884` | Unread badge, send button, unread time |
+| `bubble_out` | `#005c4b` | Outgoing bubble |
+| `bubble_in` | `#202c33` | Incoming bubble |
+| `success` | `#53bdeb` | Read ticks (blue) |
+| `system_chip` | `#182229` | Day separators, E2E notice |
+| `notice_text` | `#ffd279` | E2E notice text, banners |
+| `chip_active` | `#0a332c` | Active filter chip (text `#00a884`) |
+
+Metrics: rail 64 px, chat list 420 px, rows 72 px, avatars 49 px (40 px in
+the header), header 59 px, bubbles max 520 px with 7.5 px radius and an
+8×13 px canvas-drawn tail on the first bubble of each group. Typography:
+Inter 400/500/600; emoji from the system Noto Color Emoji.
