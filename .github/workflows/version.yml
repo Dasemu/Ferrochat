@@ -1,0 +1,53 @@
+name: Version bump
+
+# push to development        -> PATCH + 1
+# merged development -> main -> MINOR + 1, PATCH = 0
+# direct push to main        -> PATCH + 1
+# The version lives in Cargo.toml. Pushes made with GITHUB_TOKEN do not
+# retrigger workflows; we also skip commits starting with "chore(release)".
+
+on:
+  push:
+    branches: [main, development]
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    if: ${{ !startsWith(github.event.head_commit.message, 'chore(release)') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Decide bump kind
+        id: kind
+        run: |
+          msg="$(git log -1 --pretty=%B)"
+          if [ "${GITHUB_REF_NAME}" = "main" ] && echo "$msg" | grep -qE "^Merge pull request .* from [^ ]+/development"; then
+            echo "kind=minor" >> "$GITHUB_OUTPUT"
+          else
+            echo "kind=patch" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Bump Cargo.toml
+        id: bump
+        run: |
+          cur=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+          IFS=. read -r major minor patch <<< "$cur"
+          if [ "${{ steps.kind.outputs.kind }}" = "minor" ]; then
+            minor=$((minor + 1)); patch=0
+          else
+            patch=$((patch + 1))
+          fi
+          new="$major.$minor.$patch"
+          sed -i "0,/^version = \".*\"/s//version = \"$new\"/" Cargo.toml
+          sed -i "/^name = \"ferrochat\"/{n;s/^version = \".*\"/version = \"$new\"/}" Cargo.lock || true
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+      - name: Commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock
+          git commit -m "chore(release): v${{ steps.bump.outputs.new }}"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
