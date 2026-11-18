@@ -190,7 +190,16 @@ impl EventHandler for Forwarder {
     }
 }
 
-async fn open_store(path: &Path, key_hex: String) -> Result<SqliteStore> {
+/// Opens the SQLCipher-encrypted session store with a hex raw key.
+pub async fn open_store(path: &Path, key_hex: String) -> Result<SqliteStore> {
+    if path.exists() {
+        // Fail fast on a wrong key: the library's pool would otherwise keep
+        // retrying the connection for its full timeout.
+        let (p, k) = (path.to_path_buf(), key_hex.clone());
+        tokio::task::spawn_blocking(move || verify_key(&p, &k))
+            .await
+            .map_err(|_| Error::Cancelled)??;
+    }
     let url = path.to_string_lossy().to_string();
     let config = SqliteStoreConfig::default().with_connection_init(move |conn| {
         // Raw-key form: no PBKDF2 at every open, the key is already 256 random bits.
@@ -202,6 +211,16 @@ async fn open_store(path: &Path, key_hex: String) -> Result<SqliteStore> {
     SqliteStore::with_config(&url, config)
         .await
         .map_err(|e| Error::Auth(format!("cannot open session store: {e}")))
+}
+
+fn verify_key(path: &Path, key_hex: &str) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map_err(|_| Error::Auth("session store key mismatch".into()))?;
+    Ok(())
 }
 
 /// Starts the live client and returns its event stream. The first event is
