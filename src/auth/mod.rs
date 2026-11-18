@@ -6,11 +6,12 @@
 pub mod secrets;
 
 /// Where the login flow is.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum AuthState {
     /// A stored session exists; connecting with it.
     Restoring,
     /// Not paired yet; waiting for the first QR code from the server.
+    #[default]
     WaitingForQr,
     /// A QR code is on screen. `generation` increments on every refresh.
     ShowingQr {
@@ -76,12 +77,6 @@ pub enum AuthEvent {
     LoggedOut(String),
     /// Unrecoverable setup failure.
     Fatal(String),
-}
-
-impl Default for AuthState {
-    fn default() -> Self {
-        Self::WaitingForQr
-    }
 }
 
 impl AuthState {

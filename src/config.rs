@@ -160,6 +160,20 @@ impl Config {
     }
 }
 
+/// Opens `<state_dir>/log`, rotating it to `log.1` when over 5 MB.
+pub fn open_log_file(state_dir: &std::path::Path) -> Option<std::fs::File> {
+    std::fs::create_dir_all(state_dir).ok()?;
+    let path = state_dir.join("log");
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
+        let _ = std::fs::rename(&path, state_dir.join("log.1"));
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

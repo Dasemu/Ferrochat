@@ -59,6 +59,9 @@ pub trait WaClient: Send + Sync {
     ) -> BoxFuture<'a, Result<()>>;
     /// Unlinks this device, disconnects and deletes the session store.
     fn logout(&self) -> BoxFuture<'_, Result<()>>;
+    /// `--mock` only: pretend the phone scanned the QR code. The live client
+    /// ignores it.
+    fn simulate_scan(&self) {}
 }
 
 /// Connection state shown in the banner.

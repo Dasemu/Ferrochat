@@ -113,7 +113,7 @@ impl FakeClient {
     }
 
     /// Simulates the phone scanning the QR code (tests / mock login).
-    pub fn simulate_scan(&self) {
+    pub fn scan(&self) {
         let _ = self.tx.send(Event::PairSuccess {
             jid: self.own_jid.clone(),
         });
@@ -297,6 +297,10 @@ impl WaClient for FakeClient {
             });
             Ok(())
         })
+    }
+
+    fn simulate_scan(&self) {
+        self.scan();
     }
 
     fn logout(&self) -> BoxFuture<'_, Result<()>> {
