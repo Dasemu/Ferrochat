@@ -59,3 +59,10 @@ codegen-units = 4
 strip = "symbols"
 panic = "unwind"
 
+
+# Keep debug builds small (test binaries with full debuginfo add up fast).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
