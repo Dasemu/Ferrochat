@@ -1,0 +1,95 @@
+//! Media helpers: voice notes (Ogg/Opus), image thumbnails and the
+//! byte-budgeted media cache. No UI types here.
+
+pub mod audio;
+pub mod image;
+
+use std::hash::Hash;
+
+/// LRU cache bounded by total bytes (architecture §3: decoded images live in
+/// an LRU with a byte budget, default 48 MB).
+pub struct ByteLru<K: Hash + Eq, V> {
+    inner: lru::LruCache<K, (V, usize)>,
+    bytes: usize,
+    budget: usize,
+}
+
+impl<K: Hash + Eq, V> ByteLru<K, V> {
+    /// Empty cache with a byte budget.
+    pub fn new(budget: usize) -> Self {
+        Self {
+            inner: lru::LruCache::unbounded(),
+            bytes: 0,
+            budget,
+        }
+    }
+
+    /// Inserts `value` of `size` bytes, evicting least-recently-used entries.
+    pub fn put(&mut self, key: K, value: V, size: usize) {
+        if let Some((_, old)) = self.inner.put(key, (value, size)) {
+            self.bytes -= old;
+        }
+        self.bytes += size;
+        while self.bytes > self.budget && self.inner.len() > 1 {
+            if let Some((_, (_, s))) = self.inner.pop_lru() {
+                self.bytes -= s;
+            }
+        }
+    }
+
+    /// Looks up and marks as recently used.
+    pub fn get(&mut self, key: &K) -> Option<&V> {
+        self.inner.get(key).map(|(v, _)| v)
+    }
+
+    /// Looks up without touching recency (usable from `&self` views).
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        self.inner.peek(key).map(|(v, _)| v)
+    }
+
+    /// True if present.
+    pub fn contains(&self, key: &K) -> bool {
+        self.inner.contains(key)
+    }
+
+    /// Bytes currently held.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// True when empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Drops everything.
+    pub fn clear(&mut self) {
+        self.inner.clear();
+        self.bytes = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn evicts_by_bytes() {
+        let mut c = ByteLru::new(100);
+        c.put("a", 1, 40);
+        c.put("b", 2, 40);
+        assert_eq!(c.get(&"a"), Some(&1)); // a is now most recent
+        c.put("c", 3, 40);
+        assert!(c.contains(&"a"));
+        assert!(!c.contains(&"b"));
+        assert_eq!(c.bytes(), 80);
+        c.put("a", 9, 10);
+        assert_eq!(c.bytes(), 50);
+        assert_eq!(c.peek(&"a"), Some(&9));
+    }
+}
