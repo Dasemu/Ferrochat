@@ -34,6 +34,12 @@ fn init_logging(cfg: &Config) {
 }
 
 fn main() -> iced::Result {
+    // Default to the CPU renderer: in measurements it idles at ~43 MB RSS
+    // versus ~177 MB for wgpu (software Vulkan); ICED_BACKEND=wgpu opts in.
+    if std::env::var_os("ICED_BACKEND").is_none() {
+        // SAFETY: single-threaded at this point, before any thread is spawned.
+        unsafe { std::env::set_var("ICED_BACKEND", "tiny-skia") };
+    }
     let cfg = match Config::from_args(std::env::args().skip(1)) {
         Cli::Run(cfg) => *cfg,
         Cli::Help => {
