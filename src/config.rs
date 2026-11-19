@@ -25,6 +25,8 @@ pub enum ScreenshotTarget {
     ListSearch,
     /// Conversation with the "delete message" dialog.
     Delete,
+    /// Settings page (background / tray toggles).
+    Settings,
 }
 
 impl ScreenshotTarget {
@@ -38,6 +40,7 @@ impl ScreenshotTarget {
             "chat-search" => Some(Self::ChatSearch),
             "list-search" => Some(Self::ListSearch),
             "delete" => Some(Self::Delete),
+            "settings" => Some(Self::Settings),
             _ => None,
         }
     }
@@ -59,6 +62,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// `$XDG_STATE_HOME/ferrochat`: log file.
     pub state_dir: PathBuf,
+    /// `$XDG_CONFIG_HOME/ferrochat`: `settings.json`.
+    pub config_dir: PathBuf,
     /// `$XDG_CACHE_HOME/ferrochat`: profile pictures and videos opened in the
     /// system player. Disposable and size-bounded.
     pub cache_dir: PathBuf,
@@ -66,6 +71,8 @@ pub struct Config {
     pub downloads_dir: PathBuf,
     /// Run against the in-process fake protocol with mock data.
     pub mock: bool,
+    /// Start with no window, only the tray icon (`--minimized`).
+    pub minimized: bool,
     /// Render one screen to a PNG and exit.
     pub screenshot: Option<(ScreenshotTarget, PathBuf)>,
     /// Light theme instead of the default dark one.
@@ -92,10 +99,11 @@ pub const USAGE: &str = "\
 ferrochat - unofficial native WhatsApp desktop client
 
 USAGE:
-    ferrochat [--mock] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete> <out.png>]
+    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings> <out.png>]
 
 OPTIONS:
     --mock                      Run with mock data and a fake protocol (no network)
+    --minimized                 Start in the system tray without opening the window
     --screenshot <screen> <png> Render a screen (implies --mock), save it and exit
     -h, --help                  Show this help
 
@@ -104,6 +112,7 @@ ENVIRONMENT:
     FERRO_THEME=light|dark      Colour scheme (default: dark)
     FERRO_TRACE_STARTUP=1       Log first_frame_ms
     FERROCHAT_DATA_DIR          Override the data directory
+    FERROCHAT_CONFIG_DIR        Override the settings directory
     FERROCHAT_CACHE_DIR         Override the cache directory (avatars, videos)
     FERROCHAT_NOTIFY=sender     Notifications show the sender only
 ";
@@ -112,11 +121,13 @@ impl Config {
     /// Parses `args` (without the program name) and the environment.
     pub fn from_args<I: IntoIterator<Item = String>>(args: I) -> Cli {
         let mut mock = false;
+        let mut minimized = false;
         let mut screenshot = None;
         let mut it = args.into_iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--mock" => mock = true,
+                "--minimized" => minimized = true,
                 "-h" | "--help" => return Cli::Help,
                 "--screenshot" => {
                     let (Some(target), Some(out)) = (it.next(), it.next()) else {
@@ -133,6 +144,8 @@ impl Config {
         }
         let mut cfg = Self::defaults();
         cfg.mock = mock;
+        // A screenshot always needs its window.
+        cfg.minimized = minimized && screenshot.is_none();
         cfg.screenshot = screenshot;
         Cli::Run(Box::new(cfg))
     }
@@ -148,6 +161,10 @@ impl Config {
             .as_ref()
             .and_then(|d| d.state_dir().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| data_dir.join("state"));
+        let config_dir = std::env::var_os("FERROCHAT_CONFIG_DIR")
+            .map(PathBuf::from)
+            .or_else(|| dirs.as_ref().map(|d| d.config_dir().to_path_buf()))
+            .unwrap_or_else(|| data_dir.join("config"));
         let cache_dir = std::env::var_os("FERROCHAT_CACHE_DIR")
             .map(PathBuf::from)
             .or_else(|| dirs.as_ref().map(|d| d.cache_dir().to_path_buf()))
@@ -158,9 +175,11 @@ impl Config {
         Self {
             data_dir,
             state_dir,
+            config_dir,
             cache_dir,
             downloads_dir,
             mock: false,
+            minimized: false,
             screenshot: None,
             light_theme: std::env::var("FERRO_THEME").is_ok_and(|v| v == "light"),
             notification_preview: if std::env::var("FERROCHAT_NOTIFY").is_ok_and(|v| v == "sender")
@@ -200,24 +219,47 @@ pub fn secure_dir(dir: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Why the instance lock could not be taken.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LockError {
+    /// Another Ferrochat holds the lock for this data directory.
+    AlreadyRunning,
+    /// Any other failure (permissions, I/O), already worded for the user.
+    Other(String),
+}
+
+impl std::fmt::Display for LockError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyRunning => f.write_str(
+                "Ferrochat is already running for this data directory. Switch to the open window.",
+            ),
+            Self::Other(m) => f.write_str(m),
+        }
+    }
+}
+
 /// Takes an exclusive advisory lock on `<data_dir>/ferrochat.lock`. Keep the
-/// returned file alive for the whole process; a second instance fails here.
-pub fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
-    secure_dir(data_dir).map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+/// returned file alive for the whole process; a second instance fails here
+/// with [`LockError::AlreadyRunning`] and asks the first one to show its
+/// window (see `instance`).
+pub fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<std::fs::File, LockError> {
+    secure_dir(data_dir)
+        .map_err(|e| LockError::Other(format!("cannot create {}: {e}", data_dir.display())))?;
     let path = data_dir.join("ferrochat.lock");
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .open(&path)
-        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+        .map_err(|e| LockError::Other(format!("cannot open {}: {e}", path.display())))?;
     match file.try_lock() {
         Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(
-            "Ferrochat is already running for this data directory. Switch to the open window."
-                .into(),
-        ),
-        Err(std::fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+        Err(std::fs::TryLockError::WouldBlock) => Err(LockError::AlreadyRunning),
+        Err(std::fs::TryLockError::Error(e)) => Err(LockError::Other(format!(
+            "cannot lock {}: {e}",
+            path.display()
+        ))),
     }
 }
 
@@ -297,7 +339,10 @@ mod tests {
     fn second_instance_is_refused() {
         let dir = std::env::temp_dir().join(format!("ferrochat-lock-{}", std::process::id()));
         let first = acquire_instance_lock(&dir).unwrap();
-        assert!(acquire_instance_lock(&dir).is_err());
+        assert_eq!(
+            acquire_instance_lock(&dir).unwrap_err(),
+            LockError::AlreadyRunning
+        );
         drop(first);
         assert!(acquire_instance_lock(&dir).is_ok());
         let _ = std::fs::remove_dir_all(dir);
@@ -314,6 +359,25 @@ mod tests {
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn minimized_flag_and_settings_screenshot() {
+        match Config::from_args(args(&["--minimized"])) {
+            Cli::Run(cfg) => assert!(cfg.minimized && !cfg.mock),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Screenshots never start without a window.
+        match Config::from_args(args(&["--minimized", "--screenshot", "settings", "x.png"])) {
+            Cli::Run(cfg) => {
+                assert!(!cfg.minimized);
+                assert_eq!(
+                    cfg.screenshot.map(|(t, _)| t),
+                    Some(ScreenshotTarget::Settings)
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 
     #[test]

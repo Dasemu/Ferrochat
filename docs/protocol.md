@@ -121,6 +121,9 @@ chats are unchanged.
 | `$XDG_DATA_HOME/ferrochat/cache.sqlite3` (+ `-wal`, `-shm`) | Cache: chats, message bodies, media references (CDN path + per-file media key, needed to download later), contact names, own JID | Plain SQLite, mode 0600, like the official desktop client's local database. Deletable at any time; rebuilt from history sync. Never contains credentials or Signal keys. |
 | `$XDG_CACHE_HOME/ferrochat/avatars/*.img` / `*.none` | Profile picture previews (JPEG as served) and "no picture" markers. File names are a hash of the JID. Refreshed after 7 days / 12 h or when the contact changes the picture; at most 1500 files and 32 MB; deleted on logout | Directory 0700 |
 | `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB) so the system player can read them | Directory 0700 |
+| `$XDG_CONFIG_HOME/ferrochat/settings.json` | Preferences: close to tray, start minimized, mute notifications | Plain JSON, no secrets; not written in `--mock` |
+| `~/.config/autostart/dev.ferro.ferrochat.desktop` | "Start at login" entry (`Exec=<binary> --minimized`) | Only when the user turns the toggle on; the toggle removes it |
+| `$XDG_DATA_HOME/ferrochat/ferrochat.sock` | Single-instance hand-off: accepts only the line `show` | Unix socket in the 0700 data directory, mode 0600, removed on exit |
 | `$XDG_STATE_HOME/ferrochat/log` (rotated at 5 MB) | Logs | Bodies, phone numbers, QR payloads, keys and file names are redacted (`Redacted`, `MaskedJid`, manual `Debug` impls; covered by `tests/redaction.rs`). |
 | `~/Downloads/<name>` | Documents the user opened | Only on explicit click. |
 
@@ -145,7 +148,10 @@ and "Try again" retries without restarting; there is no file fallback (an
 opt-in passphrase-encrypted fallback is future work).
 
 A single-instance lock (`ferrochat.lock` in the data directory, OS file
-lock) prevents two Ferrochat processes from sharing one session store.
+lock) prevents two Ferrochat processes from sharing one session store. A
+second launch connects to `ferrochat.sock`, asks the first instance to show
+and focus its window, and exits with status 0 (`--minimized` launches, e.g.
+autostart, exit silently).
 
 The SQLCipher key only lives in zeroized buffers (`secrecy`, `Zeroizing`).
 Media limits: downloads ≤ 100 MB, at most 4 concurrent; images are
@@ -211,8 +217,9 @@ draws the waveform bars as played / unplayed.
   retroactively).
 * Group "read" ticks turn blue on the first participant's read receipt
   (WhatsApp waits for all participants).
-* No profile pictures, typing indicators, replies, reactions, edits or
-  message search yet.
+* Windows and macOS have no tray yet (stub): closing the window quits.
+* On Wayland the compositor may refuse to focus a window that is shown from
+  the tray or a notification (xdg-activation); it then appears without focus.
 
 ## UI reference
 

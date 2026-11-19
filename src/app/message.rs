@@ -29,6 +29,18 @@ pub enum Message {
     CaptureScreenshot,
     /// First frame has been presented (startup trace).
     FirstFrame,
+    /// Tray click / menu entry, a second launch or a clicked notification.
+    External(crate::ext::External),
+    /// The user asked to close a window (X button, Alt+F4).
+    CloseRequested(iced::window::Id),
+    /// A window is gone.
+    WindowClosed(iced::window::Id),
+    /// A window was resized (remembered for the next open).
+    WindowResized(iced::window::Id, iced::Size),
+    /// A window moved (not reported on Wayland).
+    WindowMoved(iced::window::Id, iced::Point),
+    /// Quit the app (tray menu).
+    Quit,
 }
 
 impl Message {
@@ -166,6 +178,12 @@ pub enum Ui {
     },
     /// "Jump to latest" after browsing old history.
     JumpLatest,
+    /// Settings page from the rail or the header menu.
+    OpenSettings,
+    /// Back from the settings page.
+    CloseSettings,
+    /// Flip a background / notification setting.
+    Toggle(Setting),
     /// Open a message found by the chat list search.
     OpenHit {
         /// Chat.
@@ -173,6 +191,20 @@ pub enum Ui {
         /// Message id.
         id: String,
     },
+}
+
+/// A boolean preference that can be flipped from the settings page (and,
+/// for some, the tray menu).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Setting {
+    /// Closing the window keeps the app in the tray.
+    CloseToTray,
+    /// Start without a window.
+    StartMinimized,
+    /// Write / remove the autostart entry.
+    Autostart,
+    /// No desktop notifications.
+    Muted,
 }
 
 /// A downloaded blob, already prepared for display where needed.
@@ -218,6 +250,8 @@ pub struct Located {
 /// Task completions.
 #[derive(Debug, Clone)]
 pub enum Done {
+    /// The autostart entry was written (`true`) or removed (`false`).
+    Autostart(Result<bool, String>),
     /// Messages loaded from the cache.
     Loaded {
         /// Chat.

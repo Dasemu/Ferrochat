@@ -4,7 +4,7 @@
 use std::io::Write;
 
 use ferrochat::app::App;
-use ferrochat::config::{APP_ID, Cli, Config, USAGE};
+use ferrochat::config::{Cli, Config, USAGE};
 use ferrochat::ui::{self, theme};
 
 fn init_logging(cfg: &Config) {
@@ -54,12 +54,37 @@ fn main() -> iced::Result {
     init_logging(&cfg);
 
     // One instance per data directory: two clients on one Signal store would
-    // corrupt it and make WhatsApp replace each other's stream.
+    // corrupt it and make WhatsApp replace each other's stream. A second
+    // launch asks the first to show its window and exits.
     let _instance_lock = if cfg.mock {
         None
     } else {
         match ferrochat::config::acquire_instance_lock(&cfg.data_dir) {
-            Ok(lock) => Some(lock),
+            Ok(lock) => {
+                if let Err(e) = ferrochat::instance::serve(&cfg.data_dir) {
+                    tracing::warn!(error = %e, "single-instance socket unavailable");
+                }
+                Some(lock)
+            }
+            Err(ferrochat::config::LockError::AlreadyRunning) => {
+                if cfg.minimized {
+                    // e.g. autostart while already running: nothing to do.
+                    return Ok(());
+                }
+                match ferrochat::instance::notify_running(&cfg.data_dir) {
+                    Ok(()) => {
+                        eprintln!("ferrochat: already running; showing its window.");
+                        return Ok(());
+                    }
+                    Err(_) => {
+                        eprintln!(
+                            "ferrochat: {}",
+                            ferrochat::config::LockError::AlreadyRunning
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
             Err(e) => {
                 eprintln!("ferrochat: {e}");
                 std::process::exit(1);
@@ -67,24 +92,12 @@ fn main() -> iced::Result {
         }
     };
 
-    let size = if cfg.screenshot.is_some() {
-        iced::Size::new(1280.0, 800.0)
-    } else {
-        iced::Size::new(1200.0, 780.0)
-    };
-    let window = iced::window::Settings {
-        size,
-        min_size: Some(iced::Size::new(760.0, 520.0)),
-        platform_specific: iced::window::settings::PlatformSpecific {
-            #[cfg(target_os = "linux")]
-            application_id: APP_ID.into(),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let _ = APP_ID;
-
-    iced::application(move || App::boot(cfg.clone()), App::update, ui::view)
+    // A daemon keeps running with zero windows: closing to the tray frees the
+    // window and its renderer while the connection stays up. The main window
+    // is opened by `App::boot` (unless `--minimized`).
+    let data_dir = cfg.data_dir.clone();
+    let mock = cfg.mock;
+    let result = iced::daemon(move || App::boot(cfg.clone()), App::update, ui::view_window)
         .title(App::title)
         .theme(App::iced_theme)
         .subscription(App::subscription)
@@ -92,7 +105,10 @@ fn main() -> iced::Result {
         .font(theme::FONT_MEDIUM)
         .font(theme::FONT_SEMIBOLD)
         .default_font(theme::INTER)
-        .window(window)
         .antialiasing(true)
-        .run()
+        .run();
+    if !mock {
+        ferrochat::instance::cleanup(&data_dir);
+    }
+    result
 }

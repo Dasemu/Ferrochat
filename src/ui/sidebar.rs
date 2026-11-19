@@ -61,7 +61,14 @@ pub fn rail(app: &App) -> El<'_> {
             item(Icon::CircleDashed, false),
             item(Icon::UsersRound, false),
             Space::new().height(Length::Fill),
-            item(Icon::Settings, false),
+            button(item(Icon::Settings, app.settings_open))
+                .on_press(Message::Ui(if app.settings_open {
+                    Ui::CloseSettings
+                } else {
+                    Ui::OpenSettings
+                }))
+                .padding(0)
+                .style(theme::flat_button(iced::Color::TRANSPARENT)),
             container(avatar_for(
                 app,
                 app.own_jid.as_deref().unwrap_or_default(),
@@ -315,7 +322,11 @@ fn menu(app: &App) -> El<'_> {
         column![
             item("New group", Icon::Users, None),
             item("Starred messages", Icon::Star, None),
-            item("Settings", Icon::Settings, None),
+            item(
+                "Settings",
+                Icon::Settings,
+                Some(Message::Ui(Ui::OpenSettings))
+            ),
             item("Log out", Icon::LogOut, Some(Message::Ui(Ui::Logout))),
         ]
         .width(220),

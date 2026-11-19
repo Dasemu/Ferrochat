@@ -439,6 +439,31 @@ pub fn chip(
     }
 }
 
+/// Switch like the official client's settings toggles (accent when on).
+pub fn toggler(
+    t: &FerroTheme,
+) -> impl Fn(&Theme, iced::widget::toggler::Status) -> iced::widget::toggler::Style + use<> {
+    let p = t.palette;
+    move |_, status| {
+        let on = matches!(
+            status,
+            iced::widget::toggler::Status::Active { is_toggled: true }
+                | iced::widget::toggler::Status::Hovered { is_toggled: true }
+        );
+        iced::widget::toggler::Style {
+            background: Background::Color(if on { p.accent } else { p.bg_selected }),
+            background_border_width: 1.0,
+            background_border_color: if on { p.accent } else { p.text_muted },
+            foreground: Background::Color(if on { p.accent_text } else { p.text_secondary }),
+            foreground_border_width: 0.0,
+            foreground_border_color: Color::TRANSPARENT,
+            text_color: Some(p.text_primary),
+            border_radius: None,
+            padding_ratio: 0.2,
+        }
+    }
+}
+
 /// Bubble-embedded button (play, document).
 pub fn flat_button(color: Color) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
     move |_, _| button::Style {
