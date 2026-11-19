@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete> docs/screenshots/<name>.png`
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
 ## Architecture
@@ -22,7 +22,8 @@ See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
 - No `unwrap`/`expect` outside tests (crate lints deny them).
 - Only `auth/secrets.rs` touches `keyring`. Never log bodies, JIDs, keys, QR codes:
   use `Redacted`, `MaskedJid`, redacting `Debug` impls.
-- Pure logic goes in `app/state.rs`, `net/convert.rs`, `net/types.rs` with unit tests.
+- Pure logic goes in `app/state.rs`, `app/live.rs`, `net/convert.rs`, `net/types.rs`
+  with unit tests; user actions live in `app/actions.rs`.
 - Every new crate needs a one-line justification in the PR.
 
 ## Workflow quirks
@@ -42,6 +43,14 @@ entry id: `dev.ferro.ferrochat`.
   linked statically (`.cargo/config.toml`, needs `cmake`).
 - Never delete the session store except on a real logout; see `docs/protocol.md` §3.
 - `scrollable().anchor_bottom()` reverses offsets: "bottom" is `RelativeOffset::START`.
+- The default `tiny-skia` renderer ignores image corner radii: round avatars are
+  masked into the RGBA tile (`media::avatar::circle_mask`).
+- Message popups (reactions / menu) float in a stack layer placed from the row's
+  on-screen bounds (`actions::Locate`); a scroll closes them. Jumping to a message
+  uses the same operation plus `scroll_to` (offsets count from the newest end).
+- Reactions/edits wait for pending message inserts (`App::deferred`), otherwise
+  they race the cache write and are lost.
+- Group ticks: per-participant receipts are stored; blue only when all read.
 - iced style fns returning `impl Fn` need `+ use<>` (edition 2024 captures).
 - Keep iced default features on (x11/wayland backends).
 - No Secret Service in CI: tests use `MemoryStore`.

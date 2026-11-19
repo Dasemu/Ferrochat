@@ -46,6 +46,9 @@ pub fn view(app: &App) -> El<'_> {
     if let Some(id) = &app.viewer {
         layers.push(chat::viewer(app, id));
     }
+    if let Some(d) = chat::dialog(app) {
+        layers.push(d);
+    }
     if let Some(msg) = &app.toast {
         layers.push(toast(t, msg));
     }
@@ -99,6 +102,19 @@ pub fn avatar<'a>(t: &FerroTheme, group: bool, size: f32) -> El<'a> {
         .height(size)
         .style(theme::rounded(p.avatar_bg, size / 2.0))
         .into()
+}
+
+/// A chat or contact picture: the fetched profile picture, or the grey
+/// default avatar while it is loading or when there is none.
+pub fn avatar_for<'a>(app: &'a App, jid: &str, group: bool, size: f32) -> El<'a> {
+    match app.avatars.peek(jid) {
+        Some(handle) => iced::widget::image(handle.clone())
+            .width(size)
+            .height(size)
+            .content_fit(iced::ContentFit::Cover)
+            .into(),
+        None => avatar(&app.theme, group, size),
+    }
 }
 
 /// Tick marks for outgoing messages.
@@ -178,6 +194,20 @@ pub fn list_time(ts: i64, now: i64) -> String {
         1 => "Yesterday".into(),
         2..=6 => local(ts).format("%A").to_string(),
         _ => local(ts).format("%d/%m/%Y").to_string(),
+    }
+}
+
+/// "last seen today at 14:05", "yesterday", or a date.
+pub fn last_seen_label(ts: i64, now: i64) -> String {
+    let (d, today) = (local_day(ts), local_day(now));
+    match today - d {
+        0 => format!("last seen today at {}", clock(ts)),
+        1 => format!("last seen yesterday at {}", clock(ts)),
+        _ => format!(
+            "last seen {} at {}",
+            local(ts).format("%d/%m/%Y"),
+            clock(ts)
+        ),
     }
 }
 
@@ -261,6 +291,15 @@ mod tests {
     fn ellipsis() {
         assert_eq!(ellipsize("hello", 10), "hello");
         assert_eq!(ellipsize("hello world", 5), "hello…");
+    }
+
+    #[test]
+    fn last_seen_labels() {
+        let now = chrono::Local::now().timestamp();
+        assert!(last_seen_label(now - 60, now).starts_with("last seen today at "));
+        assert!(last_seen_label(now - 86_400, now).starts_with("last seen yesterday at "));
+        let old = last_seen_label(now - 86_400 * 30, now);
+        assert!(old.starts_with("last seen ") && old.contains('/'));
     }
 
     #[test]

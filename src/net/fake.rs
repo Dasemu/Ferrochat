@@ -13,7 +13,9 @@ use futures::future::BoxFuture;
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 
-use super::types::{Content, MediaRef, Message, Origin, OutgoingMedia, ReceiptStatus};
+use super::types::{
+    ChatState, Content, MediaRef, Message, MsgKey, Origin, OutgoingMedia, Quote, ReceiptStatus,
+};
 use super::{Connection, Event, WaClient};
 use crate::error::{Error, Result};
 use crate::mock::MockData;
@@ -35,6 +37,8 @@ pub struct FakeOptions {
     pub auto_reply: bool,
     /// Make every send fail (tests the failed-tick path).
     pub fail_sends: bool,
+    /// Other participants reported for every group.
+    pub group_size: usize,
 }
 
 impl Default for FakeOptions {
@@ -47,6 +51,7 @@ impl Default for FakeOptions {
             receipt_delay: Duration::from_millis(800),
             auto_reply: false,
             fail_sends: false,
+            group_size: 3,
         }
     }
 }
@@ -62,6 +67,48 @@ pub enum Sent {
         id: String,
         /// Body.
         text: String,
+        /// Id of the quoted message when it was a reply.
+        reply_to: Option<String>,
+    },
+    /// Reaction (empty emoji = removed).
+    Reaction {
+        /// Target message.
+        key: MsgKey,
+        /// Emoji.
+        emoji: String,
+    },
+    /// Edit of one of our messages.
+    Edit {
+        /// Chat.
+        chat: String,
+        /// Id.
+        id: String,
+        /// New text.
+        text: String,
+    },
+    /// Delete for everyone.
+    Revoke {
+        /// Chat.
+        chat: String,
+        /// Id.
+        id: String,
+    },
+    /// Delete for me.
+    DeleteForMe {
+        /// Target message.
+        key: MsgKey,
+    },
+    /// Typing / recording indicator we sent.
+    ChatState {
+        /// Chat.
+        chat: String,
+        /// State.
+        state: ChatState,
+    },
+    /// Presence subscription.
+    Subscribed {
+        /// Contact.
+        jid: String,
     },
     /// Media.
     Media {
@@ -97,6 +144,7 @@ pub struct FakeClient {
     own_jid: String,
     log: Mutex<Vec<Sent>>,
     media: Mutex<HashMap<String, Vec<u8>>>,
+    avatars: HashMap<String, Vec<u8>>,
     pending_pair: Mutex<Option<(Vec<Event>, Vec<Message>)>>,
 }
 
@@ -160,6 +208,51 @@ impl FakeClient {
         });
     }
 
+    /// Simulates a peer typing / recording / stopping.
+    pub fn simulate_chat_state(&self, chat: &str, participant: Option<&str>, state: ChatState) {
+        let _ = self.tx.send(Event::ChatState {
+            chat: chat.into(),
+            participant: participant.map(Into::into),
+            state,
+        });
+    }
+
+    /// Simulates a presence update.
+    pub fn simulate_presence(&self, jid: &str, online: bool, last_seen: Option<i64>) {
+        let _ = self.tx.send(Event::Presence {
+            jid: jid.into(),
+            online,
+            last_seen,
+        });
+    }
+
+    /// Simulates an incoming reaction.
+    pub fn simulate_reaction(&self, chat: &str, target: &str, reactor: &str, emoji: &str) {
+        let _ = self.tx.send(Event::Reaction {
+            chat: chat.into(),
+            target: target.into(),
+            reactor: reactor.into(),
+            emoji: emoji.into(),
+            ts: chrono::Utc::now().timestamp(),
+        });
+    }
+
+    /// Simulates a participant's receipt in a group.
+    pub fn simulate_group_receipt(
+        &self,
+        chat: &str,
+        ids: &[&str],
+        status: ReceiptStatus,
+        participant: &str,
+    ) {
+        let _ = self.tx.send(Event::Receipt {
+            chat: chat.into(),
+            ids: ids.iter().map(|s| s.to_string()).collect(),
+            status,
+            participant: Some(participant.into()),
+        });
+    }
+
     fn schedule_receipts(&self, chat: &str, id: &str) {
         let tx = self.tx.clone();
         let chat = chat.to_string();
@@ -170,8 +263,10 @@ impl FakeClient {
             chat: chat.clone(),
             ids: ids.clone(),
             status: ReceiptStatus::Sent,
+            participant: None,
         });
-        if !auto {
+        if !auto || crate::net::is_group_jid(&chat) {
+            // Group receipts come per participant; tests drive them.
             return;
         }
         tokio::spawn(async move {
@@ -180,12 +275,14 @@ impl FakeClient {
                 chat: chat.clone(),
                 ids: ids.clone(),
                 status: ReceiptStatus::Delivered,
+                participant: None,
             });
             tokio::time::sleep(delay).await;
             let _ = tx.send(Event::Receipt {
                 chat,
                 ids,
                 status: ReceiptStatus::Read,
+                participant: None,
             });
         });
     }
@@ -197,6 +294,7 @@ impl WaClient for FakeClient {
         chat: &'a str,
         id: &'a str,
         text: &'a str,
+        reply: Option<&'a Quote>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if self.opts.fail_sends {
@@ -206,6 +304,7 @@ impl WaClient for FakeClient {
                 chat: chat.into(),
                 id: id.into(),
                 text: text.into(),
+                reply_to: reply.map(|q| q.id.clone()),
             });
             self.schedule_receipts(chat, id);
             if self.opts.auto_reply {
@@ -213,7 +312,18 @@ impl WaClient for FakeClient {
                 let chat = chat.to_string();
                 let delay = self.opts.receipt_delay * 3;
                 tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
+                    tokio::time::sleep(delay / 2).await;
+                    let _ = tx.send(Event::ChatState {
+                        chat: chat.clone(),
+                        participant: None,
+                        state: ChatState::Composing,
+                    });
+                    tokio::time::sleep(delay / 2).await;
+                    let _ = tx.send(Event::ChatState {
+                        chat: chat.clone(),
+                        participant: None,
+                        state: ChatState::Paused,
+                    });
                     let _ = tx.send(Event::Messages {
                         messages: vec![Message {
                             id: super::new_message_id(),
@@ -225,6 +335,9 @@ impl WaClient for FakeClient {
                             content: Content::Text("👍".into()),
                             status: ReceiptStatus::Read,
                             expires_at: None,
+                            reply: None,
+                            edited: false,
+                            reactions: Vec::new(),
                         }],
                         origin: Origin::Live,
                     });
@@ -313,6 +426,83 @@ impl WaClient for FakeClient {
         })
     }
 
+    fn profile_picture<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(async move { Ok(self.avatars.get(jid).cloned()) })
+    }
+
+    fn send_reaction<'a>(&'a self, key: &'a MsgKey, emoji: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::Reaction {
+                key: key.clone(),
+                emoji: emoji.into(),
+            });
+            Ok(())
+        })
+    }
+
+    fn edit_text<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::Edit {
+                chat: chat.into(),
+                id: id.into(),
+                text: text.into(),
+            });
+            Ok(())
+        })
+    }
+
+    fn revoke<'a>(&'a self, chat: &'a str, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::Revoke {
+                chat: chat.into(),
+                id: id.into(),
+            });
+            Ok(())
+        })
+    }
+
+    fn delete_for_me<'a>(&'a self, key: &'a MsgKey, _timestamp: i64) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::DeleteForMe { key: key.clone() });
+            Ok(())
+        })
+    }
+
+    fn send_chat_state<'a>(&'a self, chat: &'a str, state: ChatState) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::ChatState {
+                chat: chat.into(),
+                state,
+            });
+            Ok(())
+        })
+    }
+
+    fn subscribe_presence<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::Subscribed { jid: jid.into() });
+            Ok(())
+        })
+    }
+
+    fn group_size<'a>(&'a self, _chat: &'a str) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move { Ok(self.opts.group_size) })
+    }
+
     fn simulate_scan(&self) {
         self.scan();
     }
@@ -346,6 +536,7 @@ pub fn start(
         own_jid: data.own_jid.clone(),
         log: Mutex::new(Vec::new()),
         media: Mutex::new(data.media),
+        avatars: data.avatars,
         pending_pair: Mutex::new(None),
     });
     let _ = tx.send(if opts.paired {
@@ -366,6 +557,20 @@ pub fn start(
             messages: data.messages,
             origin: Origin::History,
         });
+        for (chat, participant, state) in data.typing {
+            let _ = tx.send(Event::ChatState {
+                chat,
+                participant,
+                state,
+            });
+        }
+        for (jid, online, last_seen) in data.presence {
+            let _ = tx.send(Event::Presence {
+                jid,
+                online,
+                last_seen,
+            });
+        }
     } else {
         if let Ok(mut p) = client.pending_pair.lock() {
             *p = Some((history, data.messages));

@@ -44,6 +44,18 @@ pub fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage> {
     reader.decode().map_err(media_err)
 }
 
+/// Largest sticker decoded (pixels). Real stickers are 512x512.
+pub const MAX_STICKER_PIXELS: u64 = 1_000_000;
+
+/// Decodes a WebP sticker to RGBA. Animated stickers yield their first
+/// frame. Never panics; oversize or corrupt input is an error.
+pub fn decode_sticker(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
+    check_image_bounds_max(bytes, MAX_STICKER_PIXELS)?;
+    let img = decode_limited(bytes)?;
+    let rgba = img.to_rgba8();
+    Ok((rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
 /// Decodes `bytes`, returns `(width, height, jpeg_thumbnail)`.
 pub fn probe_and_thumbnail(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     let img = decode_limited(bytes)?;
@@ -129,6 +141,7 @@ pub fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageEncoder as _;
 
     fn png(w: u32, h: u32) -> Vec<u8> {
         let img = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([x as u8, y as u8, 128]));
@@ -180,5 +193,25 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(34_000), "34 kB");
         assert_eq!(human_size(1_260_000), "1.3 MB");
+    }
+
+    #[test]
+    fn stickers_decode_to_rgba_with_transparency() {
+        let (w, h, px) = decode_sticker(&crate::mock::sticker_webp()).unwrap();
+        assert_eq!((w, h), (256, 256));
+        assert_eq!(px.len(), 256 * 256 * 4);
+        assert_eq!(px[3], 0, "outside the circle is transparent");
+        assert!(decode_sticker(b"RIFF....WEBPjunk").is_err());
+        assert!(decode_sticker(&[]).is_err());
+    }
+
+    #[test]
+    fn oversized_stickers_are_refused_before_decoding() {
+        let img = image::RgbaImage::new(1200, 1200);
+        let mut out = Vec::new();
+        image::codecs::png::PngEncoder::new(&mut out)
+            .write_image(img.as_raw(), 1200, 1200, image::ExtendedColorType::Rgba8)
+            .unwrap();
+        assert!(decode_sticker(&out).is_err());
     }
 }

@@ -19,12 +19,16 @@ use whatsapp_rust::download::{DownloadParams, MediaType};
 use whatsapp_rust::prelude::{Event as WaEvent, EventHandler};
 use whatsapp_rust::send::SendOptions;
 use whatsapp_rust::upload::UploadOptions;
+use whatsapp_rust::wacore::net::HttpRequest;
 use whatsapp_rust::wacore::store::DevicePropsOverride;
+use whatsapp_rust::wacore_binary::jid::JidExt;
 use whatsapp_rust::{Client, Jid};
 use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
 
 use super::convert::{self, Envelope, Uploaded};
-use super::types::{Content, MediaKind, MediaRef, Origin, OutgoingKind, OutgoingMedia};
+use super::types::{
+    ChatState, Content, MediaKind, MediaRef, MsgKey, Origin, OutgoingKind, OutgoingMedia, Quote,
+};
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
 use crate::error::{Error, MaskedJid, Result};
@@ -47,8 +51,13 @@ fn media_type(kind: MediaKind) -> MediaType {
         MediaKind::Image => MediaType::Image,
         MediaKind::Document => MediaType::Document,
         MediaKind::Audio => MediaType::Audio,
+        MediaKind::Video => MediaType::Video,
+        MediaKind::Sticker => MediaType::Sticker,
     }
 }
+
+/// Largest profile picture preview fetched (they are a few kB in practice).
+pub const MAX_AVATAR_BYTES: usize = 1024 * 1024;
 
 impl WaClient for RealClient {
     fn send_text<'a>(
@@ -56,15 +65,16 @@ impl WaClient for RealClient {
         chat: &'a str,
         id: &'a str,
         text: &'a str,
+        reply: Option<&'a Quote>,
     ) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             let jid = parse_jid(chat)?;
+            let msg = match reply {
+                Some(q) => convert::build_reply(text, q),
+                None => convert::build_text(text),
+            };
             self.client
-                .send_message_with_options(
-                    jid,
-                    convert::build_text(text),
-                    SendOptions::default().with_message_id(id),
-                )
+                .send_message_with_options(jid, msg, SendOptions::default().with_message_id(id))
                 .await
                 .map_err(|e| Error::Net(e.to_string()))?;
             Ok(())
@@ -160,6 +170,149 @@ impl WaClient for RealClient {
                 .mark_as_played(&chat, sender.as_ref(), &ids)
                 .await
                 .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn profile_picture<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>>> {
+        Box::pin(async move {
+            let jid = parse_jid(jid)?;
+            let pic = self
+                .client
+                .contacts()
+                .get_profile_picture(&jid, true)
+                .await
+                .map_err(|e| Error::Net(format!("profile picture lookup failed: {e}")))?;
+            let Some(pic) = pic else { return Ok(None) };
+            let resp = self
+                .client
+                .http_client
+                .execute(HttpRequest::get(pic.url))
+                .await
+                .map_err(|e| Error::Net(format!("profile picture download failed: {e}")))?;
+            if resp.status_code == 404 || resp.status_code == 410 {
+                return Ok(None);
+            }
+            if resp.status_code != 200 {
+                return Err(Error::Net(format!(
+                    "profile picture download failed (HTTP {})",
+                    resp.status_code
+                )));
+            }
+            if resp.body.len() > MAX_AVATAR_BYTES {
+                return Ok(None);
+            }
+            Ok(Some(resp.body))
+        })
+    }
+
+    fn send_reaction<'a>(&'a self, key: &'a MsgKey, emoji: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let chat = parse_jid(&key.chat)?;
+            let wa_key = convert::reaction_key(
+                &key.chat,
+                &key.id,
+                key.from_me,
+                &key.sender,
+                chat.is_group(),
+            );
+            self.client
+                .send_reaction(chat, wa_key, emoji)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn edit_text<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            self.client
+                .edit_message(jid, id, convert::build_text(text))
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn revoke<'a>(&'a self, chat: &'a str, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            self.client
+                .revoke_message(jid, id, whatsapp_rust::send::RevokeType::Sender)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn delete_for_me<'a>(&'a self, key: &'a MsgKey, timestamp: i64) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let chat = parse_jid(&key.chat)?;
+            let participant = (chat.is_group() && !key.from_me)
+                .then(|| parse_jid(&key.sender))
+                .transpose()?;
+            self.client
+                .chat_actions()
+                .delete_message_for_me(
+                    &chat,
+                    participant.as_ref(),
+                    &key.id,
+                    key.from_me,
+                    false,
+                    Some(timestamp),
+                )
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn send_chat_state<'a>(&'a self, chat: &'a str, state: ChatState) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let cs = self.client.chatstate();
+            match state {
+                ChatState::Composing => cs.send_composing(&jid).await,
+                ChatState::Recording => cs.send_recording(&jid).await,
+                ChatState::Paused => cs.send_paused(&jid).await,
+            }
+            .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn subscribe_presence<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(jid)?;
+            self.client
+                .presence()
+                .subscribe(jid)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn group_size<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<usize>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let info = self
+                .client
+                .groups()
+                .query_info(&jid)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            let (pn, lid) = (self.client.pn(), self.client.lid());
+            let others = info
+                .participants
+                .iter()
+                .filter(|p| {
+                    !pn.as_ref().is_some_and(|me| me.is_same_user_as(*p))
+                        && !lid.as_ref().is_some_and(|me| me.is_same_user_as(*p))
+                })
+                .count();
+            Ok(others)
         })
     }
 
@@ -525,7 +678,9 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
         WaEvent::Messages(batch) => {
             let drained = !matches!(batch.origin, whatsapp_rust::prelude::BatchOrigin::Live)
                 || batch.messages.iter().any(|m| m.info.is_offline);
+            let own = client.pn().map(|j| convert::bare_jid(&j.to_string()));
             let mut out = Vec::new();
+            let mut extra = Vec::new();
             let mut pairs = Vec::new();
             for m in batch.messages.iter() {
                 let info = &m.info;
@@ -541,19 +696,31 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                     ephemeral_secs: info.ephemeral_expiration,
                 };
                 pairs.extend(env.lid_pairs());
-                if let Some(target) = convert::revoked_target(&m.message) {
-                    // The revoker is `sender`; the store only applies it to a
-                    // message from that same sender.
-                    out.push(super::Message {
-                        id: target,
-                        content: Content::Deleted,
-                        ..match convert::message_from_envelope(&env, &m.message) {
-                            Some(msg) => msg,
-                            None => continue,
-                        }
-                    });
-                } else if let Some(msg) = convert::message_from_envelope(&env, &m.message) {
-                    out.push(msg);
+                match convert::parse_incoming(&env, &m.message) {
+                    Some(convert::Parsed::Message(msg)) => out.push(*msg),
+                    Some(convert::Parsed::Reaction { target, emoji }) => {
+                        let reactor = match (&own, env.from_me) {
+                            (Some(me), true) => me.clone(),
+                            _ => convert::bare_jid(&env.sender),
+                        };
+                        extra.push(Event::Reaction {
+                            chat: convert::bare_jid(&env.chat),
+                            target,
+                            reactor,
+                            emoji,
+                            ts: env.timestamp,
+                        });
+                    }
+                    Some(convert::Parsed::Edit { target, content }) => {
+                        extra.push(Event::Edited {
+                            chat: convert::bare_jid(&env.chat),
+                            id: target,
+                            sender: convert::bare_jid(&env.sender),
+                            from_me: env.from_me,
+                            content: Box::new(content),
+                        });
+                    }
+                    None => {}
                 }
             }
             let mut v = Vec::new();
@@ -570,6 +737,9 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                     },
                 });
             }
+            // Reactions and edits refer to stored messages, so they follow
+            // the batch that may contain their targets.
+            v.extend(extra);
             v
         }
         WaEvent::Receipt(r) => {
@@ -582,6 +752,10 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                     chat,
                     ids: r.message_ids.iter().map(|i| i.to_string()).collect(),
                     status,
+                    participant: r
+                        .source
+                        .is_group
+                        .then(|| convert::bare_jid(&r.source.sender.to_string())),
                 }],
                 None => vec![],
             }
@@ -606,6 +780,26 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             }],
             _ => vec![],
         },
+        WaEvent::ChatPresence(c) => vec![Event::ChatState {
+            chat: convert::bare_jid(&c.source.chat.to_string()),
+            participant: c
+                .source
+                .is_group
+                .then(|| convert::bare_jid(&c.source.sender.to_string())),
+            state: convert::chat_state(c.state, c.media),
+        }],
+        WaEvent::Presence(p) => vec![Event::Presence {
+            jid: convert::bare_jid(&p.from.to_string()),
+            online: !p.unavailable,
+            last_seen: p.last_seen.map(|t| t.timestamp()),
+        }],
+        WaEvent::PictureUpdate(p) => vec![Event::PictureChanged {
+            jid: convert::bare_jid(&p.jid.to_string()),
+        }],
+        WaEvent::DeleteMessageForMeUpdate(d) => vec![Event::DeletedForMe {
+            chat: convert::bare_jid(&d.chat_jid.to_string()),
+            id: d.message_id.clone(),
+        }],
         WaEvent::MarkChatAsReadUpdate(m) if m.action.read == Some(true) => {
             vec![Event::ChatRead {
                 chat: convert::bare_jid(&m.jid.to_string()),

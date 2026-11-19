@@ -15,6 +15,16 @@ pub enum ScreenshotTarget {
     ChatList,
     /// Chat list plus an open conversation with every bubble kind.
     Chat,
+    /// Conversation with the reply bar and the message menu open.
+    Reply,
+    /// Conversation with the quick-reaction picker open.
+    Reactions,
+    /// Conversation with the in-chat search bar and its highlighted hit.
+    ChatSearch,
+    /// Chat list showing message search results.
+    ListSearch,
+    /// Conversation with the "delete message" dialog.
+    Delete,
 }
 
 impl ScreenshotTarget {
@@ -23,6 +33,11 @@ impl ScreenshotTarget {
             "login" | "qr" => Some(Self::Login),
             "chats" | "chat-list" => Some(Self::ChatList),
             "chat" | "conversation" => Some(Self::Chat),
+            "reply" | "menu" => Some(Self::Reply),
+            "reactions" => Some(Self::Reactions),
+            "chat-search" => Some(Self::ChatSearch),
+            "list-search" => Some(Self::ListSearch),
+            "delete" => Some(Self::Delete),
             _ => None,
         }
     }
@@ -44,6 +59,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     /// `$XDG_STATE_HOME/ferrochat`: log file.
     pub state_dir: PathBuf,
+    /// `$XDG_CACHE_HOME/ferrochat`: profile pictures and videos opened in the
+    /// system player. Disposable and size-bounded.
+    pub cache_dir: PathBuf,
     /// Where documents are saved when opened.
     pub downloads_dir: PathBuf,
     /// Run against the in-process fake protocol with mock data.
@@ -74,7 +92,7 @@ pub const USAGE: &str = "\
 ferrochat - unofficial native WhatsApp desktop client
 
 USAGE:
-    ferrochat [--mock] [--screenshot <login|chats|chat> <out.png>]
+    ferrochat [--mock] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete> <out.png>]
 
 OPTIONS:
     --mock                      Run with mock data and a fake protocol (no network)
@@ -86,6 +104,7 @@ ENVIRONMENT:
     FERRO_THEME=light|dark      Colour scheme (default: dark)
     FERRO_TRACE_STARTUP=1       Log first_frame_ms
     FERROCHAT_DATA_DIR          Override the data directory
+    FERROCHAT_CACHE_DIR         Override the cache directory (avatars, videos)
     FERROCHAT_NOTIFY=sender     Notifications show the sender only
 ";
 
@@ -129,12 +148,17 @@ impl Config {
             .as_ref()
             .and_then(|d| d.state_dir().map(|p| p.to_path_buf()))
             .unwrap_or_else(|| data_dir.join("state"));
+        let cache_dir = std::env::var_os("FERROCHAT_CACHE_DIR")
+            .map(PathBuf::from)
+            .or_else(|| dirs.as_ref().map(|d| d.cache_dir().to_path_buf()))
+            .unwrap_or_else(|| data_dir.join("cache"));
         let downloads_dir = directories::UserDirs::new()
             .and_then(|u| u.download_dir().map(|p| p.to_path_buf()))
             .unwrap_or_else(std::env::temp_dir);
         Self {
             data_dir,
             state_dir,
+            cache_dir,
             downloads_dir,
             mock: false,
             screenshot: None,

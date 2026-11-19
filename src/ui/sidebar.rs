@@ -6,7 +6,7 @@ use iced::{Alignment, Length};
 
 use super::icons::Icon;
 use super::theme::{self, INTER_MEDIUM, INTER_SEMIBOLD};
-use super::{El, avatar, badge, ellipsize, fill, gap, icon, list_time, ticks};
+use super::{El, avatar_for, badge, ellipsize, fill, gap, icon, list_time, ticks};
 use crate::app::state::{ChatEntry, Filter};
 use crate::app::{App, Message, Ui};
 use crate::net::Connection;
@@ -62,7 +62,13 @@ pub fn rail(app: &App) -> El<'_> {
             item(Icon::UsersRound, false),
             Space::new().height(Length::Fill),
             item(Icon::Settings, false),
-            container(avatar(t, false, 32.0)).padding(4),
+            container(avatar_for(
+                app,
+                app.own_jid.as_deref().unwrap_or_default(),
+                false,
+                32.0
+            ))
+            .padding(4),
         ]
         .spacing(10)
         .align_x(Alignment::Center),
@@ -164,7 +170,13 @@ pub fn view(app: &App) -> El<'_> {
 
     let now = chrono::Utc::now().timestamp();
     let entries = app.chats.filtered(&app.search, app.filter);
-    let list: El<'_> = if entries.is_empty() {
+    let searching = !app.search.trim().is_empty();
+    let hits = if searching {
+        &app.message_hits[..]
+    } else {
+        &[]
+    };
+    let list: El<'_> = if entries.is_empty() && hits.is_empty() {
         container(
             text(if app.search.is_empty() {
                 "No chats yet"
@@ -215,9 +227,24 @@ pub fn view(app: &App) -> El<'_> {
                 .padding(16),
             );
         }
+        if !hits.is_empty() {
+            col = col.push(
+                container(text("Messages").size(14).font(INTER_MEDIUM).color(p.accent))
+                    .padding([14, 20]),
+            );
+            for h in hits {
+                col = col.push(hit_row(app, h, now));
+            }
+        }
         scrollable(col)
             .direction(super::thin_scrollbar())
             .style(theme::scrollbar(t))
+            .on_scroll(|v| {
+                Message::Ui(Ui::SidebarScrolled {
+                    offset_y: v.absolute_offset().y,
+                    height: v.bounds().height,
+                })
+            })
             .height(Length::Fill)
             .into()
     };
@@ -315,6 +342,65 @@ fn menu(app: &App) -> El<'_> {
         .into()
 }
 
+/// A message found by the chat list search: chat name, snippet and time.
+fn hit_row<'a>(app: &'a App, h: &'a crate::store::SearchHit, now: i64) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let name = app.chats.display_name(&h.chat);
+    let who = if h.from_me {
+        "You: ".to_string()
+    } else if crate::net::is_group_jid(&h.chat) {
+        format!("{}: ", ellipsize(&app.chats.display_name(&h.sender), 14))
+    } else {
+        String::new()
+    };
+    let content = column![
+        row![
+            text(ellipsize(&name, 34))
+                .size(16.5)
+                .color(p.text_primary)
+                .wrapping(Wrapping::None)
+                .shaping(text::Shaping::Advanced),
+            fill(),
+            text(list_time(h.ts, now)).size(12).color(p.text_secondary),
+        ]
+        .align_y(Alignment::Center),
+        text(format!("{who}{}", ellipsize(&h.snippet, 60)))
+            .size(m.text_small + 0.5)
+            .color(p.text_secondary)
+            .wrapping(Wrapping::None)
+            .shaping(text::Shaping::Advanced),
+    ]
+    .spacing(3)
+    .width(Length::Fill);
+    button(
+        row![
+            container(avatar_for(
+                app,
+                &h.chat,
+                crate::net::is_group_jid(&h.chat),
+                m.avatar
+            ))
+            .padding([0, 15]),
+            container(content).padding(iced::Padding {
+                right: 15.0,
+                ..Default::default()
+            }),
+        ]
+        .align_y(Alignment::Center),
+    )
+    .padding(0)
+    .width(Length::Fill)
+    .height(m.row_height)
+    .style(theme::chat_row(t, false))
+    .on_press(Message::Ui(Ui::OpenHit {
+        chat: h.chat.clone(),
+        id: h.id.clone(),
+    }))
+    .into()
+}
+
 fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
     let t = &app.theme;
     let p = t.palette;
@@ -336,7 +422,24 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
         });
 
     let mut preview_row = row![].spacing(3).align_y(Alignment::Center);
-    if let Some(l) = &e.last {
+    let typing = {
+        let names: Vec<(String, crate::net::ChatState)> = app
+            .typing
+            .in_chat(&e.meta.id)
+            .into_iter()
+            .map(|(p, st)| (app.chats.display_name(&p), st))
+            .collect();
+        crate::app::live::typing_label(&names, e.is_group())
+    };
+    if let Some(label) = typing {
+        preview_row = preview_row.push(
+            text(ellipsize(&label, 42))
+                .size(m.text_small + 0.5)
+                .color(p.accent)
+                .wrapping(Wrapping::None)
+                .shaping(text::Shaping::Advanced),
+        );
+    } else if let Some(l) = &e.last {
         if l.from_me {
             preview_row = preview_row.push(ticks(t, l.status, 16.0));
         } else if e.is_group() {
@@ -401,7 +504,7 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
         }));
 
     let inner = row![
-        container(avatar(t, e.is_group(), m.avatar)).padding([0, 15]),
+        container(avatar_for(app, &e.meta.id, e.is_group(), m.avatar)).padding([0, 15]),
         column![
             Space::new().height(Length::Fill),
             container(content).padding(iced::Padding {

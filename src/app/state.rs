@@ -3,7 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::net::types::{
-    ChatId, ChatMeta, Content, Message, ReceiptStatus, fallback_name, is_group_jid,
+    ChatId, ChatMeta, Content, Message, Reaction, ReceiptStatus, fallback_name, is_group_jid,
+    merge_edit,
 };
 use crate::store::ChatRow;
 
@@ -218,6 +219,51 @@ impl ChatList {
         }
     }
 
+    /// Group aggregate receipts for the preview tick.
+    pub fn set_status(&mut self, chat: &str, id: &str, status: ReceiptStatus) {
+        if let Some(e) = self.get_mut(chat)
+            && let Some(l) = &mut e.last
+            && l.from_me
+            && l.id == id
+        {
+            l.status = l.status.advance(status);
+        }
+    }
+
+    /// An edit changed the newest message of a chat.
+    pub fn apply_edit(
+        &mut self,
+        chat: &str,
+        id: &str,
+        sender: &str,
+        from_me: bool,
+        content: &Content,
+    ) {
+        if let Some(e) = self.get_mut(chat)
+            && let Some(l) = &mut e.last
+            && l.id == id
+            && crate::store::edit_allowed(l.from_me, &l.sender, sender, from_me)
+            && let Some(merged) = merge_edit(&l.content, content)
+        {
+            l.content = merged;
+            l.edited = true;
+        }
+    }
+
+    /// Replaces the preview message (after a local delete).
+    pub fn set_last(&mut self, chat: &str, last: Option<Message>) {
+        if let Some(e) = self.get_mut(chat) {
+            e.last = last;
+        }
+    }
+
+    /// True when `id` is the newest message of `chat`.
+    pub fn is_last(&self, chat: &str, id: &str) -> bool {
+        self.get(chat)
+            .and_then(|e| e.last.as_ref())
+            .is_some_and(|l| l.id == id)
+    }
+
     /// Clears the unread badge.
     pub fn mark_read(&mut self, chat: &str) {
         if let Some(e) = self.get_mut(chat) {
@@ -262,6 +308,9 @@ pub struct Conversation {
     pub messages: VecDeque<Message>,
     /// More history exists in the cache.
     pub has_more: bool,
+    /// The window was opened around an old message (search hit, reply jump):
+    /// newer messages exist in the cache but are not loaded.
+    pub has_newer: bool,
 }
 
 impl Conversation {
@@ -271,6 +320,7 @@ impl Conversation {
             chat,
             messages: VecDeque::new(),
             has_more,
+            has_newer: false,
         };
         c.merge(msgs);
         c
@@ -296,6 +346,9 @@ impl Conversation {
                 let gained_media = cur.content.media().is_none() && m.content.media().is_some();
                 if deleted || gained_media {
                     cur.content = m.content;
+                }
+                if cur.reactions.is_empty() && !m.reactions.is_empty() {
+                    cur.reactions = m.reactions;
                 }
                 continue;
             }
@@ -345,6 +398,75 @@ impl Conversation {
         changed
     }
 
+    /// Applies a reaction (empty emoji removes it). Newer wins.
+    pub fn apply_reaction(&mut self, target: &str, reactor: &str, emoji: &str, ts: i64) -> bool {
+        let Some(i) = self.position(target) else {
+            return false;
+        };
+        apply_reaction(&mut self.messages[i].reactions, reactor, emoji, ts)
+    }
+
+    /// Applies an edit if `sender` is the original sender. Returns true
+    /// when the message changed.
+    pub fn apply_edit(&mut self, id: &str, sender: &str, from_me: bool, content: &Content) -> bool {
+        let Some(i) = self.position(id) else {
+            return false;
+        };
+        let cur = &mut self.messages[i];
+        let allowed = crate::store::edit_allowed(cur.from_me, &cur.sender, sender, from_me);
+        if !allowed || matches!(cur.content, Content::Deleted) {
+            return false;
+        }
+        match merge_edit(&cur.content, content) {
+            Some(c) => {
+                cur.content = c;
+                cur.edited = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Removes a message ("delete for me").
+    pub fn remove(&mut self, id: &str) -> bool {
+        match self.position(id) {
+            Some(i) => {
+                self.messages.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Sets an aggregate status (groups).
+    pub fn set_status(&mut self, id: &str, status: ReceiptStatus) {
+        if let Some(i) = self.position(id) {
+            let m = &mut self.messages[i];
+            m.status = m.status.advance(status);
+        }
+    }
+
+    /// Appends a newer page (after jumping into the middle of history).
+    pub fn append_newer(&mut self, newer: Vec<Message>, has_newer: bool) {
+        for m in newer {
+            if self.position(&m.id).is_none() {
+                self.messages.push_back(m);
+            }
+        }
+        while self.messages.len() > WINDOW {
+            self.messages.pop_front();
+            self.has_more = true;
+        }
+        self.has_newer = has_newer;
+    }
+
+    /// Replaces the window with one around an anchor.
+    pub fn replace_window(&mut self, msgs: Vec<Message>, has_more: bool, has_newer: bool) {
+        self.messages = msgs.into();
+        self.has_more = has_more;
+        self.has_newer = has_newer;
+    }
+
     /// Replaces the content of a message (upload finished).
     pub fn set_content(&mut self, id: &str, content: Content) {
         if let Some(i) = self.position(id) {
@@ -360,6 +482,72 @@ impl Conversation {
     /// Cursor for paging older messages.
     pub fn oldest_cursor(&self) -> Option<(i64, String)> {
         self.messages.front().map(|m| (m.timestamp, m.id.clone()))
+    }
+}
+
+/// Applies one reactor's reaction to a reaction list: one reaction per
+/// reactor, an empty emoji removes it, an older timestamp never wins.
+pub fn apply_reaction(list: &mut Vec<Reaction>, reactor: &str, emoji: &str, ts: i64) -> bool {
+    let pos = list.iter().position(|r| r.reactor == reactor);
+    if let Some(i) = pos
+        && list[i].ts > ts
+    {
+        return false;
+    }
+    if emoji.is_empty() {
+        return match pos {
+            Some(i) => {
+                list.remove(i);
+                true
+            }
+            None => false,
+        };
+    }
+    match pos {
+        Some(i) => {
+            let changed = list[i].emoji != emoji;
+            list[i].emoji = emoji.to_string();
+            list[i].ts = ts;
+            changed
+        }
+        None => {
+            list.push(Reaction {
+                reactor: reactor.to_string(),
+                emoji: emoji.to_string(),
+                ts,
+            });
+            true
+        }
+    }
+}
+
+/// Reaction badge contents: distinct emoji with their counts, most used
+/// first (ties keep first-seen order), plus the total.
+pub fn reaction_summary(list: &[Reaction]) -> (Vec<(String, usize)>, usize) {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for r in list {
+        match counts.iter_mut().find(|(e, _)| *e == r.emoji) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((r.emoji.clone(), 1)),
+        }
+    }
+    counts.sort_by_key(|c| std::cmp::Reverse(c.1));
+    (counts, list.len())
+}
+
+/// Tick of a group message from per-participant receipts: blue only once
+/// every other participant read it, grey double ticks once all received it.
+/// `None` when nothing should change yet (or the group size is unknown/zero).
+pub fn group_status(size: usize, delivered: usize, read: usize) -> Option<ReceiptStatus> {
+    if size == 0 {
+        return None;
+    }
+    if read >= size {
+        Some(ReceiptStatus::Read)
+    } else if delivered.max(read) >= size {
+        Some(ReceiptStatus::Delivered)
+    } else {
+        None
     }
 }
 
@@ -420,6 +608,9 @@ mod tests {
                 ReceiptStatus::Read
             },
             expires_at: None,
+            reply: None,
+            edited: false,
+            reactions: Vec::new(),
         }
     }
 
@@ -614,5 +805,123 @@ mod tests {
         assert_eq!(day_label(9, 10, "Monday", "1/1/2026"), "Yesterday");
         assert_eq!(day_label(6, 10, "Monday", "1/1/2026"), "Monday");
         assert_eq!(day_label(1, 10, "Monday", "1/1/2026"), "1/1/2026");
+    }
+
+    // ---- parity features -------------------------------------------------
+
+    #[test]
+    fn reactions_one_per_reactor_newest_wins() {
+        let mut l: Vec<Reaction> = Vec::new();
+        assert!(apply_reaction(&mut l, "ana", "👍", 10));
+        assert!(
+            !apply_reaction(&mut l, "ana", "👍", 11),
+            "same emoji is no change"
+        );
+        assert!(apply_reaction(&mut l, "ana", "😂", 12));
+        assert!(
+            !apply_reaction(&mut l, "ana", "😮", 5),
+            "stale update ignored"
+        );
+        assert!(apply_reaction(&mut l, "bob", "😂", 13));
+        assert_eq!(l.len(), 2);
+        assert!(
+            !apply_reaction(&mut l, "ana", "", 1),
+            "stale removal ignored"
+        );
+        assert!(apply_reaction(&mut l, "ana", "", 20));
+        assert!(!apply_reaction(&mut l, "ana", "", 21), "nothing to remove");
+        assert_eq!(l.len(), 1);
+    }
+
+    #[test]
+    fn reaction_summary_orders_by_count() {
+        let r = |who: &str, e: &str| Reaction {
+            reactor: who.into(),
+            emoji: e.into(),
+            ts: 1,
+        };
+        let list = vec![r("a", "👍"), r("b", "❤️"), r("c", "❤️"), r("d", "😂")];
+        let (counts, total) = reaction_summary(&list);
+        assert_eq!(total, 4);
+        assert_eq!(counts[0], ("❤️".to_string(), 2));
+        assert_eq!(counts[1].0, "👍", "ties keep first-seen order");
+        assert_eq!(reaction_summary(&[]), (vec![], 0));
+    }
+
+    #[test]
+    fn group_status_aggregation() {
+        assert_eq!(group_status(0, 5, 5), None, "unknown size");
+        assert_eq!(group_status(3, 2, 0), None);
+        assert_eq!(group_status(3, 3, 0), Some(ReceiptStatus::Delivered));
+        assert_eq!(group_status(3, 3, 2), Some(ReceiptStatus::Delivered));
+        assert_eq!(group_status(3, 3, 3), Some(ReceiptStatus::Read));
+        // Reads imply deliveries even if the delivery receipts were lost.
+        assert_eq!(group_status(2, 0, 2), Some(ReceiptStatus::Read));
+        assert_eq!(group_status(2, 0, 1), None);
+    }
+
+    #[test]
+    fn conversation_edit_remove_and_windows() {
+        let mut c = Conversation::new(
+            "a".into(),
+            vec![m("a", "1", 10, true), m("a", "2", 20, false)],
+            false,
+        );
+        // Edit rules mirror the store: only the original sender.
+        assert!(!c.apply_edit("2", "intruder", false, &Content::Text("x".into())));
+        assert!(c.apply_edit("2", "s-2", false, &Content::Text("edited".into())));
+        assert_eq!(c.get("2").unwrap().content, Content::Text("edited".into()));
+        assert!(c.get("2").unwrap().edited);
+        assert!(!c.apply_edit("1", "s-1", false, &Content::Text("x".into())));
+        assert!(c.apply_edit("1", "me", true, &Content::Text("mine".into())));
+        assert!(!c.apply_edit("zz", "me", true, &Content::Text("x".into())));
+        assert!(c.remove("1"));
+        assert!(!c.remove("1"));
+        assert_eq!(c.messages.len(), 1);
+        // Newer pages are appended without duplicates and lift `has_newer`.
+        c.has_newer = true;
+        c.append_newer(vec![m("a", "2", 20, false), m("a", "3", 30, false)], false);
+        let ids: Vec<_> = c.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["2", "3"]);
+        assert!(!c.has_newer);
+        c.replace_window(vec![m("a", "9", 90, false)], true, true);
+        assert_eq!(c.messages.len(), 1);
+        assert!(c.has_more && c.has_newer);
+    }
+
+    #[test]
+    fn conversation_reactions_and_group_status() {
+        let mut c = Conversation::new("a".into(), vec![m("a", "1", 10, true)], false);
+        assert!(c.apply_reaction("1", "ana", "👍", 5));
+        assert!(!c.apply_reaction("missing", "ana", "👍", 5));
+        assert_eq!(c.get("1").unwrap().reactions.len(), 1);
+        c.set_status("1", ReceiptStatus::Delivered);
+        c.set_status("1", ReceiptStatus::Sent);
+        assert_eq!(c.get("1").unwrap().status, ReceiptStatus::Delivered);
+    }
+
+    #[test]
+    fn chat_list_follows_edits_and_local_deletes() {
+        let mut l = list();
+        let mut last = m("a", "5", 50, true);
+        last.sender = "me".into();
+        l.apply_messages(&[last], None, true, None);
+        assert!(l.is_last("a", "5"));
+        l.apply_edit("a", "5", "intruder", false, &Content::Text("hax".into()));
+        assert_eq!(
+            l.get("a").unwrap().last.as_ref().unwrap().content,
+            Content::Text("msg 5".into())
+        );
+        l.apply_edit("a", "5", "me", true, &Content::Text("fixed".into()));
+        let shown = l.get("a").unwrap().last.as_ref().unwrap();
+        assert_eq!(shown.content, Content::Text("fixed".into()));
+        assert!(shown.edited);
+        l.set_status("a", "5", ReceiptStatus::Read);
+        assert_eq!(
+            l.get("a").unwrap().last.as_ref().unwrap().status,
+            ReceiptStatus::Read
+        );
+        l.set_last("a", None);
+        assert!(l.get("a").unwrap().last.is_none());
     }
 }

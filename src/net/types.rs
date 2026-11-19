@@ -22,6 +22,10 @@ pub enum MediaKind {
     Document,
     /// Audio and voice notes (PTT).
     Audio,
+    /// Video (and GIF-as-video) messages.
+    Video,
+    /// WebP stickers.
+    Sticker,
 }
 
 /// Everything needed to download and decrypt a media blob from the CDN.
@@ -111,7 +115,35 @@ pub enum Content {
         /// Where to fetch the audio.
         media: Option<MediaRef>,
     },
-    /// Something we do not render yet (sticker, video, poll, ...).
+    /// A video message: thumbnail and duration are shown in the bubble, the
+    /// file itself is downloaded on click and opened in the system player.
+    Video {
+        /// Optional caption.
+        caption: Option<String>,
+        /// Duration in seconds.
+        seconds: u32,
+        /// Pixel width, if announced.
+        width: u32,
+        /// Pixel height, if announced.
+        height: u32,
+        /// Inline JPEG thumbnail (stored separately in the cache).
+        #[serde(skip)]
+        thumbnail: Option<Vec<u8>>,
+        /// Where to fetch the video.
+        media: Option<MediaRef>,
+    },
+    /// A sticker (WebP). Rendered statically: animated ones show frame 1.
+    Sticker {
+        /// Pixel width, if announced.
+        width: u32,
+        /// Pixel height, if announced.
+        height: u32,
+        /// Animated sticker (only the first frame is shown).
+        animated: bool,
+        /// Where to fetch the WebP.
+        media: Option<MediaRef>,
+    },
+    /// Something we do not render yet (poll, location, ...).
     Unsupported(String),
     /// A view-once photo / video / voice note. Never downloaded or stored;
     /// the user opens it on the phone.
@@ -130,6 +162,13 @@ impl Content {
                 _ => "📷 Photo".into(),
             },
             Content::Document { file_name, .. } => format!("📄 {file_name}"),
+            Content::Video {
+                caption, seconds, ..
+            } => match caption {
+                Some(c) if !c.is_empty() => format!("🎥 {c}"),
+                _ => format!("🎥 {}", format_duration(*seconds)),
+            },
+            Content::Sticker { .. } => "Sticker".into(),
             Content::Voice { seconds, ptt, .. } => {
                 let label = if *ptt { "🎤" } else { "🎵" };
                 format!("{label} {}", format_duration(*seconds))
@@ -145,6 +184,8 @@ impl Content {
         match self {
             Content::Image { media, .. }
             | Content::Document { media, .. }
+            | Content::Video { media, .. }
+            | Content::Sticker { media, .. }
             | Content::Voice { media, .. } => media.as_ref(),
             _ => None,
         }
@@ -157,6 +198,8 @@ impl Content {
             Content::Image { .. } => "image",
             Content::Document { .. } => "document",
             Content::Voice { .. } => "voice",
+            Content::Video { .. } => "video",
+            Content::Sticker { .. } => "sticker",
             Content::Unsupported(_) => "unsupported",
             Content::ViewOnce => "view_once",
             Content::Deleted => "deleted",
@@ -172,6 +215,8 @@ impl fmt::Debug for Content {
             Content::Image { width, height, .. } => write!(f, "Image({width}x{height})"),
             Content::Document { size, .. } => write!(f, "Document(size={size})"),
             Content::Voice { seconds, ptt, .. } => write!(f, "Voice({seconds}s, ptt={ptt})"),
+            Content::Video { seconds, .. } => write!(f, "Video({seconds}s)"),
+            Content::Sticker { animated, .. } => write!(f, "Sticker(animated={animated})"),
             Content::Unsupported(k) => write!(f, "Unsupported({k})"),
             Content::ViewOnce => write!(f, "ViewOnce"),
             Content::Deleted => write!(f, "Deleted"),
@@ -254,7 +299,7 @@ impl ReceiptStatus {
 }
 
 /// A message in a chat.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Message {
     /// Message id (unique per chat).
     pub id: String,
@@ -274,6 +319,185 @@ pub struct Message {
     pub status: ReceiptStatus,
     /// Disappearing messages: unix seconds after which the cache drops it.
     pub expires_at: Option<i64>,
+    /// The message this one replies to.
+    pub reply: Option<Quote>,
+    /// The sender edited the message after sending it.
+    pub edited: bool,
+    /// Reactions, one per reactor, oldest first.
+    pub reactions: Vec<Reaction>,
+}
+
+impl fmt::Debug for Message {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // JIDs are phone numbers and push names are personal data: masked.
+        f.debug_struct("Message")
+            .field("id", &self.id)
+            .field(
+                "chat",
+                &format_args!("{}", crate::error::MaskedJid(&self.chat)),
+            )
+            .field(
+                "sender",
+                &format_args!("{}", crate::error::MaskedJid(&self.sender)),
+            )
+            .field("from_me", &self.from_me)
+            .field("timestamp", &self.timestamp)
+            .field("content", &self.content)
+            .field("status", &self.status)
+            .field("reply", &self.reply)
+            .field("edited", &self.edited)
+            .field("reactions", &self.reactions.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// The quoted message of a reply (WhatsApp's `contextInfo`).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Quote {
+    /// Id of the quoted message.
+    pub id: String,
+    /// Author of the quoted message (bare JID).
+    pub sender: String,
+    /// One-line preview ("📷 Photo", or the first line of the text).
+    pub preview: String,
+}
+
+impl fmt::Debug for Quote {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Previews are message bodies: never printed.
+        write!(f, "Quote(len={})", self.preview.chars().count())
+    }
+}
+
+/// Longest quote preview kept (characters).
+pub const QUOTE_PREVIEW_MAX: usize = 160;
+
+impl Quote {
+    /// Quote of `msg` as shown in the reply bubble.
+    pub fn of(msg: &Message) -> Self {
+        Self {
+            id: msg.id.clone(),
+            sender: msg.sender.clone(),
+            preview: msg
+                .content
+                .preview()
+                .chars()
+                .take(QUOTE_PREVIEW_MAX)
+                .collect(),
+        }
+    }
+}
+
+/// One person's reaction to a message.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Reaction {
+    /// Who reacted (bare JID; our own JID for our reactions).
+    pub reactor: String,
+    /// The emoji.
+    pub emoji: String,
+    /// Unix seconds.
+    pub ts: i64,
+}
+
+impl fmt::Debug for Reaction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Reaction({})", self.emoji)
+    }
+}
+
+/// Typing indicator state of a peer (chat state).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ChatState {
+    /// Typing a text message.
+    Composing,
+    /// Recording a voice note.
+    Recording,
+    /// Stopped.
+    Paused,
+}
+
+/// Identifies one message for actions that need its protocol key.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MsgKey {
+    /// Chat JID.
+    pub chat: ChatId,
+    /// Message id.
+    pub id: String,
+    /// Sent by us.
+    pub from_me: bool,
+    /// Author (bare JID); the participant for group messages.
+    pub sender: String,
+}
+
+impl fmt::Debug for MsgKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MsgKey(from_me={})", self.from_me)
+    }
+}
+
+/// Result of applying an edit to `old`: text stays text; for media only the
+/// caption changes (the media reference is kept). `None` when the edit does
+/// not fit the original (so it is ignored).
+pub fn merge_edit(old: &Content, new: &Content) -> Option<Content> {
+    let new_text = |c: &Content| -> Option<Option<String>> {
+        match c {
+            Content::Text(t) => Some(Some(t.clone()).filter(|t| !t.is_empty())),
+            Content::Image { caption, .. }
+            | Content::Video { caption, .. }
+            | Content::Document { caption, .. } => Some(caption.clone()),
+            _ => None,
+        }
+    };
+    let text = new_text(new)?;
+    match old {
+        Content::Text(_) => Some(Content::Text(text?)),
+        Content::Image { .. } | Content::Video { .. } | Content::Document { .. } => {
+            let mut c = old.clone();
+            match &mut c {
+                Content::Image { caption, .. }
+                | Content::Video { caption, .. }
+                | Content::Document { caption, .. } => *caption = text,
+                _ => return None,
+            }
+            Some(c)
+        }
+        _ => None,
+    }
+}
+
+/// Seconds a message can be edited after sending (WhatsApp: 15 minutes).
+pub const EDIT_WINDOW_SECS: i64 = 15 * 60;
+/// Seconds "delete for everyone" stays available (WhatsApp: 2 days 12 hours).
+pub const REVOKE_WINDOW_SECS: i64 = 60 * 60 * 60;
+
+impl Message {
+    /// Our text message is still inside WhatsApp's edit window.
+    pub fn can_edit(&self, now: i64) -> bool {
+        self.from_me
+            && matches!(self.content, Content::Text(_))
+            && self.status != ReceiptStatus::Failed
+            && self.status != ReceiptStatus::Pending
+            && now - self.timestamp <= EDIT_WINDOW_SECS
+    }
+
+    /// Our message can still be deleted for everyone.
+    pub fn can_revoke(&self, now: i64) -> bool {
+        self.from_me
+            && !matches!(self.content, Content::Deleted)
+            && self.status != ReceiptStatus::Failed
+            && self.status != ReceiptStatus::Pending
+            && now - self.timestamp <= REVOKE_WINDOW_SECS
+    }
+
+    /// Protocol key of this message.
+    pub fn key(&self) -> MsgKey {
+        MsgKey {
+            chat: self.chat.clone(),
+            id: self.id.clone(),
+            from_me: self.from_me,
+            sender: self.sender.clone(),
+        }
+    }
 }
 
 /// Chat metadata (from history sync or derived from messages).
@@ -540,5 +764,120 @@ mod tests {
         assert_eq!(fallback_name("34600111222@s.whatsapp.net"), "+34600111222");
         assert_eq!(fallback_name("1203630@g.us"), "Group");
         assert!(is_group_jid("1203630@g.us"));
+    }
+
+    fn text_msg(from_me: bool, ts: i64, status: ReceiptStatus) -> Message {
+        Message {
+            id: "1".into(),
+            chat: "c".into(),
+            sender: "s".into(),
+            sender_name: None,
+            from_me,
+            timestamp: ts,
+            content: Content::Text("hi".into()),
+            status,
+            expires_at: None,
+            reply: None,
+            edited: false,
+            reactions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn edit_and_revoke_windows() {
+        let now = 1_000_000;
+        let m = text_msg(true, now - 60, Sent);
+        assert!(m.can_edit(now));
+        assert!(m.can_revoke(now));
+        // 15 minutes to edit, then the option disappears (delete stays).
+        let old = text_msg(true, now - EDIT_WINDOW_SECS - 1, Delivered);
+        assert!(!old.can_edit(now));
+        assert!(old.can_revoke(now));
+        let edge = text_msg(true, now - EDIT_WINDOW_SECS, Read);
+        assert!(edge.can_edit(now));
+        // About two and a half days to delete for everyone.
+        let ancient = text_msg(true, now - REVOKE_WINDOW_SECS - 1, Read);
+        assert!(!ancient.can_revoke(now));
+        // Never for other people's messages, pending or failed sends.
+        assert!(!text_msg(false, now - 1, Read).can_edit(now));
+        assert!(!text_msg(false, now - 1, Read).can_revoke(now));
+        assert!(!text_msg(true, now - 1, Pending).can_edit(now));
+        assert!(!text_msg(true, now - 1, Failed).can_revoke(now));
+        // Only text can be edited here; deleted messages cannot be deleted again.
+        let mut img = text_msg(true, now - 1, Sent);
+        img.content = Content::Deleted;
+        assert!(!img.can_edit(now) && !img.can_revoke(now));
+    }
+
+    #[test]
+    fn edits_merge_into_the_original_content() {
+        let t = |s: &str| Content::Text(s.into());
+        assert_eq!(merge_edit(&t("a"), &t("b")), Some(t("b")));
+        assert_eq!(
+            merge_edit(&t("a"), &t("")),
+            None,
+            "empty text is not an edit"
+        );
+        let img = Content::Image {
+            caption: Some("old".into()),
+            width: 2,
+            height: 2,
+            thumbnail: None,
+            media: None,
+        };
+        match merge_edit(&img, &t("new")) {
+            Some(Content::Image { caption, width, .. }) => {
+                assert_eq!(caption.as_deref(), Some("new"));
+                assert_eq!(width, 2);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(merge_edit(&Content::Deleted, &t("x")), None);
+        assert_eq!(merge_edit(&t("a"), &Content::Deleted), None);
+    }
+
+    #[test]
+    fn quotes_are_capped_and_never_logged() {
+        let mut m = text_msg(false, 1, Read);
+        m.content = Content::Text("y".repeat(1000));
+        let q = Quote::of(&m);
+        assert_eq!(q.preview.chars().count(), QUOTE_PREVIEW_MAX);
+        let mut secret = text_msg(false, 1, Read);
+        secret.content = Content::Text("my secret".into());
+        assert!(!format!("{:?}", Quote::of(&secret)).contains("secret"));
+        assert!(
+            !format!(
+                "{:?}",
+                Reaction {
+                    reactor: "34600111222@s.whatsapp.net".into(),
+                    emoji: "👍".into(),
+                    ts: 1
+                }
+            )
+            .contains("346")
+        );
+        assert_eq!(format!("{:?}", secret.key()), "MsgKey(from_me=false)");
+    }
+
+    #[test]
+    fn video_and_sticker_previews() {
+        let v = Content::Video {
+            caption: None,
+            seconds: 75,
+            width: 1,
+            height: 1,
+            thumbnail: None,
+            media: None,
+        };
+        assert_eq!(v.preview(), "🎥 1:15");
+        assert_eq!(v.kind_tag(), "video");
+        let s = Content::Sticker {
+            width: 1,
+            height: 1,
+            animated: false,
+            media: None,
+        };
+        assert_eq!(s.preview(), "Sticker");
+        assert!(s.media().is_none());
     }
 }

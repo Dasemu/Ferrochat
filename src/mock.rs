@@ -7,7 +7,9 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use crate::media::audio;
-use crate::net::types::{ChatMeta, Content, MediaKind, MediaRef, Message, ReceiptStatus};
+use crate::net::types::{
+    ChatMeta, ChatState, Content, MediaKind, MediaRef, Message, Quote, Reaction, ReceiptStatus,
+};
 
 /// Own (fake) JID in mock mode.
 pub const OWN_JID: &str = "34600000000@s.whatsapp.net";
@@ -26,6 +28,89 @@ pub struct MockData {
     pub messages: Vec<Message>,
     /// Downloadable media keyed by `direct_path`.
     pub media: HashMap<String, Vec<u8>>,
+    /// Profile pictures (PNG) by JID; chats without an entry have none.
+    pub avatars: HashMap<String, Vec<u8>>,
+    /// Typing indicators sent right after the history: `(chat, participant, state)`.
+    pub typing: Vec<(String, Option<String>, ChatState)>,
+    /// Presence updates sent right after the history: `(jid, online, last_seen)`.
+    pub presence: Vec<(String, bool, Option<i64>)>,
+}
+
+/// A procedurally drawn portrait-like avatar (original artwork): a coloured
+/// disc background with a head and shoulders silhouette.
+pub fn avatar_png(seed: u32, group: bool) -> Vec<u8> {
+    let side = 160u32;
+    let hue = (seed.wrapping_mul(2_654_435_761) >> 8) % 360;
+    let hsv = |h: f32, s: f32, v: f32| -> [u8; 3] {
+        let c = v * s;
+        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+        let m = v - c;
+        let (r, g, b) = match (h / 60.0) as u32 {
+            0 => (c, x, 0.0),
+            1 => (x, c, 0.0),
+            2 => (0.0, c, x),
+            3 => (0.0, x, c),
+            4 => (x, 0.0, c),
+            _ => (c, 0.0, x),
+        };
+        [
+            ((r + m) * 255.0) as u8,
+            ((g + m) * 255.0) as u8,
+            ((b + m) * 255.0) as u8,
+        ]
+    };
+    let h = hue as f32;
+    let img = image::RgbImage::from_fn(side, side, |x, y| {
+        let (fx, fy) = (x as f32 / side as f32, y as f32 / side as f32);
+        let bg = hsv(h, 0.45, 0.55 + 0.25 * fy);
+        let fg = hsv(h, 0.2, 0.93);
+        let dots: &[(f32, f32, f32)] = if group {
+            &[(0.3, 0.42, 0.13), (0.7, 0.42, 0.13), (0.5, 0.58, 0.15)]
+        } else {
+            &[(0.5, 0.38, 0.17)]
+        };
+        let in_head = dots
+            .iter()
+            .any(|(cx, cy, r)| (fx - cx).powi(2) + (fy - cy).powi(2) < r * r);
+        let in_body =
+            !group && ((fx - 0.5).powi(2) / 0.17 + (fy - 1.0).powi(2) / 0.2) < 1.0 && fy > 0.62;
+        image::Rgb(if in_head || in_body { fg } else { bg })
+    });
+    let mut out = Vec::new();
+    let _ = img.write_to(&mut Cursor::new(&mut out), image::ImageFormat::Png);
+    out
+}
+
+/// A procedurally drawn smiley sticker as lossless WebP (original artwork).
+pub fn sticker_webp() -> Vec<u8> {
+    use image::ImageEncoder;
+    let side = 256u32;
+    let img = image::RgbaImage::from_fn(side, side, |x, y| {
+        let (fx, fy) = (x as f32 / side as f32 - 0.5, y as f32 / side as f32 - 0.5);
+        let r = (fx * fx + fy * fy).sqrt();
+        let eye = |ex: f32| ((fx - ex).powi(2) + (fy + 0.12).powi(2)).sqrt() < 0.055;
+        let mouth = {
+            let d = (fx * fx + (fy - 0.02) * (fy - 0.02)).sqrt();
+            (0.24..0.29).contains(&d) && fy > 0.06
+        };
+        if r > 0.46 {
+            image::Rgba([0, 0, 0, 0])
+        } else if r > 0.43 {
+            image::Rgba([0xc9, 0x8a, 0x00, 255])
+        } else if eye(-0.15) || eye(0.15) || mouth {
+            image::Rgba([0x4a, 0x2f, 0x00, 255])
+        } else {
+            image::Rgba([0xff, 0xcc, 0x33, 255])
+        }
+    });
+    let mut out = Vec::new();
+    let _ = image::codecs::webp::WebPEncoder::new_lossless(&mut out).write_image(
+        img.as_raw(),
+        side,
+        side,
+        image::ExtendedColorType::Rgba8,
+    );
+    out
 }
 
 fn media_ref(path: &str, kind: MediaKind, mimetype: &str, bytes: &[u8]) -> MediaRef {
@@ -141,7 +226,40 @@ impl B {
             content: c,
             status: if from_me { st } else { ReceiptStatus::Read },
             expires_at: None,
+            reply: None,
+            edited: false,
+            reactions: Vec::new(),
         });
+    }
+
+    /// Id of the message pushed last.
+    fn last_id(&self) -> String {
+        self.msgs.last().map(|m| m.id.clone()).unwrap_or_default()
+    }
+
+    /// Quote of an earlier message (by id) for the one pushed last.
+    fn reply_to_earlier(&mut self, id: &str) {
+        let q = self.msgs.iter().find(|m| m.id == id).map(Quote::of);
+        if let Some(m) = self.msgs.last_mut() {
+            m.reply = q;
+        }
+    }
+
+    /// Adds a reaction to the message pushed last.
+    fn react(&mut self, reactor: &str, emoji: &str, ts: i64) {
+        if let Some(m) = self.msgs.last_mut() {
+            m.reactions.push(Reaction {
+                reactor: reactor.into(),
+                emoji: emoji.into(),
+                ts,
+            });
+        }
+    }
+
+    fn mark_edited(&mut self) {
+        if let Some(m) = self.msgs.last_mut() {
+            m.edited = true;
+        }
     }
 }
 
@@ -205,6 +323,14 @@ pub fn mock_data(now: i64) -> MockData {
         &ogg_out,
     );
     media.insert(voice_out.direct_path.clone(), ogg_out);
+
+    let clip = b"\x00\x00\x00\x18ftypmp42 mock clip, never played".to_vec();
+    let clip_ref = media_ref("/mock/clip.mp4", MediaKind::Video, "video/mp4", &clip);
+    media.insert(clip_ref.direct_path.clone(), clip);
+    let clip_thumb = thumbnail_of(&sunset_png(320, 180));
+    let webp = sticker_webp();
+    let sticker_ref = media_ref("/mock/smile.webp", MediaKind::Sticker, "image/webp", &webp);
+    media.insert(sticker_ref.direct_path.clone(), webp);
 
     let today = now - now.rem_euclid(86_400) + 9 * 3600;
     let mut b = B {
@@ -307,6 +433,54 @@ pub fn mock_data(now: i64) -> MockData {
         Sent,
     );
 
+    // Replies, reactions, video, sticker and an edited message.
+    let coffee_id = b.last_id();
+    b.push(
+        lucia,
+        l,
+        now - 200,
+        text("Perfecto, yo llevo los bollos 🥐"),
+        Read,
+    );
+    b.reply_to_earlier(&coffee_id);
+    b.react(OWN_JID, "❤️", now - 150);
+    b.push(
+        lucia,
+        l,
+        now - 3450,
+        Content::Video {
+            caption: None,
+            seconds: 14,
+            width: 320,
+            height: 180,
+            thumbnail: clip_thumb,
+            media: Some(clip_ref),
+        },
+        Read,
+    );
+    b.react(OWN_JID, "😂", now - 3400);
+    b.push(
+        lucia,
+        l,
+        now - 1650,
+        Content::Sticker {
+            width: 256,
+            height: 256,
+            animated: false,
+            media: Some(sticker_ref),
+        },
+        Read,
+    );
+    b.push(
+        lucia,
+        None,
+        now - 130,
+        text("Llevo yo el café, entonces. ¡Hasta mañana! ☕"),
+        Delivered,
+    );
+    b.mark_edited();
+    b.react(lucia, "👍", now - 100);
+
     let f1 = Some(("34688888888@s.whatsapp.net", "Tía Rosa"));
     let f2 = Some((mum, "Mamá"));
     b.push(
@@ -320,6 +494,24 @@ pub fn mock_data(now: i64) -> MockData {
     b.push(family, f1, now - 900, text("Yo llevo el postre"), Read);
     b.push(family, f2, now - 600, text("Genial, hago paella"), Read);
     b.push(family, f1, now - 420, text("🥘🥘🥘"), Read);
+    b.react(mum, "😋", now - 400);
+    b.react(OWN_JID, "😋", now - 390);
+    b.react("34688888888@s.whatsapp.net", "❤️", now - 380);
+    let rice_id = b
+        .msgs
+        .iter()
+        .rev()
+        .nth(1)
+        .map(|m| m.id.clone())
+        .unwrap_or_default();
+    b.push(
+        family,
+        None,
+        now - 300,
+        text("¡Yo llevo las bebidas!"),
+        Read,
+    );
+    b.reply_to_earlier(&rice_id);
 
     b.push(
         marcos,
@@ -447,12 +639,27 @@ pub fn mock_data(now: i64) -> MockData {
         chat(mum, None, 0, false, false),
     ];
 
+    let mut avatars = HashMap::new();
+    for (i, jid) in [lucia, marcos, mum, carmen, elena, family, climbing]
+        .into_iter()
+        .enumerate()
+    {
+        avatars.insert(
+            jid.to_string(),
+            avatar_png(i as u32 + 3, jid.ends_with("@g.us")),
+        );
+    }
+    avatars.insert(OWN_JID.to_string(), avatar_png(99, false));
+
     MockData {
         own_jid: OWN_JID.into(),
         chats,
         names,
         messages: b.msgs,
         media,
+        avatars,
+        typing: vec![(carmen.to_string(), None, ChatState::Composing)],
+        presence: vec![(lucia.to_string(), true, None)],
     }
 }
 
@@ -476,7 +683,10 @@ mod tests {
             .iter()
             .filter(|m| m.chat == SHOWCASE_CHAT)
             .collect();
-        for tag in ["text", "image", "document", "voice"] {
+        assert!(showcase.iter().any(|m| m.reply.is_some()));
+        assert!(showcase.iter().any(|m| !m.reactions.is_empty()));
+        assert!(showcase.iter().any(|m| m.edited));
+        for tag in ["text", "image", "document", "voice", "video", "sticker"] {
             assert!(
                 showcase.iter().any(|m| m.content.kind_tag() == tag),
                 "{tag}"
