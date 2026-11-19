@@ -2,9 +2,12 @@
 
 mod actions;
 pub use actions::{PopupPos, popup_top, row_id};
+mod background;
+pub use background::WindowGeom;
 pub mod live;
 pub mod message;
 pub mod state;
+pub mod window;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
@@ -14,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use iced::widget::{image, operation};
-use iced::{Subscription, Task, window};
+use iced::{Subscription, Task};
 
-pub use message::{Done, Fetched, Located, Message, Ui};
+pub use message::{Done, Fetched, Located, Message, Setting, Ui};
 use state::{ChatList, Conversation, Filter};
 
 use crate::auth::secrets::{KeyringStore, MemoryStore, SIGNAL_STORE_KEY, SecretStore};
@@ -187,6 +190,22 @@ pub struct App {
     scene_started: bool,
     /// Last known scroll offset of the conversation.
     scroll_y: f32,
+    /// Persisted preferences (background mode, mute).
+    pub(crate) settings: crate::settings::Settings,
+    /// The tray service reported at least once (up or not).
+    pub(crate) tray_checked: bool,
+    /// The autostart entry exists.
+    pub(crate) autostart: bool,
+    /// The settings page replaces the conversation pane.
+    pub(crate) settings_open: bool,
+    /// Whether the main window exists and whether a tray backs it.
+    window: window::WindowMode,
+    /// iced id of the main window while it exists.
+    window_id: Option<iced::window::Id>,
+    /// Size / position to reopen the window with.
+    geom: WindowGeom,
+    /// Last tray model handed to the tray service.
+    tray_sent: Option<crate::tray::TrayModel>,
 }
 
 /// Subscription key for the protocol stream. Changing `generation`
@@ -327,6 +346,19 @@ impl App {
             AuthState::WaitingForQr
         };
         let avatar_dir = (!cfg.mock).then(|| cfg.cache_dir.join("avatars"));
+        let settings = if cfg.mock {
+            crate::settings::Settings::default()
+        } else {
+            crate::settings::Settings::load(&cfg.config_dir)
+        };
+        // `--minimized` or the saved "start minimized" preference: no window.
+        let mut cfg = cfg;
+        if settings.start_minimized && cfg.screenshot.is_none() && !cfg.mock {
+            cfg.minimized = true;
+        }
+        let autostart = !cfg.mock && crate::autostart::is_enabled();
+        let window = App::initial_mode(&cfg, settings.close_to_tray);
+        let geom = WindowGeom::initial(cfg.screenshot.is_some());
         let app = Self {
             theme: FerroTheme::new(!cfg.light_theme),
             cfg,
@@ -389,14 +421,37 @@ impl App {
             chat_search: None,
             scene_started: false,
             scroll_y: 0.0,
+            settings,
+            autostart,
+            tray_checked: false,
+            settings_open: false,
+            window,
+            window_id: None,
+            geom,
+            tray_sent: None,
         };
         let mut app = app;
+        app.focused = !app.cfg.minimized;
         if cache_fallback {
             app.toast(
                 "The message cache could not be opened; this session keeps history in memory only.",
             );
         }
         let mut tasks = vec![Task::done(Message::FirstFrame)];
+        if app.window.open {
+            tasks.push(app.open_window());
+        }
+        if app.cfg.screenshot.is_none() {
+            // A tray icon, if the desktop has a panel for it. The answer
+            // decides whether closing the window may hide it.
+            let model = app.tray_model();
+            tasks.push(Task::perform(crate::tray::start(model), |up| {
+                Message::External(crate::ext::External::TrayUp(up))
+            }));
+        }
+        if matches!(app.cfg.screenshot, Some((ScreenshotTarget::Settings, _))) {
+            app.settings_open = true;
+        }
         if app.cfg.screenshot.is_some() {
             tasks.push(Task::perform(
                 tokio::time::sleep(Duration::from_millis(2500)),
@@ -407,7 +462,7 @@ impl App {
     }
 
     /// Wrapper for `iced::application`'s title.
-    pub fn title(&self) -> String {
+    pub fn title(&self, _window: iced::window::Id) -> String {
         let unread: u32 = self.chats.entries.iter().map(|e| e.meta.unread).sum();
         if unread > 0 {
             format!("({unread}) Ferrochat")
@@ -417,7 +472,7 @@ impl App {
     }
 
     /// iced theme.
-    pub fn iced_theme(&self) -> iced::Theme {
+    pub fn iced_theme(&self, _window: iced::window::Id) -> iced::Theme {
         self.theme.iced()
     }
 
@@ -430,9 +485,18 @@ impl App {
         };
         let mut subs = vec![
             Subscription::run_with(key, net_stream),
-            iced::event::listen_with(|event, _status, _id| match event {
-                iced::Event::Window(window::Event::Focused) => Some(Message::Focus(true)),
-                iced::Event::Window(window::Event::Unfocused) => Some(Message::Focus(false)),
+            iced::window::close_requests().map(Message::CloseRequested),
+            iced::window::close_events().map(Message::WindowClosed),
+            Subscription::run(crate::ext::stream).map(Message::External),
+            iced::event::listen_with(|event, _status, id| match event {
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
+                iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+                iced::Event::Window(iced::window::Event::Resized(size)) => {
+                    Some(Message::WindowResized(id, size))
+                }
+                iced::Event::Window(iced::window::Event::Moved(p)) => {
+                    Some(Message::WindowMoved(id, p))
+                }
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
@@ -450,9 +514,27 @@ impl App {
         Subscription::batch(subs)
     }
 
-    /// The only mutation point.
+    /// The only mutation point. Pushes the tray model afterwards.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        self.sync_tray();
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::External(ev) => self.on_external(ev),
+            Message::CloseRequested(id) => self.on_close_requested(id),
+            Message::WindowClosed(id) => self.on_window_closed(id),
+            Message::WindowResized(id, size) => {
+                self.on_window_resized(id, size);
+                Task::none()
+            }
+            Message::WindowMoved(id, p) => {
+                self.on_window_moved(id, p);
+                Task::none()
+            }
+            Message::Quit => self.quit(),
             Message::Ui(ui) => self.on_ui(ui),
             Message::Net(ev) => self.on_net(ev),
             Message::Done(done) => self.on_done(*done),
@@ -477,8 +559,8 @@ impl App {
                 }
                 Task::none()
             }
-            Message::CaptureScreenshot => window::latest()
-                .and_then(window::screenshot)
+            Message::CaptureScreenshot => iced::window::latest()
+                .and_then(iced::window::screenshot)
                 .map(|s| Message::done(Done::Screenshot(Box::new(s)))),
         }
     }
@@ -506,7 +588,8 @@ impl App {
             Ui::OpenChat(chat) => return self.open_chat(chat),
             Ui::CloseChat => {
                 // Esc closes the topmost layer first, the conversation last.
-                let consumed = self.dialog.take().is_some()
+                let consumed = std::mem::take(&mut self.settings_open)
+                    || self.dialog.take().is_some()
                     || self.popup.take().is_some()
                     || self.viewer.take().is_some()
                     || self.chat_search.take().is_some()
@@ -686,6 +769,12 @@ impl App {
                 return self.cleanup_session();
             }
             Ui::ToggleMenu => self.menu_open = !self.menu_open,
+            Ui::OpenSettings => {
+                self.menu_open = false;
+                self.settings_open = true;
+            }
+            Ui::CloseSettings => self.settings_open = false,
+            Ui::Toggle(setting) => return self.toggle_setting(setting),
             Ui::DismissToast => self.toast = None,
             Ui::SimulateScan => {
                 if let Some(c) = &self.client {
@@ -1564,12 +1653,13 @@ impl App {
                 .iter()
                 .filter(|m| fresh.contains(&m.id))
                 .filter(|m| {
-                    let muted = self.chats.get(&m.chat).is_some_and(|e| e.meta.muted);
+                    let muted = self.settings.muted
+                        || self.chats.get(&m.chat).is_some_and(|e| e.meta.muted);
                     state::should_notify(m, open_chat.as_deref(), self.focused, muted)
                 })
                 .collect();
             let mode = self.cfg.notification_preview;
-            let texts: Vec<(String, String)> = match origin {
+            let texts: Vec<(String, String, Option<String>)> = match origin {
                 Origin::Live => notify
                     .iter()
                     .map(|m| {
@@ -1579,24 +1669,35 @@ impl App {
                             .unwrap_or_else(|| self.chats.display_name(&m.sender));
                         let group =
                             net::is_group_jid(&m.chat).then(|| self.chats.display_name(&m.chat));
-                        crate::notify::notification_text(
+                        let (summary, body) = crate::notify::notification_text(
                             &sender,
                             group.as_deref(),
                             &m.content.preview(),
                             mode,
-                        )
+                        );
+                        (summary, body, Some(m.chat.clone()))
                     })
                     .collect(),
                 // One summary for an offline drain instead of a burst.
                 _ if !notify.is_empty() => {
                     let chats: HashSet<&str> = notify.iter().map(|m| m.chat.as_str()).collect();
-                    vec![crate::notify::summary_text(notify.len(), chats.len())]
+                    let (summary, body) = crate::notify::summary_text(notify.len(), chats.len());
+                    let only = (chats.len() == 1).then(|| notify[0].chat.clone());
+                    vec![(summary, body, only)]
                 }
                 _ => Vec::new(),
             };
-            for (summary, body) in texts {
+            for (summary, body, chat) in texts {
                 tasks.push(blocking(
-                    move || crate::notify::show(&summary, &body),
+                    move || {
+                        // Clicking it shows the window and opens that chat.
+                        let on_click = chat.map(|chat| -> crate::notify::OnClick {
+                            Box::new(move || {
+                                crate::ext::send(crate::ext::External::Show { chat: Some(chat) })
+                            })
+                        });
+                        crate::notify::show(&summary, &body, on_click)
+                    },
                     |_| Message::done(Done::Nothing),
                 ));
             }
@@ -1803,6 +1904,11 @@ impl App {
             Done::VideoOpened(Ok(_)) => self.toast("Opened in your video player."),
             Done::VideoOpened(Err(e)) => self.toast(format!("Could not open the video: {e}")),
             Done::Stored(Err(e)) => tracing::warn!(error = %e, "cache write failed"),
+            Done::Autostart(Ok(on)) => self.autostart = on,
+            Done::Autostart(Err(e)) => {
+                tracing::warn!(error = %e, "autostart entry not changed");
+                self.toast("Could not change the start-at-login setting.");
+            }
             Done::Stored(Ok(())) | Done::Nothing => {}
             Done::CleanedUp(problems) => {
                 if !problems.is_empty() {
@@ -1920,7 +2026,7 @@ fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
         .unwrap_or(candidate)
 }
 
-fn save_png(path: &std::path::Path, shot: &window::Screenshot) -> Result<(), String> {
+fn save_png(path: &std::path::Path, shot: &iced::window::Screenshot) -> Result<(), String> {
     let (w, h) = (shot.size.width, shot.size.height);
     let img = ::image::RgbaImage::from_raw(w, h, shot.rgba.to_vec())
         .ok_or_else(|| "bad screenshot buffer".to_string())?;
