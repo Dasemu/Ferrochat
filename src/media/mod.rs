@@ -11,8 +11,12 @@ use crate::error::{Error, Result};
 /// Largest media blob Ferrochat downloads (WhatsApp's own document limit is 2 GB;
 /// a desktop cache keeps a tighter bound).
 pub const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
-/// Largest decoded image accepted (pixels), to bound decode memory.
+/// Largest decoded image accepted when the user opens it (pixels).
 pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+/// Largest image decoded automatically while scrolling a chat (pixels).
+pub const MAX_AUTO_IMAGE_PIXELS: u64 = 16_000_000;
+/// Concurrent media downloads.
+pub const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
 /// Rejects downloads above [`MAX_DOWNLOAD_BYTES`].
 pub fn check_download_size(len: u64) -> Result<()> {
@@ -44,11 +48,18 @@ impl<K: Hash + Eq, V> ByteLru<K, V> {
 
     /// Inserts `value` of `size` bytes, evicting least-recently-used entries.
     pub fn put(&mut self, key: K, value: V, size: usize) {
+        if size > self.budget {
+            // Never keep a single entry that alone exceeds the budget.
+            if let Some((_, old)) = self.inner.pop(&key) {
+                self.bytes -= old;
+            }
+            return;
+        }
         if let Some((_, old)) = self.inner.put(key, (value, size)) {
             self.bytes -= old;
         }
         self.bytes += size;
-        while self.bytes > self.budget && self.inner.len() > 1 {
+        while self.bytes > self.budget {
             if let Some((_, (_, s))) = self.inner.pop_lru() {
                 self.bytes -= s;
             }
@@ -115,5 +126,11 @@ mod tests {
         c.put("a", 9, 10);
         assert_eq!(c.bytes(), 50);
         assert_eq!(c.peek(&"a"), Some(&9));
+        // An entry bigger than the whole budget is not kept (and replaces nothing).
+        c.put("huge", 1, 101);
+        assert!(!c.contains(&"huge"));
+        c.put("a", 2, 500);
+        assert!(!c.contains(&"a"));
+        assert_eq!(c.bytes(), 40);
     }
 }

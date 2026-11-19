@@ -16,12 +16,17 @@ fn media_err(e: impl std::fmt::Display) -> Error {
 /// Reads only the header and rejects images whose decoded size would exceed
 /// [`crate::media::MAX_IMAGE_PIXELS`] (decompression bombs).
 pub fn check_image_bounds(bytes: &[u8]) -> Result<(u32, u32)> {
+    check_image_bounds_max(bytes, crate::media::MAX_IMAGE_PIXELS)
+}
+
+/// [`check_image_bounds`] with an explicit pixel cap.
+pub fn check_image_bounds_max(bytes: &[u8], max_pixels: u64) -> Result<(u32, u32)> {
     let (w, h) = image::ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()
         .map_err(media_err)?
         .into_dimensions()
         .map_err(media_err)?;
-    if w as u64 * h as u64 > crate::media::MAX_IMAGE_PIXELS {
+    if w as u64 * h as u64 > max_pixels {
         return Err(Error::Media(format!("image too large ({w}x{h})")));
     }
     Ok((w, h))

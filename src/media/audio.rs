@@ -43,8 +43,21 @@ fn media_err(e: impl std::fmt::Display) -> Error {
     Error::Media(e.to_string())
 }
 
-/// Decodes an Ogg/Opus file.
+/// Hard cap on decoded audio: 10 minutes per channel at 48 kHz.
+pub const MAX_DECODED_SECONDS: u64 = 10 * 60;
+/// Hard cap on Opus packets (20 ms each → 30 minutes; real notes use far fewer).
+pub const MAX_PACKETS: usize = 90_000;
+
+/// Decodes an Ogg/Opus file with no declared duration (10-minute cap).
 pub fn decode_ogg_opus(bytes: &[u8]) -> Result<Pcm> {
+    decode_ogg_opus_bounded(bytes, None)
+}
+
+/// Decodes an Ogg/Opus file, refusing to produce more audio than
+/// `declared_secs` (plus slack) or [`MAX_DECODED_SECONDS`], whichever is
+/// smaller. Protects against decompression bombs: a few hundred kB of
+/// crafted packets can otherwise expand to gigabytes of PCM.
+pub fn decode_ogg_opus_bounded(bytes: &[u8], declared_secs: Option<u32>) -> Result<Pcm> {
     let mut reader = ogg::PacketReader::new(Cursor::new(bytes));
     let head = reader
         .read_packet()
@@ -60,19 +73,39 @@ pub fn decode_ogg_opus(bytes: &[u8]) -> Result<Pcm> {
     } else {
         opus::Channels::Mono
     };
+    let max_secs = match declared_secs {
+        // Declared length + 50 % + 10 s slack, never above the hard cap.
+        Some(d) if d > 0 => (d as u64 * 3 / 2 + 10).min(MAX_DECODED_SECONDS),
+        _ => MAX_DECODED_SECONDS,
+    };
+    let max_samples = (max_secs * OPUS_RATE as u64 * channels as u64) as usize;
     let mut decoder = opus::Decoder::new(OPUS_RATE, ch).map_err(media_err)?;
     let mut out: Vec<f32> = Vec::new();
     let mut buf = vec![0f32; 5760 * channels as usize];
     let mut seen_tags = false;
+    let mut packets = 0usize;
     while let Some(pkt) = reader.read_packet().map_err(media_err)? {
         if !seen_tags && pkt.data.starts_with(b"OpusTags") {
             seen_tags = true;
             continue;
         }
+        if pkt.data.is_empty() {
+            continue;
+        }
+        packets += 1;
+        if packets > MAX_PACKETS {
+            return Err(media_err("voice note has too many packets"));
+        }
         let n = decoder
             .decode_float(&pkt.data, &mut buf, false)
             .map_err(media_err)?;
-        out.extend_from_slice(&buf[..n * channels as usize]);
+        let n = n * channels as usize;
+        if out.len() + n > max_samples {
+            return Err(media_err(format!(
+                "voice note decodes to more than {max_secs} s of audio"
+            )));
+        }
+        out.extend_from_slice(&buf[..n]);
     }
     let skip = (pre_skip * channels as usize).min(out.len());
     out.drain(..skip);
@@ -325,12 +358,26 @@ impl Player {
     }
 }
 
-/// Microphone capture for voice notes.
-pub struct Recorder {
-    stream: Option<rodio::cpal::Stream>,
-    buf: Arc<Mutex<Vec<f32>>>,
+/// Longest voice note that can be recorded.
+pub const MAX_RECORDING_SECS: u64 = 30 * 60;
+
+#[derive(Default)]
+struct Capture {
+    samples: Vec<f32>,
     channels: u16,
     rate: u32,
+    max_samples: usize,
+    error: Option<String>,
+    full: bool,
+}
+
+/// Microphone capture for voice notes. The `cpal` stream is not `Send`, so
+/// it lives on its own thread; `start` returns immediately (no device I/O on
+/// the UI thread) and failures show up in [`Recorder::error`].
+pub struct Recorder {
+    stop: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    cap: Arc<Mutex<Capture>>,
 }
 
 impl std::fmt::Debug for Recorder {
@@ -339,59 +386,109 @@ impl std::fmt::Debug for Recorder {
     }
 }
 
+fn push_capped(cap: &Mutex<Capture>, data: impl Iterator<Item = f32>) {
+    if let Ok(mut c) = cap.lock() {
+        let room = c.max_samples.saturating_sub(c.samples.len());
+        c.samples.extend(data.take(room));
+        c.full = c.samples.len() >= c.max_samples;
+    }
+}
+
+fn capture_thread(cap: Arc<Mutex<Capture>>, stop: mpsc::Receiver<()>) -> Result<()> {
+    use rodio::DeviceTrait;
+    use rodio::cpal::traits::{HostTrait, StreamTrait};
+    let host = rodio::cpal::default_host();
+    let dev = host
+        .default_input_device()
+        .ok_or_else(|| media_err("no microphone found"))?;
+    let cfg = dev.default_input_config().map_err(media_err)?;
+    if let Ok(mut c) = cap.lock() {
+        c.channels = cfg.channels().max(1);
+        c.rate = cfg.sample_rate().0;
+        c.max_samples = (MAX_RECORDING_SECS * c.rate as u64 * c.channels as u64)
+            .min(usize::MAX as u64) as usize;
+    }
+    let err_fn = |e| tracing::warn!(error = %e, "microphone stream error");
+    let (c1, c2) = (cap.clone(), cap.clone());
+    let stream = match cfg.sample_format() {
+        rodio::cpal::SampleFormat::F32 => dev.build_input_stream(
+            &cfg.into(),
+            move |data: &[f32], _: &_| push_capped(&c1, data.iter().copied()),
+            err_fn,
+            None,
+        ),
+        rodio::cpal::SampleFormat::I16 => dev.build_input_stream(
+            &cfg.into(),
+            move |data: &[i16], _: &_| {
+                push_capped(&c2, data.iter().map(|s| *s as f32 / i16::MAX as f32))
+            },
+            err_fn,
+            None,
+        ),
+        other => return Err(media_err(format!("unsupported sample format {other:?}"))),
+    }
+    .map_err(media_err)?;
+    stream.play().map_err(media_err)?;
+    let _ = stop.recv();
+    drop(stream);
+    Ok(())
+}
+
 impl Recorder {
-    /// Opens the default input device and starts capturing.
-    pub fn start() -> Result<Self> {
-        use rodio::DeviceTrait;
-        use rodio::cpal::traits::{HostTrait, StreamTrait};
-        let host = rodio::cpal::default_host();
-        let dev = host
-            .default_input_device()
-            .ok_or_else(|| media_err("no microphone found"))?;
-        let cfg = dev.default_input_config().map_err(media_err)?;
-        let channels = cfg.channels();
-        let rate = cfg.sample_rate().0;
-        let buf = Arc::new(Mutex::new(Vec::<f32>::new()));
-        let b = buf.clone();
-        let err_fn = |e| tracing::warn!(error = %e, "microphone stream error");
-        let stream = match cfg.sample_format() {
-            rodio::cpal::SampleFormat::F32 => dev.build_input_stream(
-                &cfg.into(),
-                move |data: &[f32], _: &_| {
-                    if let Ok(mut v) = b.lock() {
-                        v.extend_from_slice(data);
-                    }
-                },
-                err_fn,
-                None,
-            ),
-            rodio::cpal::SampleFormat::I16 => dev.build_input_stream(
-                &cfg.into(),
-                move |data: &[i16], _: &_| {
-                    if let Ok(mut v) = b.lock() {
-                        v.extend(data.iter().map(|s| *s as f32 / i16::MAX as f32));
-                    }
-                },
-                err_fn,
-                None,
-            ),
-            other => return Err(media_err(format!("unsupported sample format {other:?}"))),
+    /// Starts capturing from the default input device on a worker thread.
+    pub fn start() -> Self {
+        let (stop, stop_rx) = mpsc::channel();
+        let cap = Arc::new(Mutex::new(Capture {
+            max_samples: (MAX_RECORDING_SECS * OPUS_RATE as u64 * 2) as usize,
+            ..Default::default()
+        }));
+        let c = cap.clone();
+        let thread = std::thread::Builder::new()
+            .name("ferrochat-mic".into())
+            .spawn(move || {
+                if let Err(e) = capture_thread(c.clone(), stop_rx)
+                    && let Ok(mut g) = c.lock()
+                {
+                    g.error = Some(e.user_message());
+                }
+            })
+            .ok();
+        if thread.is_none()
+            && let Ok(mut g) = cap.lock()
+        {
+            g.error = Some("could not start the recording thread".into());
         }
-        .map_err(media_err)?;
-        stream.play().map_err(media_err)?;
-        Ok(Self {
-            stream: Some(stream),
-            buf,
-            channels,
-            rate,
-        })
+        Self { stop, thread, cap }
     }
 
-    /// Stops capturing and returns mono 48 kHz samples.
+    /// Error raised by the capture thread, if any.
+    pub fn error(&self) -> Option<String> {
+        self.cap.lock().ok().and_then(|c| c.error.clone())
+    }
+
+    /// The length cap was reached.
+    pub fn is_full(&self) -> bool {
+        self.cap.lock().is_ok_and(|c| c.full)
+    }
+
+    /// Stops capturing and returns mono 48 kHz samples. Blocking (joins the
+    /// thread and resamples): call from `spawn_blocking`.
     pub fn finish(mut self) -> Vec<f32> {
-        drop(self.stream.take());
-        let raw = self.buf.lock().map(|v| v.clone()).unwrap_or_default();
-        to_mono_48k(&raw, self.channels, self.rate)
+        let _ = self.stop.send(());
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+        let c = match self.cap.lock() {
+            Ok(mut c) => std::mem::take(&mut *c),
+            Err(_) => return Vec::new(),
+        };
+        to_mono_48k(&c.samples, c.channels.max(1), c.rate)
+    }
+}
+
+impl Drop for Recorder {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
     }
 }
 
@@ -417,6 +514,61 @@ mod tests {
         assert!((990..=1030).contains(&ms), "duration {ms}");
         let energy: f32 = decoded.samples.iter().map(|s| s * s).sum();
         assert!(energy > 100.0);
+    }
+
+    /// Same construction as the reviewer's reproduction: tiny code-3 packets
+    /// that each expand to 120 ms of audio.
+    fn bomb(packets: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut w = ogg::PacketWriter::new(&mut out);
+            let mut head = b"OpusHead".to_vec();
+            head.extend_from_slice(&[1, 1]);
+            head.extend_from_slice(&312u16.to_le_bytes());
+            head.extend_from_slice(&48_000u32.to_le_bytes());
+            head.extend_from_slice(&[0, 0, 0]);
+            w.write_packet(head, 1, ogg::PacketWriteEndInfo::EndPage, 0)
+                .unwrap();
+            let mut tags = b"OpusTags".to_vec();
+            tags.extend_from_slice(&[0; 8]);
+            w.write_packet(tags, 1, ogg::PacketWriteEndInfo::EndPage, 0)
+                .unwrap();
+            for i in 0..packets {
+                let end = if i + 1 == packets {
+                    ogg::PacketWriteEndInfo::EndStream
+                } else {
+                    ogg::PacketWriteEndInfo::NormalPacket
+                };
+                w.write_packet(vec![0x7B, 0x02], 1, end, (i + 1) * 5760)
+                    .unwrap();
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn decompression_bomb_is_rejected() {
+        // 20 000 tiny packets expand to minutes of audio from ~200 kB of input.
+        let b = bomb(20_000);
+        assert!(b.len() < 400_000);
+        assert!(decode_ogg_opus(&b).is_err());
+        // A declared 9 s note may not expand to a minute.
+        assert!(decode_ogg_opus_bounded(&bomb(1500), Some(9)).is_err());
+        // Within bounds it still decodes.
+        assert!(decode_ogg_opus_bounded(&bomb(50), Some(9)).is_ok());
+    }
+
+    #[test]
+    fn capture_buffer_is_capped() {
+        let cap = Mutex::new(Capture {
+            max_samples: 10,
+            ..Default::default()
+        });
+        push_capped(&cap, std::iter::repeat_n(0.1, 7));
+        push_capped(&cap, std::iter::repeat_n(0.1, 7));
+        let c = cap.lock().unwrap();
+        assert_eq!(c.samples.len(), 10);
+        assert!(c.full);
     }
 
     #[test]
