@@ -15,6 +15,34 @@ dark theme.
 > to lose. No WhatsApp logos, icons or fonts are shipped; the look is
 > recreated with Inter (OFL) and Lucide icons (ISC).
 
+## Install / update
+
+Linux x86_64, no root needed. One command installs and updates (it downloads
+the latest [release](https://github.com/Dasemu/Ferrochat/releases/latest), checks
+its SHA-256 and puts the binary, menu entry and icon under `~/.local`):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dasemu/Ferrochat/main/install.sh | sh
+```
+
+Uninstall (removes only what the installer added, never your account data):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Dasemu/Ferrochat/main/install.sh | sh -s -- --uninstall
+```
+
+Manual alternative: download `ferrochat-vX.Y.Z-linux-x86_64.tar.gz` and its
+`.sha256` from the Releases page, then:
+
+```sh
+sha256sum -c ferrochat-*-linux-x86_64.tar.gz.sha256
+tar xzf ferrochat-*-linux-x86_64.tar.gz
+./ferrochat-*-linux-x86_64/ferrochat
+```
+
+The tarball also has `packaging/dev.ferro.ferrochat.desktop` and `.svg` if you want
+a menu entry. Releases are built on Ubuntu 22.04 (glibc 2.35).
+
 ![Chat](docs/screenshots/chat.png)
 
 ## Features

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Ferrochat
+GenericName=WhatsApp client
+Comment=Lightweight unofficial WhatsApp desktop client
+Exec=ferrochat %U
+Icon=dev.ferro.ferrochat
+Terminal=false
+Categories=Network;InstantMessaging;Chat;
+Keywords=whatsapp;chat;messenger;
+StartupWMClass=dev.ferro.ferrochat
