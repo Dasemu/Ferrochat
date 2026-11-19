@@ -85,21 +85,23 @@ pub enum Event {
     Failed(Failure),
 }
 
+/// The helper inside `dir`, if it is there.
+pub fn helper_in(dir: &Path) -> Option<PathBuf> {
+    let p = dir.join(HELPER_NAME);
+    p.is_file().then_some(p)
+}
+
 /// The helper executable: next to this binary, else on `PATH`.
 pub fn helper_path() -> Option<PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let p = dir.join(HELPER_NAME);
-        if p.is_file() {
+        if let Some(p) = helper_in(dir) {
             return Some(p);
         }
         // `cargo test` runs from target/debug/deps.
-        if let Some(up) = dir.parent() {
-            let p = up.join(HELPER_NAME);
-            if p.is_file() {
-                return Some(p);
-            }
+        if let Some(p) = dir.parent().and_then(helper_in) {
+            return Some(p);
         }
     }
     let path = std::env::var_os("PATH")?;

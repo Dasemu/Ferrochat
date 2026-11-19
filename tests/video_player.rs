@@ -210,10 +210,10 @@ async fn a_helper_that_cannot_load_gstreamer_is_reported_as_unavailable() {
 }
 
 #[test]
-fn the_helper_is_found_next_to_the_app() {
-    // `cargo test` builds the helper into target/debug, one level above the
-    // test executable's deps directory.
-    assert!(video::helper_path().is_some());
+fn the_helper_is_found_in_its_directory() {
+    let dir = Path::new(HELPER).parent().unwrap();
+    assert_eq!(video::helper_in(dir).as_deref(), Some(Path::new(HELPER)));
+    assert!(video::helper_in(Path::new("/nonexistent")).is_none());
 }
 
 #[allow(dead_code)]
