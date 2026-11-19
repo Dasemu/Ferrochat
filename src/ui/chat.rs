@@ -1183,7 +1183,7 @@ pub fn highlight_spans<'a>(
     }
     let mut spans = Vec::new();
     let mut at = 0;
-    while let Some(pos) = lower[at..].find(term) {
+    while let Some(pos) = lower.get(at..).and_then(|rest| rest.find(term)) {
         let (start, end) = (at + pos, at + pos + term.len());
         if !s.is_char_boundary(start) || !s.is_char_boundary(end) {
             break;
@@ -1502,6 +1502,22 @@ pub fn viewer<'a>(app: &'a App, id: &'a str) -> El<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlight_spans_split_around_matches() {
+        let spans = highlight_spans("Hola hola HOLA", "hola", Color::WHITE);
+        // plain, match, plain, match, plain, match => 3 matches + 2 gaps
+        assert_eq!(spans.len(), 5);
+        assert_eq!(
+            highlight_spans("nothing here", "zzz", Color::WHITE).len(),
+            1
+        );
+        // Characters whose lower-case form has a different length are never
+        // sliced at a wrong boundary.
+        assert_eq!(highlight_spans("İstanbul", "stan", Color::WHITE).len(), 1);
+        assert_eq!(highlight_spans("", "x", Color::WHITE).len(), 1);
+        assert_eq!(highlight_spans("ñandú ñ", "ñ", Color::WHITE).len(), 3);
+    }
 
     #[test]
     fn fit_keeps_aspect_and_bounds() {

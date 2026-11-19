@@ -1856,17 +1856,18 @@ impl App {
         };
         let ui = |u: Ui| Task::done(Message::Ui(u));
         let mut v = Vec::new();
+        let mut hover = None;
         match target {
             ScreenshotTarget::Reply => {
                 if let (Some(a), Some(b)) = (find("Perfecto, ¡gracias!"), find("Qué pasada")) {
                     v.push(ui(Ui::StartReply(a)));
-                    v.push(ui(Ui::HoverMessage(b.clone())));
+                    hover = Some(b.clone());
                     v.push(ui(Ui::ToggleMessageMenu(b)));
                 }
             }
             ScreenshotTarget::Reactions => {
                 if let Some(a) = find("Qué pasada") {
-                    v.push(ui(Ui::HoverMessage(a.clone())));
+                    hover = Some(a.clone());
                     v.push(ui(Ui::ToggleReactionPicker(a)));
                 }
             }
@@ -1882,6 +1883,7 @@ impl App {
             }
             _ => {}
         }
+        self.hovered = hover;
         v
     }
 

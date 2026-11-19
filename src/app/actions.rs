@@ -130,6 +130,10 @@ impl App {
     /// variants that belong to the core update loop.
     pub(super) fn on_ui_extra(&mut self, ui: Ui) -> Result<Task<Message>, Ui> {
         Ok(match ui {
+            // Screenshots script their own hover; a stray X pointer must not move it.
+            Ui::HoverMessage(_) | Ui::UnhoverMessage(_) if self.cfg.screenshot.is_some() => {
+                Task::none()
+            }
             Ui::HoverMessage(id) => {
                 self.hovered = Some(id);
                 Task::none()

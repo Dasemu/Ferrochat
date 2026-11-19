@@ -21,6 +21,8 @@ pub fn base_message(msg: &wa::Message) -> &wa::Message {
             .as_option()
             .or(cur.view_once_message.as_option())
             .or(cur.document_with_caption_message.as_option())
+            // History stores an edited message as its latest content.
+            .or(cur.edited_message.as_option())
             .and_then(|f| f.message.as_option());
         match inner {
             Some(m) => cur = m,
@@ -73,6 +75,7 @@ pub fn is_view_once(msg: &wa::Message) -> bool {
             .ephemeral_message
             .as_option()
             .or(cur.document_with_caption_message.as_option())
+            .or(cur.edited_message.as_option())
             .and_then(|f| f.message.as_option())
         {
             Some(m) => cur = m,
@@ -1231,6 +1234,20 @@ mod parity_tests {
             content_from_wa(&bare),
             Some(Content::Video { media: None, .. })
         ));
+    }
+
+    #[test]
+    fn history_edited_wrapper_shows_the_latest_text() {
+        let wrapped = wa::Message {
+            edited_message: buffa_some(wa::message::FutureProofMessage {
+                message: buffa_some(build_text("latest text")),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(
+            content_from_wa(&wrapped),
+            Some(Content::Text("latest text".into()))
+        );
     }
 
     #[test]
