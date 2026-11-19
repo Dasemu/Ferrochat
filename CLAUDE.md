@@ -38,7 +38,9 @@ entry id: `dev.ferro.ferrochat`.
 ## Gotchas
 - Only ONE `libsqlite3-sys` may link: it is pinned to 0.37 with `bundled-sqlcipher`;
   `rusqlite` must stay on 0.39 and `whatsapp-rust` default features stay OFF.
-- SQLCipher needs OpenSSL (`libssl-dev`); voice notes need `libopus-dev` + `cmake`.
+- SQLCipher needs OpenSSL (`libssl-dev`); libopus is built from bundled source and
+  linked statically (`.cargo/config.toml`, needs `cmake`).
+- Never delete the session store except on a real logout; see `docs/protocol.md` §3.
 - `scrollable().anchor_bottom()` reverses offsets: "bottom" is `RelativeOffset::START`.
 - iced style fns returning `impl Fn` need `+ use<>` (edition 2024 captures).
 - Keep iced default features on (x11/wayland backends).

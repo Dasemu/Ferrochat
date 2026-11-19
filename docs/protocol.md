@@ -44,20 +44,27 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `PairingQrCodesExhausted` | `QrExhausted` | "Click to reload QR code" (restarts the client) |
 | `PairSuccess` / `PairError` | same | logged in / error under the QR |
 | `Connected` | `Connection(Connected)` + `Connected { jid }` | banner cleared |
-| `Disconnected`, `ConnectFailure`, `StreamError` | `Connection(Reconnecting { attempt })` | banner; the library reconnects with backoff |
-| `LoggedOut`, `StreamReplaced` | `LoggedOut { reason }` | session store and key deleted, cache wiped, back to QR |
+| `Disconnected`, `StreamError`, `ConnectFailure` 500/503 | `Connection(Reconnecting { attempt })` | banner; the library reconnects with backoff |
+| `ConnectFailure` other 4xx | `Connection(Offline { reason })` | library stopped; app retries with its own backoff (1 s → 60 s + jitter) and shows "Retry now" |
+| `ConnectFailure` 401/403/406, `LoggedOut` | `LoggedOut { reason }` | session store and key deleted, cache wiped, back to QR (the only automatic wipe) |
+| `StreamReplaced` | `Connection(Replaced)` | **non-destructive**: library stopped, banner "WhatsApp is open on another computer" with "Use here" |
 | `TemporaryBan`, `ClientOutdated` | `Fatal` | shown on the login screen |
-| `Messages` | `Messages { live }` | stored, reducers, notifications (live only), read receipts |
+| `Messages` | `LidMappings` + `Messages { origin: Live \| Offline }` | stored first; ids the store did not have count as unread (live and offline-drained alike); one notification per live message, one summary per offline drain |
 | `Receipt` | `Receipt` or `ChatRead` (read-self) | tick state machine |
-| `HistorySync` | `History` + `Messages { live: false }` | chats, names, cached messages |
+| `HistorySync` | `LidMappings` + `History` / `Messages { origin: History }` in chunks of 500 | chats, names, cached messages; never counted as unread |
 | `PushNameUpdate`, `ContactUpdate` | `ContactName` | display names |
 | `MarkChatAsReadUpdate` | `ChatRead` | badge cleared |
 
 Message bodies handled: `conversation`, `extendedTextMessage`,
 `imageMessage`, `documentMessage` (also wrapped in
 `documentWithCaptionMessage`), `audioMessage` (PTT and audio files),
-`protocolMessage{REVOKE}` (shown as "This message was deleted").
-Ephemeral / view-once wrappers are unwrapped. Video, stickers, locations,
+`protocolMessage{REVOKE}` (shown as "This message was deleted", applied only
+when the revoker is the original sender: our own devices for our messages,
+the same participant otherwise; group-admin revokes are ignored because they
+cannot be verified locally). Ephemeral wrappers are unwrapped; disappearing
+messages carry `expires_at` and are pruned from the cache when it passes.
+**View-once** messages are rendered as "View once message: open it on your
+phone": their media reference is never exposed, downloaded or stored. Video, stickers, locations,
 contacts and polls show an "unsupported" placeholder; reactions and key
 distribution messages are not bubbles.
 
@@ -80,10 +87,31 @@ because KDE renders a subset of HTML in them.
 Images and voice notes are kept in memory only (byte-bounded LRUs: 48 MB
 images, 16 MB decoded audio) and re-downloaded after a restart.
 
-If the keyring has no key but a session file exists (keyring wiped), the
-file is undecryptable and is deleted; the user pairs again. If no Secret
-Service is reachable the login screen shows an explicit error instead of
-falling back to a file.
+The session store is **never deleted automatically** except on a real
+logout (user action or server-side unlink). Only `SQLITE_NOTADB` (wrong key)
+or a missing/malformed keyring entry next to an existing session counts as
+"unreadable": the login screen then explains it and offers "Discard saved
+session and link again"; no new key is minted over an existing session. Any
+other error (I/O, permissions, busy database, migration) is shown as an
+error with "Try again" and nothing is touched. If no Secret Service is
+reachable the login screen explains how to enable KWallet / GNOME Keyring
+and "Try again" retries without restarting; there is no file fallback (an
+opt-in passphrase-encrypted fallback is future work).
+
+A single-instance lock (`ferrochat.lock` in the data directory, OS file
+lock) prevents two Ferrochat processes from sharing one session store.
+
+The SQLCipher key only lives in zeroized buffers (`secrecy`, `Zeroizing`).
+Media limits: downloads ≤ 100 MB, at most 4 concurrent; images are
+header-probed and refused above 16 Mpx when auto-downloaded and 40 Mpx when
+opened; voice notes refuse to decode beyond their declared duration
+(+50 % + 10 s) or 10 minutes, and beyond 90 000 packets (decompression
+bombs). Recording stops at 30 minutes. Documents with executable or active
+content types (`.exe`, `.bat`, `.ps1`, `.lnk`, `.jar`, `.msi`, `.desktop`,
+`.sh`, `.AppImage`, `.html`, `.svg`, …) are saved but never launched; file
+names are sanitised (separators, control characters, trailing dots/spaces,
+reserved Windows names). Files are opened without a shell (`open` crate:
+`xdg-open` / `ShellExecuteW`).
 
 `--mock` mode uses an in-memory secret store and an in-memory cache and
 writes nothing except an optional screenshot.
@@ -128,9 +156,13 @@ draws the waveform bars as played / unplayed.
 
 ## 7. Known protocol gaps
 
-* LID vs. phone-number addressing: chats are keyed by whatever JID the
-  server uses (`…@lid` or `…@s.whatsapp.net`); the same contact can appear
-  twice if the server switches addressing mid-history.
+* LID vs. phone-number addressing: LID ↔ PN pairs are learned from
+  envelopes (`sender_alt` / `recipient_alt`), history sync
+  (`phoneNumberToLidMappings`, conversation `pnJid`/`lidJid`) and persisted
+  (`lid_map` table); messages, receipts, history chats and names are
+  normalised to the PN JID. A LID seen before any mapping is learned still
+  forms its own chat until the pair arrives (existing rows are not merged
+  retroactively).
 * Group "read" ticks turn blue on the first participant's read receipt
   (WhatsApp waits for all participants).
 * No profile pictures, typing indicators, replies, reactions, edits or

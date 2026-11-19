@@ -70,3 +70,17 @@ next change.
 * A shared build host fills its disk quickly: debug test binaries with full
   debuginfo reached 16 GB. Remove `target/debug/incremental` when short on
   space.
+
+## Review round 1
+
+* Never delete a session automatically. Only a real logout wipes; a wrong
+  key is `SQLITE_NOTADB` and still needs the user's confirmation; I/O and
+  migration errors are retryable errors. `StreamReplaced` is not a logout.
+* Count unread by "the store did not have this id", not by delivery path:
+  the offline drain after reconnect is exactly when users expect badges.
+* Compressed media needs output caps: a few hundred kB of Opus packets can
+  decode to gigabytes. Cap by declared duration and packet count.
+* `pkg-config` will not link system libraries statically; build libopus from
+  the bundled source (`LIBOPUS_NO_PKG=1`) to get a static link.
+* Version sync must be a real merge of main into development (simulated in
+  `.github/scripts/version.sh`), or the second release conflicts.

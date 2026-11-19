@@ -40,12 +40,16 @@ Rust stable (edition 2024, ≥ 1.94) and, on Debian/Ubuntu:
 
 ```sh
 sudo apt-get install -y pkg-config cmake libdbus-1-dev libasound2-dev \
-  libxkbcommon-dev libwayland-dev libssl-dev libopus-dev libfontconfig1-dev
+  libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev
 cargo build --release
 ```
 
-`libssl-dev` is needed for SQLCipher (the encrypted session store),
-`libopus-dev` for voice notes. Linux (KDE Plasma / Wayland) is the primary
+`libssl-dev` is needed for SQLCipher (the encrypted session store);
+`cmake` builds the bundled libopus, which is linked statically
+(`.cargo/config.toml` sets `LIBOPUS_NO_PKG=1`), so the binary needs no
+libopus package at runtime. Runtime packages: OpenSSL's `libcrypto`, ALSA /
+PipeWire, D-Bus, a Secret Service (KWallet or GNOME Keyring) and
+`xdg-open`. Linux (KDE Plasma / Wayland) is the primary
 target; Windows and macOS should build but are not tested.
 
 ## Run
