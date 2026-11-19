@@ -1,0 +1,5 @@
+# Build libopus from the source bundled in audiopus_sys and link it
+# statically (the crate's "static" feature), so the binary does not need a
+# libopus runtime package. Requires cmake at build time.
+[env]
+LIBOPUS_NO_PKG = "1"

@@ -46,6 +46,10 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "t
 rodio = { version = "0.21", default-features = false, features = ["playback"] }
 ogg = "0.9"
 opus = "0.3"
+# Same crate opus uses; "static" links libopus.a so the binary has no runtime libopus dependency.
+audiopus_sys = { version = "0.2", features = ["static"] }
+# Opens documents without a shell (ShellExecuteW on Windows, xdg-open/open elsewhere).
+open = { version = "5", features = ["shellexecute-on-windows"] }
 lru = "0.16"
 
 [dev-dependencies]
