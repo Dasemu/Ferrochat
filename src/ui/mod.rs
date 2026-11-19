@@ -3,6 +3,7 @@
 pub mod chat;
 pub mod icons;
 pub mod login;
+pub mod settings;
 pub mod sidebar;
 pub mod theme;
 
@@ -18,15 +19,24 @@ use theme::FerroTheme;
 /// Element alias.
 pub type El<'a> = Element<'a, Message>;
 
+/// `iced::daemon` view: one main window, whatever its id.
+pub fn view_window(app: &App, _window: iced::window::Id) -> El<'_> {
+    view(app)
+}
+
 /// Root view dispatcher.
 pub fn view(app: &App) -> El<'_> {
     let t = &app.theme;
     let base: El<'_> = if app.auth.shows_login() {
         login::view(app)
     } else {
-        let conv: El<'_> = match &app.open {
-            Some(c) => chat::view(app, c),
-            None => chat::empty(app),
+        let conv: El<'_> = if app.settings_open {
+            settings::view(app)
+        } else {
+            match &app.open {
+                Some(c) => chat::view(app, c),
+                None => chat::empty(app),
+            }
         };
         row![
             sidebar::rail(app),

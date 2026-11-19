@@ -59,9 +59,36 @@ pub fn summary_text(messages: usize, chats: usize) -> (String, String) {
     ("Ferrochat".into(), body)
 }
 
-/// Shows a notification. Blocking (D-Bus round trip): call from
-/// `spawn_blocking`. Failures are logged, never fatal.
-pub fn show(summary: &str, body: &str) {
+/// Callback run when the user clicks a notification.
+pub type OnClick = Box<dyn FnOnce() + Send>;
+
+/// Notifications whose click we are still waiting for (each holds a thread).
+#[cfg(all(unix, not(target_os = "macos")))]
+static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// At most this many click waiters at once; further notifications are shown
+/// without a click action.
+#[cfg(all(unix, not(target_os = "macos")))]
+const MAX_WAITING: usize = 8;
+
+/// Reserves one of the click-waiter slots, if any is free.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn take_waiter_slot() -> bool {
+    use std::sync::atomic::Ordering;
+    let mut cur = WAITING.load(Ordering::SeqCst);
+    while cur < MAX_WAITING {
+        match WAITING.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
+}
+
+/// Shows a notification. Blocking (D-Bus round trip, and until the
+/// notification is dismissed when `on_click` is given): call from
+/// `spawn_blocking`. Clicking the notification runs `on_click`. Failures are
+/// logged, never fatal.
+pub fn show(summary: &str, body: &str, on_click: Option<OnClick>) {
     let mut n = notify_rust::Notification::new();
     n.appname("Ferrochat")
         .summary(summary)
@@ -69,13 +96,41 @@ pub fn show(summary: &str, body: &str) {
         .icon("mail-message-new");
     #[cfg(all(unix, not(target_os = "macos")))]
     {
+        use std::sync::atomic::Ordering;
         n.hint(notify_rust::Hint::DesktopEntry(APP_ID.into()));
         n.hint(notify_rust::Hint::Category("im.received".into()));
+        let wait = on_click.is_some() && take_waiter_slot();
+        if wait {
+            // "default" is the action servers invoke when the body is clicked.
+            n.action("default", "Open");
+        }
+        match n.show() {
+            Ok(handle) if wait => {
+                let mut cb = on_click;
+                handle.wait_for_action(|action| {
+                    if action == "default"
+                        && let Some(f) = cb.take()
+                    {
+                        f();
+                    }
+                });
+                WAITING.fetch_sub(1, Ordering::SeqCst);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if wait {
+                    WAITING.fetch_sub(1, Ordering::SeqCst);
+                }
+                tracing::warn!(error = %e, "notification failed");
+            }
+        }
     }
     #[cfg(not(all(unix, not(target_os = "macos"))))]
-    let _ = APP_ID;
-    if let Err(e) = n.show() {
-        tracing::warn!(error = %e, "notification failed");
+    {
+        let _ = (APP_ID, on_click);
+        if let Err(e) = n.show() {
+            tracing::warn!(error = %e, "notification failed");
+        }
     }
 }
 

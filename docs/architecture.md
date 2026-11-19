@@ -222,6 +222,7 @@ pub struct FerroTheme { pub palette: Palette, pub metrics: Metrics, pub dark: bo
   and focused.
 * Wayland/KDE: the app sets a stable `app_id` (`dev.ferro.<app>`) so KDE
   groups windows and notifications correctly.
+* Tray / background mode: see §11.4.
 
 ## 10. Testing strategy
 
@@ -258,6 +259,30 @@ domain conversion), `whatsapp.rs` (live `whatsapp-rust` client) and
 `fake.rs` (scripted fake used by `--mock`, screenshots and integration
 tests). The app only sees the `WaClient` trait and the `net::Event` stream.
 
+### 11.4 Tray and background mode
+
+The app runs under `iced::daemon`, which survives with zero windows.
+
+| Piece | Where |
+|---|---|
+| Tray service (StatusNotifierItem over `ksni`/zbus 5; Linux only, a stub reporting "no tray" elsewhere) | `src/tray/` |
+| Tooltip "Ferrochat — N unread chats", `NeedsAttention` + attention icon while any non-muted chat is unread, menu Show/Hide, Mute notifications, Start minimized to tray, Quit | `tray::TrayModel` (pure) |
+| Window / tray state machine (visible → hidden → shown, quit when there is no tray) | `app/window.rs` (pure) |
+| Event glue, geometry memory, setting toggles | `app/background.rs` |
+| Events from outside iced (tray clicks, second launch, notification click) | `src/ext.rs` (one global channel, drained by a subscription) |
+| Second launch → show window | `src/instance.rs`: the flock winner also listens on `<data_dir>/ferrochat.sock`; the loser sends `show` and exits 0 |
+| Preferences (`close_to_tray` default on, `start_minimized`, `muted`) | `$XDG_CONFIG_HOME/ferrochat/settings.json` (`src/settings.rs`; not written in `--mock`) |
+| Start at login (off by default) | `~/.config/autostart/dev.ferro.ferrochat.desktop`, `Exec=… --minimized` (`src/autostart.rs`) |
+
+Rules: closing the window **closes** it (the renderer and surfaces are
+freed; the app state, the connection and notifications stay) when the setting
+is on **and** a StatusNotifierWatcher accepted the icon; otherwise closing
+quits. If the tray disappears while the window is hidden the window is
+reopened, so the process is never invisible and unreachable. Reopening uses
+the last size and position (position is not reported on Wayland). Left click
+on the icon toggles the window. `--minimized` starts with no window; if there
+is no tray it opens the window anyway.
+
 ### 11.2 Screens and navigation
 
 ```
@@ -266,7 +291,7 @@ tests). The app only sees the `WaClient` trait and the `net::Event` stream.
   Login (QR pairing) ── PairSuccess ──▶ Main ── Log out / revoked ─┘
    │  QR rotates every ~20 s                │
    │  "Click to reload QR code" when        ├─ Rail (Chats active; Status /
-   │   the server stops rotating            │   Communities / Settings shown disabled)
+   │   the server stops rotating            │   Communities shown disabled; Settings page)
    └─ keyring / pairing errors inline       ├─ Chat list: header (new chat, ⋮ menu → Log out),
                                             │   search, chips (All / Unread / Favourites / Groups),
                                             │   connection + sync banners, rows
