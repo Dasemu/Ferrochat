@@ -113,6 +113,9 @@ pub enum Content {
     },
     /// Something we do not render yet (sticker, video, poll, ...).
     Unsupported(String),
+    /// A view-once photo / video / voice note. Never downloaded or stored;
+    /// the user opens it on the phone.
+    ViewOnce,
     /// "This message was deleted".
     Deleted,
 }
@@ -132,6 +135,7 @@ impl Content {
                 format!("{label} {}", format_duration(*seconds))
             }
             Content::Unsupported(kind) => format!("Unsupported message: {kind}"),
+            Content::ViewOnce => "👁 View once message".into(),
             Content::Deleted => "🚫 This message was deleted".into(),
         }
     }
@@ -154,6 +158,7 @@ impl Content {
             Content::Document { .. } => "document",
             Content::Voice { .. } => "voice",
             Content::Unsupported(_) => "unsupported",
+            Content::ViewOnce => "view_once",
             Content::Deleted => "deleted",
         }
     }
@@ -168,6 +173,7 @@ impl fmt::Debug for Content {
             Content::Document { size, .. } => write!(f, "Document(size={size})"),
             Content::Voice { seconds, ptt, .. } => write!(f, "Voice({seconds}s, ptt={ptt})"),
             Content::Unsupported(k) => write!(f, "Unsupported({k})"),
+            Content::ViewOnce => write!(f, "ViewOnce"),
             Content::Deleted => write!(f, "Deleted"),
         }
     }
@@ -266,6 +272,8 @@ pub struct Message {
     pub content: Content,
     /// Delivery state (only meaningful when `from_me`).
     pub status: ReceiptStatus,
+    /// Disappearing messages: unix seconds after which the cache drops it.
+    pub expires_at: Option<i64>,
 }
 
 /// Chat metadata (from history sync or derived from messages).
@@ -285,6 +293,71 @@ pub struct ChatMeta {
     pub archived: bool,
     /// Muted.
     pub muted: bool,
+}
+
+/// Where a batch of messages comes from. Decides unread counting and
+/// notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Origin {
+    /// Delivered live.
+    Live,
+    /// Drained from the server's offline queue after (re)connecting: new to
+    /// us, but delivered in bulk.
+    Offline,
+    /// History sync / local echo: never counts as unread.
+    History,
+}
+
+/// Maps `@lid` JIDs to phone-number JIDs so one contact is one chat.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LidMap {
+    lid_to_pn: std::collections::HashMap<String, String>,
+}
+
+impl LidMap {
+    /// Learns a pair; ignores anything that is not `(…@lid, …@s.whatsapp.net)`.
+    /// Returns true if the map changed.
+    pub fn learn(&mut self, lid: &str, pn: &str) -> bool {
+        if !lid.ends_with("@lid") || !pn.ends_with("@s.whatsapp.net") {
+            return false;
+        }
+        self.lid_to_pn
+            .insert(lid.to_string(), pn.to_string())
+            .as_deref()
+            != Some(pn)
+    }
+
+    /// PN JID for a LID, or the input unchanged.
+    pub fn normalize(&self, jid: &str) -> String {
+        self.lid_to_pn
+            .get(jid)
+            .cloned()
+            .unwrap_or_else(|| jid.to_string())
+    }
+
+    /// Rewrites chat and sender of a message.
+    pub fn apply(&self, m: &mut Message) {
+        m.chat = self.normalize(&m.chat);
+        m.sender = self.normalize(&m.sender);
+    }
+
+    /// All pairs (for persisting).
+    pub fn pairs(&self) -> Vec<(String, String)> {
+        self.lid_to_pn
+            .iter()
+            .map(|(a, b)| (a.clone(), b.clone()))
+            .collect()
+    }
+
+    /// Number of known pairs.
+    pub fn len(&self) -> usize {
+        self.lid_to_pn.len()
+    }
+
+    /// True when empty.
+    pub fn is_empty(&self) -> bool {
+        self.lid_to_pn.is_empty()
+    }
 }
 
 /// True for group JIDs.
@@ -449,6 +522,17 @@ mod tests {
             media: None,
         };
         assert!(!format!("{d:?}").contains("tax"));
+    }
+
+    #[test]
+    fn lid_map_normalizes_only_known_pairs() {
+        let mut m = LidMap::default();
+        assert!(m.learn("123@lid", "34600111222@s.whatsapp.net"));
+        assert!(!m.learn("123@lid", "34600111222@s.whatsapp.net"));
+        assert!(!m.learn("34600111222@s.whatsapp.net", "123@lid"));
+        assert_eq!(m.normalize("123@lid"), "34600111222@s.whatsapp.net");
+        assert_eq!(m.normalize("999@lid"), "999@lid");
+        assert_eq!(m.len(), 1);
     }
 
     #[test]

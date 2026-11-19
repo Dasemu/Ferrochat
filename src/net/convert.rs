@@ -55,11 +55,41 @@ fn media_ref(
     })
 }
 
+/// True when the message (or any wrapper) is a view-once message.
+pub fn is_view_once(msg: &wa::Message) -> bool {
+    let mut cur = msg;
+    for _ in 0..4 {
+        if cur.view_once_message.is_set() {
+            return true;
+        }
+        if cur.image_message.as_option().and_then(|m| m.view_once) == Some(true)
+            || cur.video_message.as_option().and_then(|m| m.view_once) == Some(true)
+            || cur.audio_message.as_option().and_then(|m| m.view_once) == Some(true)
+        {
+            return true;
+        }
+        match cur
+            .ephemeral_message
+            .as_option()
+            .or(cur.document_with_caption_message.as_option())
+            .and_then(|f| f.message.as_option())
+        {
+            Some(m) => cur = m,
+            None => return false,
+        }
+    }
+    false
+}
+
 /// Converts a decrypted protobuf message body into [`Content`].
 ///
 /// Returns `None` for messages that are not shown as bubbles (reactions,
 /// key distribution, protocol messages other than "delete for everyone", ...).
 pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
+    if is_view_once(msg) {
+        // Never expose the media reference: not downloaded, not cached.
+        return Some(Content::ViewOnce);
+    }
     let m = base_message(msg);
 
     if let Some(text) = non_empty(m.conversation.as_ref()) {
@@ -112,7 +142,13 @@ pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
         return Some(Content::Voice {
             seconds: audio.seconds.unwrap_or_default(),
             ptt: audio.ptt.unwrap_or(false),
-            waveform: audio.waveform.clone().unwrap_or_default(),
+            waveform: audio
+                .waveform
+                .iter()
+                .flatten()
+                .take(64)
+                .map(|v| (*v).min(100))
+                .collect(),
             media: media_ref(
                 MediaKind::Audio,
                 audio.direct_path.as_ref(),
@@ -159,14 +195,27 @@ pub fn revoked_target(msg: &wa::Message) -> Option<String> {
     p.key.as_option()?.id.clone()
 }
 
-/// Strips the device part from a JID (`123:4@s.whatsapp.net` → `123@s.whatsapp.net`).
+/// Strips the agent and device parts from a JID
+/// (`123.0:4@s.whatsapp.net` → `123@s.whatsapp.net`). Group ids keep their
+/// shape (they contain neither).
 pub fn bare_jid(jid: &str) -> String {
     match jid.split_once('@') {
         Some((user, server)) => {
             let user = user.split(':').next().unwrap_or(user);
+            let user = user.split('.').next().unwrap_or(user);
             format!("{user}@{server}")
         }
         None => jid.to_string(),
+    }
+}
+
+/// Learns `(lid, pn)` from a chat/sender and its alternate addressing.
+pub fn lid_pair(primary: &str, alt: Option<&str>) -> Option<(String, String)> {
+    let (p, a) = (bare_jid(primary), bare_jid(alt?));
+    match (p.ends_with("@lid"), a.ends_with("@s.whatsapp.net")) {
+        (true, true) => Some((p, a)),
+        _ if a.ends_with("@lid") && p.ends_with("@s.whatsapp.net") => Some((a, p)),
+        _ => None,
     }
 }
 
@@ -186,6 +235,26 @@ pub struct Envelope {
     pub push_name: String,
     /// Unix seconds.
     pub timestamp: i64,
+    /// Alternate addressing of the sender (PN for a LID sender or vice versa).
+    pub sender_alt: Option<String>,
+    /// Alternate addressing of the recipient (our own outgoing DMs).
+    pub recipient_alt: Option<String>,
+    /// Disappearing-message timer in seconds, if any.
+    pub ephemeral_secs: Option<u32>,
+}
+
+impl Envelope {
+    /// LID ↔ PN pairs this envelope reveals.
+    pub fn lid_pairs(&self) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        out.extend(lid_pair(&self.sender, self.sender_alt.as_deref()));
+        if self.from_me {
+            out.extend(lid_pair(&self.chat, self.recipient_alt.as_deref()));
+        } else if !self.chat.ends_with("@g.us") {
+            out.extend(lid_pair(&self.chat, self.sender_alt.as_deref()));
+        }
+        out
+    }
 }
 
 /// Live inbound message → domain message.
@@ -205,6 +274,10 @@ pub fn message_from_envelope(env: &Envelope, msg: &wa::Message) -> Option<Messag
         } else {
             ReceiptStatus::Read
         },
+        expires_at: env
+            .ephemeral_secs
+            .filter(|s| *s > 0)
+            .map(|s| env.timestamp + s as i64),
     })
 }
 
@@ -221,8 +294,13 @@ pub fn status_from_web(status: Option<wa::web_message_info::Status>) -> ReceiptS
     }
 }
 
-/// History-sync message → domain message.
-pub fn message_from_web_info(chat: &str, wmi: &wa::WebMessageInfo) -> Option<Message> {
+/// History-sync message → domain message. `ephemeral_secs` is the chat's
+/// disappearing-messages timer.
+pub fn message_from_web_info(
+    chat: &str,
+    wmi: &wa::WebMessageInfo,
+    ephemeral_secs: Option<u32>,
+) -> Option<Message> {
     let key = wmi.key.as_option()?;
     let id = key.id.clone()?;
     let content = content_from_wa(wmi.message.as_option()?)?;
@@ -235,19 +313,23 @@ pub fn message_from_web_info(chat: &str, wmi: &wa::WebMessageInfo) -> Option<Mes
             .or_else(|| key.participant.clone())
             .unwrap_or_else(|| chat.to_string())
     };
+    let timestamp = wmi.message_timestamp.unwrap_or_default() as i64;
     Some(Message {
         id,
         chat: bare_jid(chat),
         sender: bare_jid(&sender),
         sender_name: non_empty(wmi.push_name.as_ref()),
         from_me,
-        timestamp: wmi.message_timestamp.unwrap_or_default() as i64,
+        timestamp,
         content,
         status: if from_me {
             status_from_web(wmi.status)
         } else {
             ReceiptStatus::Read
         },
+        expires_at: ephemeral_secs
+            .filter(|s| *s > 0)
+            .map(|s| timestamp + s as i64),
     })
 }
 
@@ -268,34 +350,55 @@ pub fn chat_from_conversation(conv: &wa::Conversation, now: i64) -> ChatMeta {
     }
 }
 
-/// Converts a full history-sync blob into chats, messages and names.
-pub fn from_history(
-    hs: &wa::HistorySync,
-    now: i64,
-) -> (Vec<ChatMeta>, Vec<Message>, Vec<(String, String)>) {
-    let mut chats = Vec::with_capacity(hs.conversations.len());
-    let mut messages = Vec::new();
+/// Everything a history-sync blob carries that the app uses.
+#[derive(Debug, Default)]
+pub struct HistoryParts {
+    /// Chats.
+    pub chats: Vec<ChatMeta>,
+    /// Messages.
+    pub messages: Vec<Message>,
+    /// Push names `(jid, name)`.
+    pub names: Vec<(String, String)>,
+    /// LID → PN pairs.
+    pub lid_pairs: Vec<(String, String)>,
+}
+
+/// Converts a full history-sync blob into chats, messages, names and LID
+/// mappings.
+pub fn from_history(hs: &wa::HistorySync, now: i64) -> HistoryParts {
+    let mut parts = HistoryParts::default();
+    for m in &hs.phone_number_to_lid_mappings {
+        if let (Some(pn), Some(lid)) = (&m.pn_jid, &m.lid_jid)
+            && let Some(pair) = lid_pair(lid, Some(pn))
+        {
+            parts.lid_pairs.push(pair);
+        }
+    }
     for conv in &hs.conversations {
         if conv.id.ends_with("@broadcast") || conv.id.ends_with("@newsletter") {
             continue;
         }
-        chats.push(chat_from_conversation(conv, now));
+        let alt = conv.pn_jid.as_deref().or(conv.lid_jid.as_deref());
+        if let Some(pair) = lid_pair(&conv.id, alt) {
+            parts.lid_pairs.push(pair);
+        }
+        parts.chats.push(chat_from_conversation(conv, now));
         for hm in &conv.messages {
             if let Some(m) = hm
                 .message
                 .as_option()
-                .and_then(|w| message_from_web_info(&conv.id, w))
+                .and_then(|w| message_from_web_info(&conv.id, w, conv.ephemeral_expiration))
             {
-                messages.push(m);
+                parts.messages.push(m);
             }
         }
     }
-    let names = hs
+    parts.names = hs
         .pushnames
         .iter()
         .filter_map(|p| Some((bare_jid(p.id.as_ref()?), non_empty(p.pushname.as_ref())?)))
         .collect();
-    (chats, messages, names)
+    parts
 }
 
 /// Receipt type → tick state. `None` for receipts that do not change ticks.
@@ -438,6 +541,9 @@ mod tests {
             from_me,
             push_name: "Ana".into(),
             timestamp: 1_700_000_000,
+            sender_alt: None,
+            recipient_alt: None,
+            ephemeral_secs: None,
         }
     }
 
@@ -564,8 +670,80 @@ mod tests {
     }
 
     #[test]
+    fn view_once_is_never_exposed() {
+        let m = wa::Message {
+            view_once_message: buffa_some(wa::message::FutureProofMessage {
+                message: buffa_some(wa::Message {
+                    image_message: buffa_some(wa::message::ImageMessage {
+                        direct_path: Some("/secret".into()),
+                        media_key: Some(vec![1; 32]),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+            }),
+            ..Default::default()
+        };
+        assert_eq!(content_from_wa(&m), Some(Content::ViewOnce));
+        let flagged = wa::Message {
+            image_message: buffa_some(wa::message::ImageMessage {
+                view_once: Some(true),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(content_from_wa(&flagged), Some(Content::ViewOnce));
+    }
+
+    #[test]
+    fn waveform_values_are_clamped() {
+        let m = wa::Message {
+            audio_message: buffa_some(wa::message::AudioMessage {
+                waveform: Some(vec![250; 80]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match content_from_wa(&m) {
+            Some(Content::Voice { waveform, .. }) => {
+                assert_eq!(waveform.len(), 64);
+                assert!(waveform.iter().all(|v| *v == 100));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn lid_pairs_from_envelopes() {
+        let mut e = env(false);
+        e.chat = "111@lid".into();
+        e.sender = "111:2@lid".into();
+        e.sender_alt = Some("34600111222:2@s.whatsapp.net".into());
+        let pairs = e.lid_pairs();
+        assert!(pairs.contains(&("111@lid".into(), "34600111222@s.whatsapp.net".into())));
+        let mut mine = env(true);
+        mine.chat = "222@lid".into();
+        mine.sender = "34600000000@s.whatsapp.net".into();
+        mine.recipient_alt = Some("34600333444@s.whatsapp.net".into());
+        assert!(
+            mine.lid_pairs()
+                .contains(&("222@lid".into(), "34600333444@s.whatsapp.net".into()))
+        );
+        assert_eq!(lid_pair("1@g.us", Some("x@lid")), None);
+    }
+
+    #[test]
+    fn ephemeral_expiry_is_computed() {
+        let mut e = env(false);
+        e.ephemeral_secs = Some(86_400);
+        let m = message_from_envelope(&e, &build_text("x")).unwrap();
+        assert_eq!(m.expires_at, Some(1_700_000_000 + 86_400));
+    }
+
+    #[test]
     fn bare_jid_variants() {
         assert_eq!(bare_jid("1:2@s.whatsapp.net"), "1@s.whatsapp.net");
+        assert_eq!(bare_jid("1.0:2@s.whatsapp.net"), "1@s.whatsapp.net");
         assert_eq!(bare_jid("123@g.us"), "123@g.us");
         assert_eq!(bare_jid("weird"), "weird");
     }

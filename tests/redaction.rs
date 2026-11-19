@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use ferrochat::auth::secrets::Secret;
 use ferrochat::error::{MaskedJid, Redacted};
-use ferrochat::net::{Content, Event, MediaKind, MediaRef, Message, ReceiptStatus};
+use ferrochat::net::{Content, Event, MediaKind, MediaRef, Message, Origin, ReceiptStatus};
 
 const BODY: &str = "my bank PIN is 4711";
 const PHONE: &str = "34612345678";
@@ -43,6 +43,7 @@ fn logs_do_not_leak_secrets() {
         timestamp: 1,
         content: Content::Text(BODY.into()),
         status: ReceiptStatus::Read,
+        expires_at: None,
     };
     let doc = Content::Document {
         file_name: FILE.into(),
@@ -64,7 +65,7 @@ fn logs_do_not_leak_secrets() {
         tracing::info!(body = %Redacted(BODY), chat = %MaskedJid(&jid), "sending");
         tracing::info!(secret = ?Secret::new(TOKEN), "keyring");
         tracing::debug!(content = ?msg.content, doc = ?doc, "converted");
-        tracing::debug!(event = ?Event::Messages { messages: vec![msg.clone()], live: true }, "net");
+        tracing::debug!(event = ?Event::Messages { messages: vec![msg.clone()], origin: Origin::Live }, "net");
         tracing::debug!(event = ?Event::Qr { code: TOKEN.into(), valid_for_secs: 20 }, "net");
         tracing::debug!(err = %ferrochat::error::Error::Net(TOKEN.into()).user_message(), "user");
     });

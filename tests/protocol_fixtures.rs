@@ -76,7 +76,12 @@ fn document_with_caption_fixture_converts() {
 #[test]
 fn history_sync_fixture_converts() {
     let hs: wa::HistorySync = load("history_sync.json");
-    let (chats, messages, names) = convert::from_history(&hs, 1_700_001_000);
+    let convert::HistoryParts {
+        chats,
+        messages,
+        names,
+        ..
+    } = convert::from_history(&hs, 1_700_001_000);
     // status@broadcast is skipped.
     assert_eq!(chats.len(), 2);
     let dm = &chats[0];

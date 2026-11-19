@@ -13,7 +13,7 @@ use futures::future::BoxFuture;
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 
-use super::types::{Content, MediaRef, Message, OutgoingMedia, ReceiptStatus};
+use super::types::{Content, MediaRef, Message, Origin, OutgoingMedia, ReceiptStatus};
 use super::{Connection, Event, WaClient};
 use crate::error::{Error, Result};
 use crate::mock::MockData;
@@ -127,7 +127,7 @@ impl FakeClient {
             }
             let _ = self.tx.send(Event::Messages {
                 messages,
-                live: false,
+                origin: Origin::History,
             });
         }
     }
@@ -136,8 +136,21 @@ impl FakeClient {
     pub fn simulate_incoming(&self, msg: Message) {
         let _ = self.tx.send(Event::Messages {
             messages: vec![msg],
-            live: true,
+            origin: Origin::Live,
         });
+    }
+
+    /// Simulates messages drained from the server's offline queue.
+    pub fn simulate_offline_drain(&self, msgs: Vec<Message>) {
+        let _ = self.tx.send(Event::Messages {
+            messages: msgs,
+            origin: Origin::Offline,
+        });
+    }
+
+    /// Simulates another WhatsApp Web session taking over the stream.
+    pub fn simulate_replaced(&self) {
+        let _ = self.tx.send(Event::Connection(Connection::Replaced));
     }
 
     /// Simulates the phone unlinking this device.
@@ -211,8 +224,9 @@ impl WaClient for FakeClient {
                             timestamp: chrono::Utc::now().timestamp(),
                             content: Content::Text("👍".into()),
                             status: ReceiptStatus::Read,
+                            expires_at: None,
                         }],
-                        live: true,
+                        origin: Origin::Live,
                     });
                 });
             }
@@ -350,7 +364,7 @@ pub fn start(
         }
         let _ = tx.send(Event::Messages {
             messages: data.messages,
-            live: false,
+            origin: Origin::History,
         });
     } else {
         if let Ok(mut p) = client.pending_pair.lock() {

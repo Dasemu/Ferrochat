@@ -140,6 +140,7 @@ impl B {
             timestamp: ts,
             content: c,
             status: if from_me { st } else { ReceiptStatus::Read },
+            expires_at: None,
         });
     }
 }

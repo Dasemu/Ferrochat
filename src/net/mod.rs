@@ -65,7 +65,7 @@ pub trait WaClient: Send + Sync {
 }
 
 /// Connection state shown in the banner.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Connection {
     /// Not connected, not trying.
     Disconnected,
@@ -77,6 +77,15 @@ pub enum Connection {
     Reconnecting {
         /// Attempt number, from 1.
         attempt: u32,
+    },
+    /// Another WhatsApp Web/Desktop session took over this one. The session
+    /// is still valid; the user can reconnect.
+    Replaced,
+    /// The server refused the connection for a non-transient reason; the app
+    /// retries with backoff and offers a manual retry.
+    Offline {
+        /// User-facing reason.
+        reason: String,
     },
 }
 
@@ -121,8 +130,8 @@ pub enum Event {
     Messages {
         /// Messages in arrival order.
         messages: Vec<Message>,
-        /// True for live traffic (may notify), false for history/offline.
-        live: bool,
+        /// Live, offline drain or history.
+        origin: Origin,
     },
     /// History sync chunk: chat metadata and names.
     History {
@@ -154,6 +163,11 @@ pub enum Event {
         /// Chat.
         chat: ChatId,
     },
+    /// LID ↔ phone-number pairs learned from envelopes or history.
+    LidMappings(Vec<(String, String)>),
+    /// The session store exists but cannot be decrypted with the keyring key
+    /// (key lost or replaced). Nothing was deleted; the user decides.
+    SessionUnreadable(String),
     /// Unrecoverable failure (keyring missing, database unreadable).
     Fatal(String),
 }
@@ -172,8 +186,8 @@ impl fmt::Debug for Event {
             Event::Connection(c) => write!(f, "Connection({c:?})"),
             Event::Connected { .. } => write!(f, "Connected"),
             Event::LoggedOut { .. } => write!(f, "LoggedOut"),
-            Event::Messages { messages, live } => {
-                write!(f, "Messages(n={}, live={live})", messages.len())
+            Event::Messages { messages, origin } => {
+                write!(f, "Messages(n={}, {origin:?})", messages.len())
             }
             Event::History {
                 chats,
@@ -190,6 +204,8 @@ impl fmt::Debug for Event {
             }
             Event::ContactName { .. } => write!(f, "ContactName"),
             Event::ChatRead { .. } => write!(f, "ChatRead"),
+            Event::LidMappings(p) => write!(f, "LidMappings(n={})", p.len()),
+            Event::SessionUnreadable(_) => write!(f, "SessionUnreadable"),
             Event::Fatal(_) => write!(f, "Fatal"),
         }
     }
