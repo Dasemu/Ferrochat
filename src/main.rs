@@ -53,6 +53,20 @@ fn main() -> iced::Result {
     };
     init_logging(&cfg);
 
+    // One instance per data directory: two clients on one Signal store would
+    // corrupt it and make WhatsApp replace each other's stream.
+    let _instance_lock = if cfg.mock {
+        None
+    } else {
+        match ferrochat::config::acquire_instance_lock(&cfg.data_dir) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                eprintln!("ferrochat: {e}");
+                std::process::exit(1);
+            }
+        }
+    };
+
     let size = if cfg.screenshot.is_some() {
         iced::Size::new(1280.0, 800.0)
     } else {

@@ -3,7 +3,7 @@
 pub mod message;
 pub mod state;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -22,8 +22,8 @@ use crate::config::{Config, ScreenshotTarget};
 use crate::media::ByteLru;
 use crate::media::audio::{self, Pcm, Player, Recorder};
 use crate::net::{
-    self, ClientHandle, Connection, Content, Event, Message as ChatMessage, OutgoingKind,
-    OutgoingMedia, ReceiptStatus,
+    self, ClientHandle, Connection, Content, Event, LidMap, Message as ChatMessage, Origin,
+    OutgoingKind, OutgoingMedia, ReceiptStatus,
 };
 use crate::store::Store;
 use crate::ui::theme::FerroTheme;
@@ -84,6 +84,14 @@ pub struct App {
     pub(crate) sync_progress: Option<u32>,
     started: Instant,
     first_frame_logged: bool,
+    lid_map: LidMap,
+    /// The session store exists but cannot be decrypted; the login screen
+    /// offers to discard it.
+    pub(crate) session_unreadable: bool,
+    /// Message ids waiting for a download slot (images, auto-download).
+    download_queue: VecDeque<String>,
+    /// App-level reconnect backoff after a non-transient refusal.
+    offline_attempt: u32,
 }
 
 /// Subscription key for the protocol stream. Changing `generation`
@@ -184,6 +192,7 @@ impl App {
     /// Boot: open the cache synchronously, render from it, start the client.
     pub fn boot(cfg: Config) -> (Self, Task<Message>) {
         let started = Instant::now();
+        let mut cache_fallback = false;
         let store = if cfg.mock {
             Store::open_in_memory()
         } else {
@@ -191,6 +200,7 @@ impl App {
         }
         .or_else(|e| {
             tracing::error!(error = %e, "cache unreadable; using an in-memory cache");
+            cache_fallback = true;
             Store::open_in_memory()
         });
         let (store, chats) = match store {
@@ -206,6 +216,11 @@ impl App {
             }
         };
         let own_jid = store.kv("own_jid").ok().flatten();
+        let _ = store.prune_expired(now_secs());
+        let mut lid_map = LidMap::default();
+        for (lid, pn) in store.lid_pairs().unwrap_or_default() {
+            lid_map.learn(&lid, &pn);
+        }
         let secrets: Arc<dyn SecretStore> = if cfg.mock {
             Arc::new(MemoryStore::new())
         } else {
@@ -249,7 +264,17 @@ impl App {
             sync_progress: None,
             started,
             first_frame_logged: false,
+            lid_map,
+            session_unreadable: false,
+            download_queue: VecDeque::new(),
+            offline_attempt: 0,
         };
+        let mut app = app;
+        if cache_fallback {
+            app.toast(
+                "The message cache could not be opened; this session keeps history in memory only.",
+            );
+        }
         let mut tasks = vec![Task::done(Message::FirstFrame)];
         if app.cfg.screenshot.is_some() {
             tasks.push(Task::perform(
@@ -307,10 +332,7 @@ impl App {
             Message::Ui(ui) => self.on_ui(ui),
             Message::Net(ev) => self.on_net(ev),
             Message::Done(done) => self.on_done(*done),
-            Message::Tick => {
-                self.on_tick();
-                Task::none()
-            }
+            Message::Tick => self.on_tick(),
             Message::Focus(f) => {
                 self.focused = f;
                 if f {
@@ -366,10 +388,12 @@ impl App {
                             .await?;
                         let path = file.path().to_path_buf();
                         let res = tokio::task::spawn_blocking(move || {
-                            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                            if bytes.len() > 100 * 1024 * 1024 {
+                            // Check the size before reading anything into memory.
+                            let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
+                            if len > crate::media::MAX_DOWNLOAD_BYTES {
                                 return Err("Files over 100 MB cannot be sent.".to_string());
                             }
+                            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
                             Ok(Box::new(crate::media::image::outgoing_from_file(
                                 &path, bytes, None,
                             )))
@@ -384,36 +408,36 @@ impl App {
             }
             Ui::ToggleEmoji => self.emoji_open = !self.emoji_open,
             Ui::Emoji(e) => self.composer.push_str(e),
-            Ui::StartRecording => match Recorder::start() {
-                Ok(r) => {
-                    self.recorder = Some(r);
-                    self.recording_since = Some(Instant::now());
-                }
-                Err(e) => self.toast(e.user_message()),
-            },
+            Ui::StartRecording => {
+                // Device I/O happens on the recorder's own thread.
+                self.recorder = Some(Recorder::start());
+                self.recording_since = Some(Instant::now());
+            }
             Ui::StopRecording { send } => {
                 self.recording_since = None;
-                if let Some(rec) = self.recorder.take() {
-                    let pcm = rec.finish();
-                    if send && pcm.len() > audio::OPUS_RATE as usize / 2 {
-                        return blocking(
-                            move || {
-                                let ogg =
-                                    audio::encode_ogg_opus(&pcm).map_err(|e| e.to_string())?;
-                                Ok(Box::new(OutgoingMedia {
-                                    kind: OutgoingKind::Voice {
-                                        seconds: (pcm.len() as u32 / audio::OPUS_RATE).max(1),
-                                        waveform: audio::waveform(&pcm),
-                                    },
-                                    bytes: ogg,
-                                    file_name: "voice-note.ogg".into(),
-                                    mimetype: "audio/ogg; codecs=opus".into(),
-                                    caption: None,
-                                }))
-                            },
-                            |r| Message::done(Done::Prepared(Some(r))),
-                        );
-                    }
+                if let Some(rec) = self.recorder.take()
+                    && send
+                {
+                    return blocking(
+                        move || {
+                            let pcm = rec.finish();
+                            if pcm.len() < audio::OPUS_RATE as usize / 2 {
+                                return Err("Voice note too short.".to_string());
+                            }
+                            let ogg = audio::encode_ogg_opus(&pcm).map_err(|e| e.to_string())?;
+                            Ok(Box::new(OutgoingMedia {
+                                kind: OutgoingKind::Voice {
+                                    seconds: (pcm.len() as u32 / audio::OPUS_RATE).max(1),
+                                    waveform: audio::waveform(&pcm),
+                                },
+                                bytes: ogg,
+                                file_name: "voice-note.ogg".into(),
+                                mimetype: "audio/ogg; codecs=opus".into(),
+                                caption: None,
+                            }))
+                        },
+                        |r| Message::done(Done::Prepared(Some(r))),
+                    );
                 }
             }
             Ui::PlayVoice(id) => return self.play_voice(id),
@@ -458,7 +482,8 @@ impl App {
             Ui::ReloadQr => {
                 self.auth = std::mem::take(&mut self.auth).next(AuthEvent::ReloadQr);
                 self.qr = None;
-                self.net_generation += 1;
+                self.session_unreadable = false;
+                self.restart_client();
             }
             Ui::Logout => {
                 self.menu_open = false;
@@ -478,6 +503,24 @@ impl App {
                 }
             }
             Ui::Retry(id) => return self.retry(&id),
+            Ui::Reconnect => {
+                self.offline_attempt = 0;
+                self.restart_client();
+            }
+            Ui::AutoReconnect { generation } => {
+                // Ignore stale timers (the user already retried / relinked).
+                if generation == self.net_generation
+                    && matches!(self.connection, Connection::Offline { .. })
+                {
+                    self.restart_client();
+                }
+            }
+            Ui::ResetSession => {
+                // The user explicitly chose to discard an undecryptable session.
+                self.session_unreadable = false;
+                self.advance_auth(AuthEvent::ReloadQr);
+                return self.cleanup_session();
+            }
         }
         Task::none()
     }
@@ -527,12 +570,13 @@ impl App {
             timestamp: now_secs(),
             content,
             status: ReceiptStatus::Pending,
+            expires_at: None,
         }
     }
 
     fn add_local(&mut self, msg: ChatMessage) -> Task<Message> {
         self.chats
-            .apply_messages(std::slice::from_ref(&msg), Some(&msg.chat), true, false);
+            .apply_messages(std::slice::from_ref(&msg), Some(&msg.chat), true, None);
         self.index_thumbs(std::slice::from_ref(&msg));
         if let Some(c) = &mut self.open {
             c.merge(vec![msg.clone()]);
@@ -631,7 +675,15 @@ impl App {
     }
 
     /// Starts downloading the media of message `id` if not cached yet.
+    /// Downloads the media of message `id` (explicit user action: higher
+    /// pixel cap, jumps the queue).
     fn ensure_media(&mut self, id: &str) -> Task<Message> {
+        self.request_media(id, crate::media::MAX_IMAGE_PIXELS, true)
+    }
+
+    /// Queues or starts a download, at most [`crate::media::MAX_CONCURRENT_DOWNLOADS`]
+    /// at a time.
+    fn request_media(&mut self, id: &str, max_pixels: u64, urgent: bool) -> Task<Message> {
         let Some(mref) = self
             .find_message(id)
             .and_then(|m| m.content.media())
@@ -640,29 +692,41 @@ impl App {
             return Task::none();
         };
         let key = mref.cache_key();
-        if self.images.contains(&key) || !self.downloading.insert(key.clone()) {
+        if self.images.contains(&key) || self.downloading.contains(&key) {
+            return Task::none();
+        }
+        if self.downloading.len() >= crate::media::MAX_CONCURRENT_DOWNLOADS {
+            if !self.download_queue.iter().any(|q| q == id) {
+                if urgent {
+                    self.download_queue.push_front(id.to_string());
+                } else {
+                    self.download_queue.push_back(id.to_string());
+                }
+            }
             return Task::none();
         }
         let Some(client) = self.client.clone() else {
-            self.downloading.remove(&key);
             return Task::none();
         };
+        self.downloading.insert(key.clone());
         Task::perform(
             async move {
                 let r = async {
                     let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    let bytes = Arc::new(bytes);
                     if mref.kind == net::MediaKind::Image {
-                        // Header-only probe: refuse decompression bombs before
-                        // iced decodes the image.
+                        // Header-only probe: refuse oversized images and
+                        // decompression bombs before iced decodes them.
                         let probe = bytes.clone();
                         tokio::task::spawn_blocking(move || {
-                            crate::media::image::check_image_bounds(&probe).map(|_| ())
+                            crate::media::image::check_image_bounds_max(&probe, max_pixels)
+                                .map(|_| ())
                         })
                         .await
                         .map_err(|e| e.to_string())?
                         .map_err(|e| e.to_string())?;
                     }
-                    Ok::<_, String>(Arc::new(bytes))
+                    Ok::<_, String>(bytes)
                 }
                 .await;
                 (key, r)
@@ -671,15 +735,31 @@ impl App {
         )
     }
 
+    /// Starts queued downloads while slots are free.
+    fn pump_downloads(&mut self) -> Task<Message> {
+        let mut tasks = Vec::new();
+        while self.downloading.len() < crate::media::MAX_CONCURRENT_DOWNLOADS {
+            let Some(id) = self.download_queue.pop_front() else {
+                break;
+            };
+            let cap = if self.viewer.as_deref() == Some(id.as_str()) {
+                crate::media::MAX_IMAGE_PIXELS
+            } else {
+                crate::media::MAX_AUTO_IMAGE_PIXELS
+            };
+            tasks.push(self.request_media(&id, cap, false));
+        }
+        Task::batch(tasks)
+    }
+
     fn play_voice(&mut self, id: String) -> Task<Message> {
         if self.player.is_none() {
-            match Player::spawn() {
-                Ok(p) => self.player = Some(p),
-                Err(e) => {
-                    self.toast(e.user_message());
-                    return Task::none();
-                }
-            }
+            // Opening the audio device blocks: do it off the UI thread and
+            // come back here when it is ready.
+            return blocking(
+                || Player::spawn().map_err(|e| e.user_message()),
+                move |result| Message::done(Done::PlayerReady { result, then: id }),
+            );
         }
         if let (Some(v), Some(p)) = (&mut self.voice, &self.player)
             && v.id == id
@@ -698,6 +778,10 @@ impl App {
         };
         let Some(mref) = msg.content.media().cloned() else {
             return Task::none();
+        };
+        let declared = match &msg.content {
+            Content::Voice { seconds, .. } => Some(*seconds),
+            _ => None,
         };
         let mut tasks = Vec::new();
         if !msg.from_me
@@ -730,10 +814,12 @@ impl App {
             async move {
                 let r = async {
                     let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
-                    tokio::task::spawn_blocking(move || audio::decode_ogg_opus(&bytes))
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())
+                    tokio::task::spawn_blocking(move || {
+                        audio::decode_ogg_opus_bounded(&bytes, declared)
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())
                 }
                 .await;
                 (id, r.map(Arc::new))
@@ -757,7 +843,17 @@ impl App {
         });
     }
 
-    fn on_tick(&mut self) {
+    fn on_tick(&mut self) -> Task<Message> {
+        if let Some(rec) = &self.recorder {
+            if let Some(err) = rec.error() {
+                self.recorder = None;
+                self.recording_since = None;
+                self.toast(format!("Microphone: {err}"));
+            } else if rec.is_full() {
+                self.toast("Voice notes are limited to 30 minutes; sending.");
+                return Task::done(Message::Ui(Ui::StopRecording { send: true }));
+            }
+        }
         if let (Some(v), Some(p)) = (&mut self.voice, &self.player)
             && !v.loading
         {
@@ -766,6 +862,7 @@ impl App {
                 self.voice = None;
             }
         }
+        Task::none()
     }
 
     fn open_document(&mut self, id: &str) -> Task<Message> {
@@ -784,19 +881,22 @@ impl App {
             return Task::none();
         };
         let dir = self.cfg.downloads_dir.clone();
-        let open_after = self.cfg.screenshot.is_none();
+        let safe_name = crate::notify::sanitize_file_name(&file_name);
+        let dangerous = crate::notify::is_dangerous(&safe_name);
+        // Executables, scripts and active content are saved, never launched.
+        let open_after = self.cfg.screenshot.is_none() && !dangerous;
         self.toast("Downloading document…");
         Task::perform(
             async move {
                 let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
                 tokio::task::spawn_blocking(move || {
                     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-                    let path = unique_path(&dir, &crate::notify::sanitize_file_name(&file_name));
+                    let path = unique_path(&dir, &safe_name);
                     std::fs::write(&path, &bytes).map_err(|e| e.to_string())?;
                     if open_after {
                         crate::notify::open_path(&path).map_err(|e| e.to_string())?;
                     }
-                    Ok(path)
+                    Ok((path, dangerous))
                 })
                 .await
                 .map_err(|e| e.to_string())?
@@ -822,15 +922,21 @@ impl App {
         let mock = self.cfg.mock;
         blocking(
             move || {
-                let _ = store.clear();
+                let mut problems = Vec::new();
+                if let Err(e) = store.clear() {
+                    problems.push(format!("cache: {e}"));
+                }
                 if !mock {
-                    net::whatsapp::remove_db(&signal_db);
+                    if let Err(e) = net::whatsapp::remove_db(&signal_db) {
+                        problems.push(format!("session file: {e}"));
+                    }
                     if let Err(e) = secrets.delete(SIGNAL_STORE_KEY) {
-                        tracing::warn!(error = %e, "could not delete session key");
+                        problems.push(format!("keyring: {e}"));
                     }
                 }
+                problems
             },
-            |_| Message::done(Done::CleanedUp),
+            |problems| Message::done(Done::CleanedUp(problems)),
         )
     }
 
@@ -897,7 +1003,7 @@ impl App {
             .collect();
         Task::batch(
             ids.iter()
-                .map(|id| self.ensure_media(id))
+                .map(|id| self.request_media(id, crate::media::MAX_AUTO_IMAGE_PIXELS, false))
                 .collect::<Vec<_>>(),
         )
     }
@@ -932,9 +1038,16 @@ impl App {
                 return store_task(&self.store, move |s| s.set_kv("own_jid", &jid));
             }
             Event::PairError(e) => self.advance_auth(AuthEvent::PairError(e)),
-            Event::Connection(c) => self.connection = c,
+            Event::Connection(c) => {
+                let retry = matches!(c, Connection::Offline { .. });
+                self.connection = c;
+                if retry {
+                    return self.schedule_reconnect();
+                }
+            }
             Event::Connected { jid } => {
                 self.connection = Connection::Connected;
+                self.offline_attempt = 0;
                 if let Some(j) = &jid {
                     self.own_jid = Some(j.clone());
                 }
@@ -948,13 +1061,16 @@ impl App {
                 self.advance_auth(AuthEvent::LoggedOut(reason));
                 return self.cleanup_session();
             }
-            Event::Messages { messages, live } => return self.on_messages(messages, live),
+            Event::Messages { messages, origin } => return self.on_messages(messages, origin),
             Event::History {
-                chats,
+                mut chats,
                 names,
                 progress,
             } => {
                 self.sync_progress = progress.filter(|p| *p < 100);
+                for c in &mut chats {
+                    c.id = self.lid_map.normalize(&c.id);
+                }
                 self.chats.apply_history(&chats, &names);
                 let mut tasks = vec![store_task(&self.store, move |s| {
                     s.upsert_chats(&chats)?;
@@ -970,6 +1086,7 @@ impl App {
                 return Task::batch(tasks);
             }
             Event::Receipt { chat, ids, status } => {
+                let chat = self.lid_map.normalize(&chat);
                 self.chats.apply_receipt(&chat, &ids, status);
                 if let Some(c) = &mut self.open
                     && c.chat == chat
@@ -981,22 +1098,96 @@ impl App {
                 });
             }
             Event::ContactName { jid, name } => {
+                let jid = self.lid_map.normalize(&jid);
                 self.chats.names.insert(jid.clone(), name.clone());
                 return store_task(&self.store, move |s| s.set_contact_names(&[(jid, name)]));
             }
             Event::ChatRead { chat } => {
+                let chat = self.lid_map.normalize(&chat);
                 self.chats.mark_read(&chat);
                 return store_task(&self.store, move |s| s.set_unread(&chat, 0));
+            }
+            Event::LidMappings(pairs) => {
+                let learned: Vec<_> = pairs
+                    .into_iter()
+                    .filter(|(lid, pn)| self.lid_map.learn(lid, pn))
+                    .collect();
+                if !learned.is_empty() {
+                    return store_task(&self.store, move |s| s.set_lid_pairs(&learned));
+                }
+            }
+            Event::SessionUnreadable(reason) => {
+                self.advance_auth(AuthEvent::Fatal(reason));
+                self.session_unreadable = true;
             }
             Event::Fatal(msg) => self.advance_auth(AuthEvent::Fatal(msg)),
         }
         Task::none()
     }
 
-    fn on_messages(&mut self, messages: Vec<ChatMessage>, live: bool) -> Task<Message> {
+    /// Restarts the protocol client (new subscription generation).
+    fn restart_client(&mut self) {
+        self.client = None;
+        self.connection = Connection::Connecting;
+        self.net_generation += 1;
+    }
+
+    /// App-level exponential backoff with jitter (1 s → 60 s) after the
+    /// server refused the connection for a non-transient reason.
+    fn schedule_reconnect(&mut self) -> Task<Message> {
+        self.offline_attempt = self.offline_attempt.saturating_add(1);
+        let delay = backoff_delay(self.offline_attempt, jitter_ms());
+        let generation = self.net_generation;
+        Task::perform(tokio::time::sleep(delay), move |_| {
+            Message::Ui(Ui::AutoReconnect { generation })
+        })
+    }
+
+    /// Phase 1: normalise addressing and persist; the store tells which
+    /// messages are new (live or drained from the offline queue).
+    fn on_messages(&mut self, mut messages: Vec<ChatMessage>, origin: Origin) -> Task<Message> {
+        for m in &mut messages {
+            self.lid_map.apply(m);
+        }
+        let s = self.store.clone();
+        blocking(
+            move || {
+                let new_ids = s.insert_messages(&messages).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "cache write failed");
+                    // Without the cache we cannot dedupe: treat all as new.
+                    messages.iter().map(|m| m.id.clone()).collect()
+                });
+                (messages, new_ids)
+            },
+            move |(messages, new_ids)| {
+                Message::done(Done::MessagesStored {
+                    messages,
+                    new_ids,
+                    origin,
+                })
+            },
+        )
+    }
+
+    /// Phase 2: reducers, unread counters, read receipts, notifications.
+    fn apply_stored_messages(
+        &mut self,
+        messages: Vec<ChatMessage>,
+        new_ids: Vec<String>,
+        origin: Origin,
+    ) -> Task<Message> {
         let open_chat = self.open.as_ref().map(|c| c.chat.clone());
-        self.chats
-            .apply_messages(&messages, open_chat.as_deref(), self.focused, live);
+        let fresh: HashSet<String> = match origin {
+            Origin::History => HashSet::new(),
+            Origin::Live | Origin::Offline => new_ids.into_iter().collect(),
+        };
+        let counts = origin != Origin::History;
+        self.chats.apply_messages(
+            &messages,
+            open_chat.as_deref(),
+            self.focused,
+            counts.then_some(&fresh),
+        );
         self.index_thumbs(&messages);
         let mut tasks = Vec::new();
         if let Some(c) = &mut self.open {
@@ -1006,12 +1197,15 @@ impl App {
                 .cloned()
                 .collect();
             if !mine.is_empty() {
-                c.merge(mine.clone());
-                if live {
-                    let incoming = mine.iter().filter(|m| !m.from_me).count();
-                    if self.focused {
-                        self.pending_read += incoming;
-                    }
+                let incoming = mine
+                    .iter()
+                    .filter(|m| !m.from_me && fresh.contains(&m.id))
+                    .count();
+                c.merge(mine);
+                if counts && self.focused {
+                    self.pending_read += incoming;
+                }
+                if origin == Origin::Live {
                     tasks.push(operation::snap_to(
                         CONVERSATION_SCROLL,
                         operation::RelativeOffset::START,
@@ -1021,32 +1215,48 @@ impl App {
         }
         tasks.push(self.auto_download_images());
         tasks.push(self.send_pending_reads());
-        if live && self.cfg.screenshot.is_none() {
+        if counts && self.cfg.screenshot.is_none() {
+            let notify: Vec<&ChatMessage> = messages
+                .iter()
+                .filter(|m| fresh.contains(&m.id))
+                .filter(|m| {
+                    let muted = self.chats.get(&m.chat).is_some_and(|e| e.meta.muted);
+                    state::should_notify(m, open_chat.as_deref(), self.focused, muted)
+                })
+                .collect();
             let mode = self.cfg.notification_preview;
-            for m in messages.iter().filter(|m| {
-                let muted = self.chats.get(&m.chat).is_some_and(|e| e.meta.muted);
-                state::should_notify(m, open_chat.as_deref(), self.focused, muted)
-            }) {
-                let sender = m
-                    .sender_name
-                    .clone()
-                    .unwrap_or_else(|| self.chats.display_name(&m.sender));
-                let group = net::is_group_jid(&m.chat).then(|| self.chats.display_name(&m.chat));
-                let (summary, body) = crate::notify::notification_text(
-                    &sender,
-                    group.as_deref(),
-                    &m.content.preview(),
-                    mode,
-                );
+            let texts: Vec<(String, String)> = match origin {
+                Origin::Live => notify
+                    .iter()
+                    .map(|m| {
+                        let sender = m
+                            .sender_name
+                            .clone()
+                            .unwrap_or_else(|| self.chats.display_name(&m.sender));
+                        let group =
+                            net::is_group_jid(&m.chat).then(|| self.chats.display_name(&m.chat));
+                        crate::notify::notification_text(
+                            &sender,
+                            group.as_deref(),
+                            &m.content.preview(),
+                            mode,
+                        )
+                    })
+                    .collect(),
+                // One summary for an offline drain instead of a burst.
+                _ if !notify.is_empty() => {
+                    let chats: HashSet<&str> = notify.iter().map(|m| m.chat.as_str()).collect();
+                    vec![crate::notify::summary_text(notify.len(), chats.len())]
+                }
+                _ => Vec::new(),
+            };
+            for (summary, body) in texts {
                 tasks.push(blocking(
                     move || crate::notify::show(&summary, &body),
                     |_| Message::done(Done::Nothing),
                 ));
             }
         }
-        tasks.push(store_task(&self.store, move |s| {
-            s.insert_messages(&messages).map(|_| ())
-        }));
         Task::batch(tasks)
     }
 
@@ -1126,12 +1336,27 @@ impl App {
                 match result {
                     Ok(bytes) => {
                         let size = bytes.len();
-                        self.images
-                            .put(key, image::Handle::from_bytes((*bytes).clone()), size);
+                        // Hand the buffer to iced without copying when we hold
+                        // the only reference.
+                        let owned = Arc::try_unwrap(bytes).unwrap_or_else(|a| (*a).clone());
+                        self.images.put(key, image::Handle::from_bytes(owned), size);
                     }
                     Err(e) => tracing::warn!(error = %e, "media download failed"),
                 }
+                return self.pump_downloads();
             }
+            Done::MessagesStored {
+                messages,
+                new_ids,
+                origin,
+            } => return self.apply_stored_messages(messages, new_ids, origin),
+            Done::PlayerReady { result, then } => match result {
+                Ok(p) => {
+                    self.player = Some(p);
+                    return self.play_voice(then);
+                }
+                Err(e) => self.toast(e),
+            },
             Done::VoiceReady { id, result } => match result {
                 Ok(pcm) => {
                     if let Some(key) = self
@@ -1154,14 +1379,28 @@ impl App {
             Done::Prepared(Some(Ok(media))) => return self.send_media(*media),
             Done::Prepared(Some(Err(e))) => self.toast(e),
             Done::Prepared(None) => {}
-            Done::DocumentOpened(Ok(path)) => {
-                self.toast(format!("Saved to {}", path.display()));
+            Done::DocumentOpened(Ok((path, dangerous))) => {
+                if dangerous {
+                    self.toast(format!(
+                        "Saved to {}. Not opened: this file type can run programs.",
+                        path.display()
+                    ));
+                } else {
+                    self.toast(format!("Saved to {}", path.display()));
+                }
             }
             Done::DocumentOpened(Err(e)) => self.toast(format!("Could not open document: {e}")),
             Done::Stored(Err(e)) => tracing::warn!(error = %e, "cache write failed"),
             Done::Stored(Ok(())) | Done::Nothing => {}
-            Done::CleanedUp => {
-                self.net_generation += 1;
+            Done::CleanedUp(problems) => {
+                if !problems.is_empty() {
+                    tracing::warn!(?problems, "logout cleanup incomplete");
+                    self.toast(format!(
+                        "Logged out, but some local data could not be removed: {}",
+                        problems.join("; ")
+                    ));
+                }
+                self.restart_client();
                 self.qr = None;
             }
             Done::Screenshot(shot) => {
@@ -1188,6 +1427,18 @@ impl App {
     pub fn is_recording(&self) -> bool {
         self.recording_since.is_some()
     }
+}
+
+/// Exponential backoff: 1 s, 2 s, 4 s … capped at 60 s, plus up to 1 s jitter.
+pub fn backoff_delay(attempt: u32, jitter_ms: u64) -> Duration {
+    let base = 1u64 << attempt.saturating_sub(1).min(6);
+    Duration::from_millis(base.min(60) * 1000 + jitter_ms % 1000)
+}
+
+fn jitter_ms() -> u64 {
+    let mut b = [0u8; 2];
+    let _ = getrandom::fill(&mut b);
+    u16::from_le_bytes(b) as u64
 }
 
 fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
@@ -1218,6 +1469,15 @@ fn save_png(path: &std::path::Path, shot: &window::Screenshot) -> Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backoff_grows_and_caps() {
+        assert_eq!(backoff_delay(1, 0), Duration::from_secs(1));
+        assert_eq!(backoff_delay(2, 0), Duration::from_secs(2));
+        assert_eq!(backoff_delay(4, 0), Duration::from_secs(8));
+        assert_eq!(backoff_delay(30, 0), Duration::from_secs(60));
+        assert!(backoff_delay(1, 999) < Duration::from_secs(2));
+    }
 
     #[test]
     fn qr_handle_renders() {

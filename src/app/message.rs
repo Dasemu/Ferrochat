@@ -88,6 +88,15 @@ pub enum Ui {
     SimulateScan,
     /// Retry a failed message.
     Retry(String),
+    /// Reconnect after "opened elsewhere" / offline.
+    Reconnect,
+    /// Backoff timer fired for this client generation.
+    AutoReconnect {
+        /// Generation the timer was armed for.
+        generation: u32,
+    },
+    /// Discard an undecryptable session and pair again (user confirmed).
+    ResetSession,
 }
 
 /// Task completions.
@@ -138,12 +147,28 @@ pub enum Done {
     },
     /// File picked and turned into outgoing media (`None` = cancelled).
     Prepared(Option<Result<Box<OutgoingMedia>, String>>),
-    /// Document saved to disk and opened.
-    DocumentOpened(Result<PathBuf, String>),
+    /// Document saved to disk (and opened unless it is an executable type).
+    DocumentOpened(Result<(PathBuf, bool), String>),
+    /// Messages persisted; `new_ids` were not in the cache before.
+    MessagesStored {
+        /// Messages (addressing normalised).
+        messages: Vec<ChatMessage>,
+        /// Ids that are new.
+        new_ids: Vec<String>,
+        /// Where they came from.
+        origin: crate::net::Origin,
+    },
+    /// The audio output thread is ready (or failed); then play `then`.
+    PlayerReady {
+        /// Player or error.
+        result: Result<crate::media::audio::Player, String>,
+        /// Message id to play.
+        then: String,
+    },
     /// Background store write finished.
     Stored(Result<(), String>),
-    /// Logout / unlink cleanup finished.
-    CleanedUp,
+    /// Logout / unlink cleanup finished, with any problems encountered.
+    CleanedUp(Vec<String>),
     /// Screenshot captured.
     Screenshot(Box<iced::window::Screenshot>),
     /// Screenshot written.

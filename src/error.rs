@@ -41,8 +41,12 @@ impl Error {
             Error::Auth(_) => "Your session is no longer valid. Link this device again.".into(),
             Error::Store(_) => "The local message cache could not be read.".into(),
             Error::Keyring(_) => {
-                "The system keyring is not available. Ferrochat needs a Secret Service \
-                 (KWallet or GNOME Keyring) to store its session securely."
+                "The system keyring is not available. Ferrochat keeps its session key \
+                 only in a Secret Service and never on disk in plain text. On KDE Plasma: \
+                 open System Settings → KDE Wallet, enable the wallet subsystem and make \
+                 sure kwalletd6 (or kwalletd5) is running; the KDE Secret Service bridge \
+                 (ksecretd / kwallet ≥ 6.x) must be active. On GNOME: install and unlock \
+                 gnome-keyring. Then press Try again."
                     .into()
             }
             Error::Io(_) => "A local file could not be read or written.".into(),

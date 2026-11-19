@@ -1,6 +1,6 @@
 //! Pure state types and reducers (unit-tested without iced).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::net::types::{
     ChatId, ChatMeta, Content, Message, ReceiptStatus, fallback_name, is_group_jid,
@@ -63,10 +63,13 @@ impl ChatEntry {
 /// The chat list plus the contact-name directory.
 #[derive(Debug, Clone, Default)]
 pub struct ChatList {
-    /// Rows, sorted pinned-first then by recency.
+    /// Rows, sorted pinned-first then by recency. Read-only outside; use the
+    /// methods to mutate so the index stays in sync.
     pub entries: Vec<ChatEntry>,
     /// JID → display name.
     pub names: HashMap<String, String>,
+    /// JID → position in `entries` (O(1) lookups during history sync).
+    index: HashMap<String, usize>,
 }
 
 impl ChatList {
@@ -81,9 +84,17 @@ impl ChatList {
                 })
                 .collect(),
             names,
+            index: HashMap::new(),
         };
         list.sort();
         list
+    }
+
+    fn reindex(&mut self) {
+        self.index.clear();
+        for (i, e) in self.entries.iter().enumerate() {
+            self.index.insert(e.meta.id.clone(), i);
+        }
     }
 
     /// Re-sorts: pinned first, then newest activity.
@@ -95,11 +106,12 @@ impl ChatList {
                 .then(b.meta.last_ts.cmp(&a.meta.last_ts))
                 .then(a.meta.id.cmp(&b.meta.id))
         });
+        self.reindex();
     }
 
     /// Display name for a chat or a sender.
     pub fn display_name(&self, jid: &str) -> String {
-        if let Some(e) = self.entries.iter().find(|e| e.meta.id == jid)
+        if let Some(e) = self.get(jid)
             && let Some(n) = &e.meta.name
         {
             return n.clone();
@@ -112,9 +124,10 @@ impl ChatList {
 
     /// Mutable entry, created if missing.
     fn entry_mut(&mut self, chat: &str) -> &mut ChatEntry {
-        if let Some(i) = self.entries.iter().position(|e| e.meta.id == chat) {
+        if let Some(&i) = self.index.get(chat) {
             return &mut self.entries[i];
         }
+        self.index.insert(chat.to_string(), self.entries.len());
         self.entries.push(ChatEntry {
             meta: ChatMeta {
                 id: chat.to_string(),
@@ -128,7 +141,12 @@ impl ChatList {
 
     /// Finds an entry.
     pub fn get(&self, chat: &str) -> Option<&ChatEntry> {
-        self.entries.iter().find(|e| e.meta.id == chat)
+        self.index.get(chat).and_then(|&i| self.entries.get(i))
+    }
+
+    fn get_mut(&mut self, chat: &str) -> Option<&mut ChatEntry> {
+        let i = *self.index.get(chat)?;
+        self.entries.get_mut(i)
     }
 
     /// Merges history-sync metadata.
@@ -149,15 +167,16 @@ impl ChatList {
         self.sort();
     }
 
-    /// Applies incoming/outgoing messages. For `live` traffic, increments
-    /// unread for incoming messages unless that chat is open and the window
-    /// focused (history carries its own unread counters).
+    /// Applies incoming/outgoing messages. Incoming messages whose id is in
+    /// `fresh` (newly stored: live or drained from the offline queue) count
+    /// as unread unless that chat is open and the window focused. History
+    /// passes `None`: it carries its own unread counters.
     pub fn apply_messages(
         &mut self,
         msgs: &[Message],
         open_chat: Option<&str>,
         focused: bool,
-        live: bool,
+        fresh: Option<&HashSet<String>>,
     ) {
         for m in msgs {
             if !m.from_me
@@ -172,11 +191,11 @@ impl ChatList {
                 .last
                 .as_ref()
                 .is_none_or(|l| (m.timestamp, &m.id) >= (l.timestamp, &l.id));
+            let is_fresh = fresh.is_some_and(|f| f.contains(&m.id));
+            if is_fresh && !m.from_me && !viewing && !matches!(m.content, Content::Deleted) {
+                e.meta.unread += 1;
+            }
             if newer {
-                let duplicate = e.last.as_ref().is_some_and(|l| l.id == m.id);
-                if live && !m.from_me && !viewing && !duplicate {
-                    e.meta.unread += 1;
-                }
                 e.last = Some(m.clone());
                 e.meta.last_ts = e.meta.last_ts.max(m.timestamp);
             } else if let Some(l) = &mut e.last
@@ -190,7 +209,7 @@ impl ChatList {
 
     /// Receipt for the preview tick.
     pub fn apply_receipt(&mut self, chat: &str, ids: &[String], status: ReceiptStatus) {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.meta.id == chat)
+        if let Some(e) = self.get_mut(chat)
             && let Some(l) = &mut e.last
             && l.from_me
             && ids.contains(&l.id)
@@ -201,7 +220,7 @@ impl ChatList {
 
     /// Clears the unread badge.
     pub fn mark_read(&mut self, chat: &str) {
-        if let Some(e) = self.entries.iter_mut().find(|e| e.meta.id == chat) {
+        if let Some(e) = self.get_mut(chat) {
             e.meta.unread = 0;
         }
     }
@@ -272,11 +291,16 @@ impl Conversation {
             if let Some(i) = self.position(&m.id) {
                 let cur = &mut self.messages[i];
                 cur.status = cur.status.advance(m.status);
-                let deleted = matches!(m.content, Content::Deleted);
+                let deleted = matches!(m.content, Content::Deleted)
+                    && crate::store::revoke_allowed(cur.from_me, &cur.sender, &m);
                 let gained_media = cur.content.media().is_none() && m.content.media().is_some();
                 if deleted || gained_media {
                     cur.content = m.content;
                 }
+                continue;
+            }
+            if matches!(m.content, Content::Deleted) {
+                // Revoke for a message outside the window / never seen.
                 continue;
             }
             let idx = self
@@ -395,7 +419,12 @@ mod tests {
             } else {
                 ReceiptStatus::Read
             },
+            expires_at: None,
         }
+    }
+
+    fn fresh(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
     }
 
     fn list() -> ChatList {
@@ -425,22 +454,36 @@ mod tests {
     fn new_message_moves_chat_to_top_and_counts_unread() {
         let mut l = list();
         assert_eq!(l.entries[0].meta.id, "g@g.us");
-        l.apply_messages(&[m("a", "1", 5, false)], None, true, false);
+        l.apply_messages(&[m("a", "1", 5, false)], None, true, None);
         assert_eq!(l.get("a").unwrap().meta.unread, 0, "history does not count");
-        l.apply_messages(&[m("a", "2", 30, false)], None, true, true);
+        l.apply_messages(&[m("a", "2", 30, false)], None, true, Some(&fresh(&["2"])));
         assert_eq!(l.entries[0].meta.id, "a");
         assert_eq!(l.get("a").unwrap().meta.unread, 1);
-        // Same message again does not double count.
-        l.apply_messages(&[m("a", "2", 30, false)], None, true, true);
+        // Same message again (not newly stored) does not double count.
+        l.apply_messages(&[m("a", "2", 30, false)], None, true, Some(&fresh(&[])));
         assert_eq!(l.get("a").unwrap().meta.unread, 1);
+        // Offline-drained messages older than the preview still count.
+        l.apply_messages(&[m("a", "0", 1, false)], None, true, Some(&fresh(&["0"])));
+        assert_eq!(l.get("a").unwrap().meta.unread, 2);
+        assert_eq!(l.get("a").unwrap().last.as_ref().unwrap().id, "2");
     }
 
     #[test]
     fn open_focused_chat_does_not_count_unread() {
         let mut l = list();
-        l.apply_messages(&[m("a", "2", 12, false)], Some("a"), true, true);
+        l.apply_messages(
+            &[m("a", "2", 12, false)],
+            Some("a"),
+            true,
+            Some(&fresh(&["2"])),
+        );
         assert_eq!(l.get("a").unwrap().meta.unread, 0);
-        l.apply_messages(&[m("a", "3", 13, false)], Some("a"), false, true);
+        l.apply_messages(
+            &[m("a", "3", 13, false)],
+            Some("a"),
+            false,
+            Some(&fresh(&["3"])),
+        );
         assert_eq!(l.get("a").unwrap().meta.unread, 1);
         l.mark_read("a");
         assert_eq!(l.get("a").unwrap().meta.unread, 0);
@@ -449,7 +492,7 @@ mod tests {
     #[test]
     fn filters_and_search() {
         let mut l = list();
-        l.apply_messages(&[m("a", "1", 11, false)], None, true, false);
+        l.apply_messages(&[m("a", "1", 11, false)], None, true, None);
         assert_eq!(l.filtered("", Filter::Groups).len(), 1);
         assert_eq!(l.filtered("", Filter::Unread).len(), 1);
         assert_eq!(l.filtered("ali", Filter::All).len(), 1);
@@ -485,10 +528,36 @@ mod tests {
         assert!(c.apply_receipt(&["1".into()], ReceiptStatus::Delivered));
         assert!(!c.apply_receipt(&["1".into()], ReceiptStatus::Sent));
         assert_eq!(c.get("1").unwrap().status, ReceiptStatus::Delivered);
+        // Someone else cannot revoke my message.
+        let mut forged = m("a", "1", 10, false);
+        forged.content = Content::Deleted;
+        c.merge(vec![forged]);
+        assert_ne!(c.get("1").unwrap().content, Content::Deleted);
         let mut del = m("a", "1", 10, true);
         del.content = Content::Deleted;
-        c.merge(vec![del]);
+        c.merge(vec![del.clone()]);
         assert_eq!(c.get("1").unwrap().content, Content::Deleted);
+        // Revokes never create bubbles.
+        del.id = "unknown".into();
+        c.merge(vec![del]);
+        assert!(c.get("unknown").is_none());
+    }
+
+    #[test]
+    fn index_survives_many_chats() {
+        let mut l = ChatList::default();
+        let chats: Vec<ChatMeta> = (0..5000)
+            .map(|i| ChatMeta {
+                id: format!("{i}@s.whatsapp.net"),
+                last_ts: i,
+                ..Default::default()
+            })
+            .collect();
+        l.apply_history(&chats, &[]);
+        assert_eq!(l.entries.len(), 5000);
+        assert_eq!(l.entries[0].meta.id, "4999@s.whatsapp.net");
+        assert_eq!(l.get("17@s.whatsapp.net").unwrap().meta.last_ts, 17);
+        l.mark_read("17@s.whatsapp.net");
     }
 
     #[test]

@@ -6,7 +6,9 @@ use std::time::Duration;
 use ferrochat::app::state::{ChatList, Conversation};
 use ferrochat::mock::{self, SHOWCASE_CHAT};
 use ferrochat::net::fake::{self, FakeOptions, Sent};
-use ferrochat::net::{Content, Event, Message, ReceiptStatus, WaClient, new_message_id};
+use std::collections::HashSet;
+
+use ferrochat::net::{Content, Event, Message, Origin, ReceiptStatus, WaClient, new_message_id};
 use ferrochat::store::Store;
 use futures::StreamExt;
 
@@ -42,11 +44,18 @@ impl Driver {
                 self.store.set_contact_names(&names).unwrap();
                 self.chats.apply_history(&chats, &names);
             }
-            Event::Messages { messages, live } => {
-                self.store.insert_messages(&messages).unwrap();
+            Event::Messages { messages, origin } => {
+                // Same two phases as App: persist, then count what was new.
+                let new_ids: HashSet<String> = self
+                    .store
+                    .insert_messages(&messages)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
                 let open = self.open.as_ref().map(|c| c.chat.clone());
+                let fresh = (origin != Origin::History).then_some(&new_ids);
                 self.chats
-                    .apply_messages(&messages, open.as_deref(), true, live);
+                    .apply_messages(&messages, open.as_deref(), true, fresh);
                 if let Some(c) = &mut self.open {
                     c.merge(messages);
                 }
@@ -149,10 +158,11 @@ async fn sending_text_walks_the_receipt_state_machine() {
         timestamp: 1_763_600_000,
         content: Content::Text("hola".into()),
         status: ReceiptStatus::Pending,
+        expires_at: None,
     };
     d.apply(Event::Messages {
         messages: vec![local],
-        live: true,
+        origin: Origin::Live,
     });
     client.send_text(SHOWCASE_CHAT, &id, "hola").await.unwrap();
 
@@ -285,8 +295,36 @@ async fn live_incoming_message_bumps_unread() {
         timestamp: 1_763_600_100,
         content: Content::Text("¿Estás?".into()),
         status: ReceiptStatus::Read,
+        expires_at: None,
     });
     drain(&mut stream, &mut d).await;
     assert_eq!(d.chats.get(SHOWCASE_CHAT).unwrap().meta.unread, before + 1);
     assert_eq!(d.chats.entries[0].meta.id, SHOWCASE_CHAT);
+}
+
+#[tokio::test]
+async fn offline_drain_counts_unread_once() {
+    let (client, stream) = fake::start(FakeOptions::default(), data());
+    let mut stream = Box::pin(stream);
+    let mut d = Driver::new();
+    drain(&mut stream, &mut d).await;
+    let before = d.chats.get(SHOWCASE_CHAT).unwrap().meta.unread;
+    let msg = |id: &str| Message {
+        id: id.into(),
+        chat: SHOWCASE_CHAT.into(),
+        sender: SHOWCASE_CHAT.into(),
+        sender_name: None,
+        from_me: false,
+        timestamp: 1_763_600_200,
+        content: Content::Text("while you were away".into()),
+        status: ReceiptStatus::Read,
+        expires_at: None,
+    };
+    client.simulate_offline_drain(vec![msg("OFF1"), msg("OFF2")]);
+    drain(&mut stream, &mut d).await;
+    assert_eq!(d.chats.get(SHOWCASE_CHAT).unwrap().meta.unread, before + 2);
+    // Redelivery of the same drain does not count twice.
+    client.simulate_offline_drain(vec![msg("OFF1"), msg("OFF2")]);
+    drain(&mut stream, &mut d).await;
+    assert_eq!(d.chats.get(SHOWCASE_CHAT).unwrap().meta.unread, before + 2);
 }

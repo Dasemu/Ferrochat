@@ -11,6 +11,9 @@ use crate::app::state::{ChatEntry, Filter};
 use crate::app::{App, Message, Ui};
 use crate::net::Connection;
 
+/// Rows rendered at most (the list is not virtualised; search reaches the rest).
+pub const MAX_ROWS: usize = 300;
+
 /// Left navigation rail. Only "Chats" is functional; the other sections
 /// (status, channels, communities) are out of scope and shown disabled.
 pub fn rail(app: &App) -> El<'_> {
@@ -132,17 +135,30 @@ pub fn view(app: &App) -> El<'_> {
     ];
 
     if app.connection != Connection::Connected {
-        let label = match app.connection {
-            Connection::Reconnecting { attempt } => format!("Reconnecting… (attempt {attempt})"),
-            Connection::Connecting => "Connecting…".into(),
-            _ => "Computer not connected".into(),
+        let (label, action) = match &app.connection {
+            Connection::Reconnecting { attempt } => {
+                (format!("Reconnecting… (attempt {attempt})"), None)
+            }
+            Connection::Connecting => ("Connecting…".into(), None),
+            Connection::Replaced => (
+                "WhatsApp is open on another computer or browser. Ferrochat is paused.".into(),
+                Some("Use here"),
+            ),
+            Connection::Offline { reason } => (
+                format!("{reason} Retrying automatically."),
+                Some("Retry now"),
+            ),
+            Connection::Disconnected | Connection::Connected => {
+                ("Computer not connected".into(), Some("Retry now"))
+            }
         };
-        top = top.push(banner(app, Icon::WifiOff, label));
+        top = top.push(banner(app, Icon::WifiOff, label, action));
     } else if let Some(pr) = app.sync_progress {
         top = top.push(banner(
             app,
             Icon::RefreshCw,
             format!("Syncing older messages… {pr}%"),
+            None,
         ));
     }
 
@@ -181,8 +197,23 @@ pub fn view(app: &App) -> El<'_> {
                 .padding([14, 16]),
             );
         }
-        for e in entries {
+        let total = entries.len();
+        for e in entries.into_iter().take(MAX_ROWS) {
             col = col.push(chat_row(app, e, now));
+        }
+        if total > MAX_ROWS {
+            col = col.push(
+                container(
+                    text(format!(
+                        "{} more chats. Search to find older chats.",
+                        total - MAX_ROWS
+                    ))
+                    .size(13)
+                    .color(p.text_secondary),
+                )
+                .center_x(Length::Fill)
+                .padding(16),
+            );
         }
         scrollable(col)
             .direction(super::thin_scrollbar())
@@ -204,23 +235,33 @@ pub fn view(app: &App) -> El<'_> {
         .into()
 }
 
-fn banner(app: &App, i: Icon, label: String) -> El<'_> {
+fn banner<'a>(app: &'a App, i: Icon, label: String, action: Option<&'static str>) -> El<'a> {
     let t = &app.theme;
     let p = t.palette;
-    container(
-        row![
-            container(icon(i, 20.0, p.bg_sidebar))
-                .padding(10)
-                .style(theme::rounded(p.notice_text, 22.0)),
-            text(label).size(14).color(p.text_primary),
-        ]
-        .spacing(14)
-        .align_y(Alignment::Center),
-    )
-    .padding([10, 16])
-    .width(Length::Fill)
-    .style(theme::solid(p.system_chip))
-    .into()
+    let mut r = row![
+        container(icon(i, 20.0, p.bg_sidebar))
+            .padding(10)
+            .style(theme::rounded(p.notice_text, 22.0)),
+        text(label)
+            .size(14)
+            .color(p.text_primary)
+            .width(Length::Fill),
+    ]
+    .spacing(14)
+    .align_y(Alignment::Center);
+    if let Some(a) = action {
+        r = r.push(
+            button(text(a).size(14).font(INTER_MEDIUM))
+                .padding([6, 4])
+                .style(theme::link_button(t))
+                .on_press(Message::Ui(Ui::Reconnect)),
+        );
+    }
+    container(r)
+        .padding([10, 16])
+        .width(Length::Fill)
+        .style(theme::solid(p.system_chip))
+        .into()
 }
 
 fn menu(app: &App) -> El<'_> {

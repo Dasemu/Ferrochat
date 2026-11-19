@@ -160,8 +160,13 @@ impl Config {
     }
 }
 
-/// Creates `dir` (and parents) and restricts it to the owner (0700).
+/// Creates `dir` (and parents) and restricts it to the owner (0700). An
+/// existing directory (e.g. a user-chosen `FERROCHAT_DATA_DIR`) keeps its
+/// permissions: we only tighten what we create.
 pub fn secure_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    if dir.is_dir() {
+        return Ok(());
+    }
     std::fs::create_dir_all(dir)?;
     #[cfg(unix)]
     {
@@ -169,6 +174,27 @@ pub fn secure_dir(dir: &std::path::Path) -> std::io::Result<()> {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     }
     Ok(())
+}
+
+/// Takes an exclusive advisory lock on `<data_dir>/ferrochat.lock`. Keep the
+/// returned file alive for the whole process; a second instance fails here.
+pub fn acquire_instance_lock(data_dir: &std::path::Path) -> Result<std::fs::File, String> {
+    secure_dir(data_dir).map_err(|e| format!("cannot create {}: {e}", data_dir.display()))?;
+    let path = data_dir.join("ferrochat.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
+    match file.try_lock() {
+        Ok(()) => Ok(file),
+        Err(std::fs::TryLockError::WouldBlock) => Err(
+            "Ferrochat is already running for this data directory. Switch to the open window."
+                .into(),
+        ),
+        Err(std::fs::TryLockError::Error(e)) => Err(format!("cannot lock {}: {e}", path.display())),
+    }
 }
 
 /// Restricts an SQLite database and its `-wal` / `-shm` / `-journal` side
@@ -240,6 +266,29 @@ mod tests {
         assert_eq!(mode(&dir), 0o700);
         assert_eq!(mode(&db), 0o600);
         assert_eq!(mode(&dir.join("x.sqlite3-wal")), 0o600);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn second_instance_is_refused() {
+        let dir = std::env::temp_dir().join(format!("ferrochat-lock-{}", std::process::id()));
+        let first = acquire_instance_lock(&dir).unwrap();
+        assert!(acquire_instance_lock(&dir).is_err());
+        drop(first);
+        assert!(acquire_instance_lock(&dir).is_ok());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_dirs_keep_their_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ferrochat-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        secure_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
         let _ = std::fs::remove_dir_all(dir);
     }
 

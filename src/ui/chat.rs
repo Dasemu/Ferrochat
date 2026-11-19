@@ -504,6 +504,17 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             container(meta_row(t, msg)).align_right(Length::Fill)
         ]
         .into(),
+        Content::ViewOnce => row![
+            icon(Icon::CircleDashed, 16.0, p.text_secondary),
+            text("View once message: open it on your phone")
+                .size(m.text)
+                .color(p.text_secondary),
+            gap(8.0),
+            meta_row(t, msg),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
         Content::Deleted => row![
             icon(Icon::CircleAlert, 15.0, p.text_secondary),
             text(if out { "You deleted this message" } else { "This message was deleted" })

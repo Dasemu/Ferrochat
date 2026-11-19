@@ -80,17 +80,21 @@ pub fn view(app: &App) -> El<'_> {
         (AuthState::Failed { message }, _) => container(
             column![
                 icon(Icon::CircleAlert, 40.0, p.danger),
-                text(message.as_str()).size(14).color(p.text_primary),
+                text(message.as_str())
+                    .size(14)
+                    .color(p.text_primary)
+                    .align_x(Alignment::Center),
                 button(text("Try again").size(14).font(INTER_MEDIUM))
                     .padding([8, 20])
                     .style(theme::primary_button(t))
                     .on_press(Message::Ui(Ui::ReloadQr)),
+                reset_button(app),
             ]
             .spacing(14)
             .align_x(Alignment::Center),
         )
-        .width(qr_side)
-        .height(qr_side)
+        .width(qr_side + 80.0)
+        .height(qr_side + 60.0)
         .align_x(Alignment::Center)
         .align_y(Alignment::Center)
         .into(),
@@ -202,4 +206,22 @@ fn qr_placeholder(app: &App, side: f32, expired: bool) -> El<'_> {
         .align_y(Alignment::Center)
         .style(theme::rounded(p.bg_input, 8.0))
         .into()
+}
+
+/// Shown only when the saved session cannot be decrypted: discarding it is
+/// the user's decision, never automatic.
+fn reset_button(app: &App) -> El<'_> {
+    let t = &app.theme;
+    if !app.session_unreadable {
+        return Space::new().into();
+    }
+    button(
+        text("Discard saved session and link again")
+            .size(13)
+            .font(INTER_MEDIUM),
+    )
+    .padding([6, 4])
+    .style(theme::link_button(t))
+    .on_press(Message::Ui(Ui::ResetSession))
+    .into()
 }
