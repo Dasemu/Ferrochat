@@ -28,7 +28,8 @@ See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
 ## Workflow quirks
 - Work on `feat/*` branches, PR to `development`. Never push `main`/`development`.
 - `version.yml` bumps `Cargo.toml` (PATCH on development, MINOR on dev→main merge);
-  it skips commits starting with `chore(release)`.
+  dev→main merges are detected via the commits/{sha}/pulls API; runs by
+  github-actions[bot] are skipped. Protected branches need a bot bypass.
 
 ## Deployment
 No packaging yet; ship `target/release/ferrochat`. Wayland `app_id` / desktop
