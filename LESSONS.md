@@ -111,6 +111,7 @@ next change.
 
 - Bot pushes made with `GITHUB_TOKEN` never trigger `push` workflows, so the release workflow chains off the version workflow with `workflow_run` (conclusion `success`, branch `main`, checkout `ref: main` for the bump commit).
 
+
 ## Round 3: flicker, names, lists, video
 
 * **Hover flicker was a reflow, not a redraw.** The hover buttons (smiley,
@@ -156,3 +157,6 @@ next change.
   read it when the click arrives.
 * `Task::perform` + `spawn_blocking` work on a plain tokio test runtime, which
   is all the harness needs.
+
+- `keyring` 4 opens a *blocking* zbus connection: if any dependency turns on zbus `tokio` (ksni default features, `rfd`/`ashpd` `tokio`, a `zbus` dev-dep) it panics ("Cannot start a runtime from within a runtime") when called on a runtime worker. Keep zbus on `async-io` (`ksni` with `default-features = false, features = ["async-io"]`, `rfd` with `async-std`); `tests/real_keyring.rs` guards it against a real Secret Service.
+
