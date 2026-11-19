@@ -113,12 +113,23 @@ impl SecretStore for MemoryStore {
     }
 }
 
+fn well_formed(k: &Secret) -> bool {
+    k.expose().len() == 64 && k.expose().bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Reads the Signal store key without ever creating one. `None` when it is
+/// missing or malformed: with an existing session file the caller must ask
+/// the user instead of minting a key (which would orphan the session).
+pub fn get_signal_store_key(store: &dyn SecretStore) -> Result<Option<Secret>> {
+    Ok(store.get(SIGNAL_STORE_KEY)?.filter(well_formed))
+}
+
 /// Returns the Signal store key, creating a fresh random 256-bit one if the
 /// keyring has none yet. `created` tells the caller that any existing
 /// encrypted database is unreadable and must be discarded.
 pub fn signal_store_key(store: &dyn SecretStore) -> Result<(Secret, bool)> {
     if let Some(k) = store.get(SIGNAL_STORE_KEY)? {
-        if k.expose().len() == 64 && k.expose().bytes().all(|b| b.is_ascii_hexdigit()) {
+        if well_formed(&k) {
             return Ok((k, false));
         }
         tracing::warn!("signal store key in keyring is malformed; generating a new one");
@@ -160,6 +171,18 @@ mod tests {
         assert!(!created2);
         assert_eq!(k1.expose(), k2.expose());
         assert_eq!(k1.expose().len(), 64);
+    }
+
+    #[test]
+    fn get_never_creates() {
+        let s = MemoryStore::new();
+        assert!(get_signal_store_key(&s).unwrap().is_none());
+        assert!(s.get(SIGNAL_STORE_KEY).unwrap().is_none());
+        s.set(SIGNAL_STORE_KEY, &Secret::new("short")).unwrap();
+        assert!(get_signal_store_key(&s).unwrap().is_none());
+        let (k, _) = signal_store_key(&MemoryStore::new()).unwrap();
+        s.set(SIGNAL_STORE_KEY, &k).unwrap();
+        assert!(get_signal_store_key(&s).unwrap().is_some());
     }
 
     #[test]

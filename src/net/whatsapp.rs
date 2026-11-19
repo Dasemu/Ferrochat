@@ -24,10 +24,11 @@ use whatsapp_rust::{Client, Jid};
 use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
 
 use super::convert::{self, Envelope, Uploaded};
-use super::types::{Content, MediaKind, MediaRef, OutgoingKind, OutgoingMedia};
+use super::types::{Content, MediaKind, MediaRef, Origin, OutgoingKind, OutgoingMedia};
 use super::{Connection, Event, WaClient};
-use crate::auth::secrets::{SecretStore, signal_store_key};
+use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
 use crate::error::{Error, MaskedJid, Result};
+use zeroize::Zeroizing;
 
 /// Live client handle.
 pub struct RealClient {
@@ -164,23 +165,48 @@ impl WaClient for RealClient {
 
     fn logout(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
-            self.client.logout().await;
-            let handle = self.handle.lock().ok().and_then(|mut h| h.take());
-            if let Some(h) = handle {
-                h.shutdown().await;
+            // Deregister (best effort: it cannot reach the server offline),
+            // then stop the client, and only then delete its database.
+            if tokio::time::timeout(LOGOUT_TIMEOUT, self.client.logout())
+                .await
+                .is_err()
+            {
+                tracing::warn!("logout request timed out; unlinking locally");
             }
-            remove_db(&self.signal_db);
-            Ok(())
+            let handle = self.handle.lock().ok().and_then(|mut h| h.take());
+            if let Some(h) = handle
+                && tokio::time::timeout(LOGOUT_TIMEOUT, h.shutdown())
+                    .await
+                    .is_err()
+            {
+                tracing::warn!("client shutdown timed out");
+            }
+            remove_db(&self.signal_db)
         })
     }
 }
 
+/// Upper bound for the logout IQ and the client shutdown.
+pub const LOGOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
 /// Removes the encrypted session database and its WAL/SHM side files.
-pub fn remove_db(path: &Path) {
+/// Missing files are fine; any other failure is reported.
+pub fn remove_db(path: &Path) -> Result<()> {
+    let mut first_err = None;
     for suffix in ["", "-wal", "-shm", "-journal"] {
         let mut p = path.as_os_str().to_owned();
         p.push(suffix);
-        let _ = std::fs::remove_file(PathBuf::from(p));
+        match std::fs::remove_file(PathBuf::from(p)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(Error::Io(e)),
+        None => Ok(()),
     }
 }
 
@@ -194,36 +220,70 @@ impl EventHandler for Forwarder {
     }
 }
 
-/// Opens the SQLCipher-encrypted session store with a hex raw key.
-pub async fn open_store(path: &Path, key_hex: String) -> Result<SqliteStore> {
+/// Why the session store could not be opened.
+#[derive(Debug)]
+pub enum SessionError {
+    /// The file is not decryptable with this key (SQLITE_NOTADB): the key
+    /// was lost or replaced. Only the user may decide to discard it.
+    KeyMismatch,
+    /// Anything else (I/O, permissions, busy, migrations): never a reason
+    /// to delete the session.
+    Other(Error),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::KeyMismatch => f.write_str("session store key mismatch"),
+            SessionError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+fn pragma_key(key_hex: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!("PRAGMA key = \"x'{key_hex}'\";"))
+}
+
+/// Opens the SQLCipher-encrypted session store with a hex raw key. Never
+/// deletes anything.
+pub async fn open_store(
+    path: &Path,
+    key_hex: Zeroizing<String>,
+) -> std::result::Result<SqliteStore, SessionError> {
     if path.exists() {
         // Fail fast on a wrong key: the library's pool would otherwise keep
         // retrying the connection for its full timeout.
         let (p, k) = (path.to_path_buf(), key_hex.clone());
         tokio::task::spawn_blocking(move || verify_key(&p, &k))
             .await
-            .map_err(|_| Error::Cancelled)??;
+            .map_err(|_| SessionError::Other(Error::Cancelled))??;
     }
     let url = path.to_string_lossy().to_string();
     let config = SqliteStoreConfig::default().with_connection_init(move |conn| {
         // Raw-key form: no PBKDF2 at every open, the key is already 256 random bits.
-        diesel::sql_query(format!("PRAGMA key = \"x'{key_hex}'\";")).execute(conn)?;
+        diesel::sql_query(pragma_key(&key_hex).as_str()).execute(conn)?;
         // Fails here (not later) when the key does not match the file.
         diesel::sql_query("SELECT count(*) FROM sqlite_master;").execute(conn)?;
         Ok(())
     });
     SqliteStore::with_config(&url, config)
         .await
-        .map_err(|e| Error::Auth(format!("cannot open session store: {e}")))
+        .map_err(|e| SessionError::Other(Error::Auth(format!("cannot open session store: {e}"))))
 }
 
-fn verify_key(path: &Path, key_hex: &str) -> Result<()> {
-    let conn = rusqlite::Connection::open(path)?;
-    conn.execute_batch(&format!("PRAGMA key = \"x'{key_hex}'\";"))?;
+/// Checks the key against an existing file. Only `SQLITE_NOTADB` (what
+/// SQLCipher returns for a wrong key) counts as a key mismatch.
+pub fn verify_key(path: &Path, key_hex: &str) -> std::result::Result<(), SessionError> {
+    let classify = |e: rusqlite::Error| match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::NotADatabase) => SessionError::KeyMismatch,
+        _ => SessionError::Other(Error::Store(e)),
+    };
+    let conn = rusqlite::Connection::open(path).map_err(classify)?;
+    conn.execute_batch(&pragma_key(key_hex)).map_err(classify)?;
     conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
         r.get::<_, i64>(0)
     })
-    .map_err(|_| Error::Auth("session store key mismatch".into()))?;
+    .map_err(classify)?;
     Ok(())
 }
 
@@ -244,39 +304,65 @@ pub fn start(
     futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
 }
 
-async fn run(
-    data_dir: PathBuf,
-    signal_db: PathBuf,
+/// Loads the key and opens the store. Returns `Ok(None)` after emitting
+/// [`Event::SessionUnreadable`] when the user has to decide.
+pub async fn prepare_session(
+    data_dir: &Path,
+    signal_db: &Path,
     secrets: Arc<dyn SecretStore>,
-    tx: mpsc::UnboundedSender<Event>,
-) -> Result<()> {
-    crate::config::secure_dir(&data_dir)?;
-    let (key, created) = tokio::task::spawn_blocking(move || signal_store_key(secrets.as_ref()))
-        .await
-        .map_err(|_| Error::Cancelled)??;
-    if created && signal_db.exists() {
-        // The old key is gone, so the old database is undecryptable.
-        tracing::warn!("new session key generated; discarding unreadable session store");
-        remove_db(&signal_db);
-    }
+    tx: &mpsc::UnboundedSender<Event>,
+) -> Result<Option<SqliteStore>> {
+    crate::config::secure_dir(data_dir)?;
     let had_session = signal_db.exists();
+    let key = tokio::task::spawn_blocking(move || {
+        if had_session {
+            // Never mint a new key over an existing session: that would make
+            // it unreadable. Missing/malformed key → ask the user.
+            get_signal_store_key(secrets.as_ref())
+        } else {
+            signal_store_key(secrets.as_ref()).map(|(k, _)| Some(k))
+        }
+    })
+    .await
+    .map_err(|_| Error::Cancelled)??;
+    let Some(key) = key else {
+        let _ = tx.send(Event::SessionUnreadable(
+            "The key for your saved session is missing from the system keyring.".into(),
+        ));
+        return Ok(None);
+    };
     let _ = tx.send(if had_session {
         Event::SessionFound
     } else {
         Event::NoSession
     });
     let _ = tx.send(Event::Connection(Connection::Connecting));
-
-    let store = match open_store(&signal_db, key.expose().to_string()).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(error = %e, "session store unreadable; starting a fresh pairing");
-            remove_db(&signal_db);
-            let _ = tx.send(Event::NoSession);
-            open_store(&signal_db, key.expose().to_string()).await?
+    match open_store(signal_db, Zeroizing::new(key.expose().to_string())).await {
+        Ok(store) => {
+            crate::config::secure_db_files(signal_db);
+            Ok(Some(store))
         }
+        Err(SessionError::KeyMismatch) => {
+            let _ = tx.send(Event::SessionUnreadable(
+                "Your saved session cannot be decrypted with the key in the system keyring.".into(),
+            ));
+            Ok(None)
+        }
+        Err(SessionError::Other(e)) => Err(e),
+    }
+}
+
+async fn run(
+    data_dir: PathBuf,
+    signal_db: PathBuf,
+    secrets: Arc<dyn SecretStore>,
+    tx: mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    let Some(store) = prepare_session(&data_dir, &signal_db, secrets, &tx).await? else {
+        // Wait for the UI to restart us after the user decided.
+        tx.closed().await;
+        return Ok(());
     };
-    crate::config::secure_db_files(&signal_db);
 
     let (wa_tx, mut wa_rx) = mpsc::unbounded_channel::<Arc<WaEvent>>();
     let bot = Bot::builder()
@@ -302,24 +388,81 @@ async fn run(
                 // The UI dropped the subscription (logout / reload / exit).
                 let handle = real.handle.lock().ok().and_then(|mut h| h.take());
                 if let Some(h) = handle {
-                    h.shutdown().await;
+                    let _ = tokio::time::timeout(LOGOUT_TIMEOUT, h.shutdown()).await;
                 }
                 return Ok(());
             }
             ev = wa_rx.recv() => {
                 let Some(ev) = ev else { return Ok(()) };
+                let terminal = is_terminal(&ev);
                 for out in translate(&ev, &client, &mut attempt) {
                     if tx.send(out).is_err() {
                         break;
                     }
+                }
+                if terminal {
+                    // Stop the library's own reconnect loop; the app decides
+                    // (backoff / user retry / re-pair).
+                    let handle = real.handle.lock().ok().and_then(|mut h| h.take());
+                    if let Some(h) = handle {
+                        let _ = tokio::time::timeout(LOGOUT_TIMEOUT, h.shutdown()).await;
+                    }
+                    tx.closed().await;
+                    return Ok(());
                 }
             }
         }
     }
 }
 
+/// Events after which the library must not keep reconnecting on its own.
+fn is_terminal(ev: &WaEvent) -> bool {
+    match ev {
+        WaEvent::StreamReplaced(_)
+        | WaEvent::LoggedOut(_)
+        | WaEvent::TemporaryBan(_)
+        | WaEvent::ClientOutdated(_) => true,
+        WaEvent::ConnectFailure(f) => !f.reason.should_reconnect(),
+        _ => false,
+    }
+}
+
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// Max messages / chats per event, so the UI applies a big history sync in
+/// slices between frames instead of freezing.
+pub const HISTORY_CHUNK: usize = 500;
+
+/// Splits a converted history blob into small events.
+pub fn history_events(parts: convert::HistoryParts, progress: Option<u32>) -> Vec<Event> {
+    let mut v = Vec::new();
+    if !parts.lid_pairs.is_empty() {
+        v.push(Event::LidMappings(parts.lid_pairs));
+    }
+    let mut chats = parts.chats.chunks(HISTORY_CHUNK).peekable();
+    let mut first = true;
+    while chats.peek().is_some() || first {
+        let chunk = chats.next().map(<[_]>::to_vec).unwrap_or_default();
+        v.push(Event::History {
+            chats: chunk,
+            names: if first {
+                parts.names.clone()
+            } else {
+                Vec::new()
+            },
+            progress,
+        });
+        first = false;
+    }
+    for chunk in parts.messages.chunks(HISTORY_CHUNK) {
+        v.push(Event::Messages {
+            messages: chunk.to_vec(),
+            origin: Origin::History,
+        });
+    }
+    v
 }
 
 /// Library event → zero or more app events.
@@ -343,18 +486,34 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                 },
             ]
         }
-        WaEvent::Disconnected(_) | WaEvent::ConnectFailure(_) | WaEvent::StreamError(_) => {
+        WaEvent::Disconnected(_) | WaEvent::StreamError(_) => {
             *attempt += 1;
             vec![Event::Connection(Connection::Reconnecting {
                 attempt: *attempt,
             })]
         }
+        WaEvent::ConnectFailure(f) => {
+            if f.reason.is_logged_out() {
+                vec![Event::LoggedOut {
+                    reason: "WhatsApp ended this session. Link the device again.".into(),
+                }]
+            } else if f.reason.should_reconnect() {
+                *attempt += 1;
+                vec![Event::Connection(Connection::Reconnecting {
+                    attempt: *attempt,
+                })]
+            } else {
+                vec![Event::Connection(Connection::Offline {
+                    reason: format!("WhatsApp refused the connection ({:?}).", f.reason),
+                })]
+            }
+        }
         WaEvent::LoggedOut(l) => vec![Event::LoggedOut {
             reason: format!("This device was unlinked ({:?}).", l.reason),
         }],
-        WaEvent::StreamReplaced(_) => vec![Event::LoggedOut {
-            reason: "WhatsApp was opened with this session somewhere else.".into(),
-        }],
+        // Not a logout: the session is still valid, another client took the
+        // stream. Never wipe anything here.
+        WaEvent::StreamReplaced(_) => vec![Event::Connection(Connection::Replaced)],
         WaEvent::TemporaryBan(_) => vec![Event::Fatal(
             "WhatsApp temporarily banned this account. Third-party clients break WhatsApp's \
              terms of service."
@@ -364,8 +523,10 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             "WhatsApp rejected this client version. Update Ferrochat.".into(),
         )],
         WaEvent::Messages(batch) => {
-            let live = matches!(batch.origin, whatsapp_rust::prelude::BatchOrigin::Live);
+            let drained = !matches!(batch.origin, whatsapp_rust::prelude::BatchOrigin::Live)
+                || batch.messages.iter().any(|m| m.info.is_offline);
             let mut out = Vec::new();
+            let mut pairs = Vec::new();
             for m in batch.messages.iter() {
                 let info = &m.info;
                 let env = Envelope {
@@ -375,8 +536,14 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                     from_me: info.source.is_from_me,
                     push_name: info.push_name.to_string(),
                     timestamp: info.timestamp.timestamp(),
+                    sender_alt: info.source.sender_alt.as_ref().map(|j| j.to_string()),
+                    recipient_alt: info.source.recipient_alt.as_ref().map(|j| j.to_string()),
+                    ephemeral_secs: info.ephemeral_expiration,
                 };
+                pairs.extend(env.lid_pairs());
                 if let Some(target) = convert::revoked_target(&m.message) {
+                    // The revoker is `sender`; the store only applies it to a
+                    // message from that same sender.
                     out.push(super::Message {
                         id: target,
                         content: Content::Deleted,
@@ -389,14 +556,21 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                     out.push(msg);
                 }
             }
-            if out.is_empty() {
-                vec![]
-            } else {
-                vec![Event::Messages {
-                    messages: out,
-                    live: live && batch.messages.iter().all(|m| !m.info.is_offline),
-                }]
+            let mut v = Vec::new();
+            if !pairs.is_empty() {
+                v.push(Event::LidMappings(pairs));
             }
+            if !out.is_empty() {
+                v.push(Event::Messages {
+                    messages: out,
+                    origin: if drained {
+                        Origin::Offline
+                    } else {
+                        Origin::Live
+                    },
+                });
+            }
+            v
         }
         WaEvent::Receipt(r) => {
             let chat = convert::bare_jid(&r.source.chat.to_string());
@@ -413,21 +587,7 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             }
         }
         WaEvent::HistorySync(lazy) => match lazy.get() {
-            Some(hs) => {
-                let (chats, messages, names) = convert::from_history(hs, now_secs());
-                let mut v = vec![Event::History {
-                    chats,
-                    names,
-                    progress: lazy.progress(),
-                }];
-                if !messages.is_empty() {
-                    v.push(Event::Messages {
-                        messages,
-                        live: false,
-                    });
-                }
-                v
-            }
+            Some(hs) => history_events(convert::from_history(hs, now_secs()), lazy.progress()),
             None => vec![],
         },
         WaEvent::PushNameUpdate(p) => vec![Event::ContactName {
