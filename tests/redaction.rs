@@ -34,6 +34,7 @@ fn logs_do_not_leak_secrets() {
     let writer = buf.clone();
     let subscriber = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::TRACE)
+        .without_time()
         .with_writer(move || writer.clone())
         .finish();
     let jid = format!("{PHONE}@s.whatsapp.net");
