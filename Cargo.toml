@@ -1,6 +1,6 @@
 [package]
 name = "ferrochat"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 rust-version = "1.94"
 description = "Unofficial lightweight native WhatsApp desktop client written in Rust"
@@ -42,7 +42,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 qrcode = { version = "0.14", default-features = false }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 notify-rust = "4"
-rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "tokio"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 rodio = { version = "0.21", default-features = false, features = ["playback"] }
 ogg = "0.9"
 opus = "0.3"
@@ -56,11 +56,11 @@ resvg = { version = "0.45", default-features = false }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # StatusNotifierItem tray icon, pure Rust over zbus 5 (the zbus already in the tree).
-ksni = "0.3"
+ksni = { version = "0.3", default-features = false, features = ["async-io"] }
 
 [dev-dependencies]
 # Fake StatusNotifierWatcher for the tray integration test (zbus 5, already in the tree).
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = "5"
 waproto = { version = "0.7", features = ["serde-deserialize"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 

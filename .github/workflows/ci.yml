@@ -18,7 +18,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config cmake libdbus-1-dev libasound2-dev \
-            libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev dbus
+            libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev dbus gnome-keyring
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -30,3 +30,11 @@ jobs:
       # A private session bus: the tray test registers on a fake StatusNotifierWatcher.
       - name: cargo test
         run: dbus-run-session -- cargo test
+
+      # Real Secret Service: guards the zbus executor feature (tokio vs async-io)
+      # that keyring's blocking connection depends on.
+      - name: cargo test real_keyring (gnome-keyring on a private bus)
+        env:
+          FERRO_REAL_KEYRING: "1"
+        run: |
+          dbus-run-session -- sh -c 'echo | gnome-keyring-daemon --unlock --components=secrets >/dev/null && cargo test --test real_keyring -- --ignored'
