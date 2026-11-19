@@ -71,6 +71,12 @@ distribution messages are not bubbles.
 | `$XDG_STATE_HOME/ferrochat/log` (rotated at 5 MB) | Logs | Bodies, phone numbers, QR payloads, keys and file names are redacted (`Redacted`, `MaskedJid`, manual `Debug` impls; covered by `tests/redaction.rs`). |
 | `~/Downloads/<name>` | Documents the user opened | Only on explicit click. |
 
+The data directory is created with mode 0700 and every database file
+(including `-wal` / `-shm`) is set to 0600. Downloads are capped at 100 MB
+and images are probed (header only) and rejected above 40 Mpx before
+decoding. Notification titles and bodies are markup-escaped (`&`, `<`, `>`)
+because KDE renders a subset of HTML in them.
+
 Images and voice notes are kept in memory only (byte-bounded LRUs: 48 MB
 images, 16 MB decoded audio) and re-downloaded after a restart.
 

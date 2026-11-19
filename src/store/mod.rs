@@ -41,17 +41,14 @@ impl Store {
     /// Opens (creating if needed) the cache at `path`.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
+            crate::config::secure_dir(dir)?;
         }
         let conn = Connection::open(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-        }
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
-        Self::init(conn)
+        let store = Self::init(conn)?;
+        crate::config::secure_db_files(path);
+        Ok(store)
     }
 
     /// In-memory cache for tests and `--mock`.

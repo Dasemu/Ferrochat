@@ -160,9 +160,39 @@ impl Config {
     }
 }
 
+/// Creates `dir` (and parents) and restricts it to the owner (0700).
+pub fn secure_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Restricts an SQLite database and its `-wal` / `-shm` / `-journal` side
+/// files to the owner (0600). Missing files are ignored.
+pub fn secure_db_files(db: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for suffix in ["", "-wal", "-shm", "-journal"] {
+            let mut p = db.as_os_str().to_owned();
+            p.push(suffix);
+            let _ = std::fs::set_permissions(
+                std::path::PathBuf::from(p),
+                std::fs::Permissions::from_mode(0o600),
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = db;
+}
+
 /// Opens `<state_dir>/log`, rotating it to `log.1` when over 5 MB.
 pub fn open_log_file(state_dir: &std::path::Path) -> Option<std::fs::File> {
-    std::fs::create_dir_all(state_dir).ok()?;
+    secure_dir(state_dir).ok()?;
     let path = state_dir.join("log");
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > 5 * 1024 * 1024) {
         let _ = std::fs::rename(&path, state_dir.join("log.1"));
@@ -194,6 +224,23 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_dir_and_db_files_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("ferrochat-perm-{}", std::process::id()));
+        secure_dir(&dir).unwrap();
+        let db = dir.join("x.sqlite3");
+        std::fs::write(&db, b"x").unwrap();
+        std::fs::write(dir.join("x.sqlite3-wal"), b"x").unwrap();
+        secure_db_files(&db);
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&dir), 0o700);
+        assert_eq!(mode(&db), 0o600);
+        assert_eq!(mode(&dir.join("x.sqlite3-wal")), 0o600);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
