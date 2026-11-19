@@ -649,11 +649,22 @@ impl App {
         };
         Task::perform(
             async move {
-                let r = client
-                    .download(&mref)
-                    .await
-                    .map(Arc::new)
-                    .map_err(|e| e.to_string());
+                let r = async {
+                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    if mref.kind == net::MediaKind::Image {
+                        // Header-only probe: refuse decompression bombs before
+                        // iced decodes the image.
+                        let probe = bytes.clone();
+                        tokio::task::spawn_blocking(move || {
+                            crate::media::image::check_image_bounds(&probe).map(|_| ())
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .map_err(|e| e.to_string())?;
+                    }
+                    Ok::<_, String>(Arc::new(bytes))
+                }
+                .await;
                 (key, r)
             },
             |(key, result)| Message::done(Done::Downloaded { key, result }),

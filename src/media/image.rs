@@ -9,9 +9,39 @@ use crate::net::types::{OutgoingKind, OutgoingMedia};
 /// Longest side of the inline thumbnail sent with a photo.
 pub const THUMB_SIDE: u32 = 96;
 
+fn media_err(e: impl std::fmt::Display) -> Error {
+    Error::Media(e.to_string())
+}
+
+/// Reads only the header and rejects images whose decoded size would exceed
+/// [`crate::media::MAX_IMAGE_PIXELS`] (decompression bombs).
+pub fn check_image_bounds(bytes: &[u8]) -> Result<(u32, u32)> {
+    let (w, h) = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(media_err)?
+        .into_dimensions()
+        .map_err(media_err)?;
+    if w as u64 * h as u64 > crate::media::MAX_IMAGE_PIXELS {
+        return Err(Error::Media(format!("image too large ({w}x{h})")));
+    }
+    Ok((w, h))
+}
+
+/// Decodes with allocation limits.
+pub fn decode_limited(bytes: &[u8]) -> Result<image::DynamicImage> {
+    check_image_bounds(bytes)?;
+    let mut reader = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(media_err)?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(crate::media::MAX_IMAGE_PIXELS * 4 + 16 * 1024 * 1024);
+    reader.limits(limits);
+    reader.decode().map_err(media_err)
+}
+
 /// Decodes `bytes`, returns `(width, height, jpeg_thumbnail)`.
 pub fn probe_and_thumbnail(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
-    let img = image::load_from_memory(bytes).map_err(|e| Error::Media(e.to_string()))?;
+    let img = decode_limited(bytes)?;
     let (w, h) = (img.width(), img.height());
     let thumb = img.thumbnail(THUMB_SIDE, THUMB_SIDE).to_rgb8();
     let mut out = Vec::new();
@@ -123,6 +153,21 @@ mod tests {
         // A broken "png" falls back to a document instead of failing.
         let bad = outgoing_from_file(Path::new("/x/b.png"), b"nope".to_vec(), None);
         assert_eq!(bad.kind, OutgoingKind::Document);
+    }
+
+    #[test]
+    fn rejects_decompression_bombs() {
+        // A valid PNG header claiming 20000x20000 pixels.
+        let mut out = Vec::new();
+        let enc = image::codecs::png::PngEncoder::new(&mut out);
+        use image::ImageEncoder;
+        // Encode a tiny image, then patch the IHDR dimensions.
+        enc.write_image(&[0u8; 3], 1, 1, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        out[16..20].copy_from_slice(&20_000u32.to_be_bytes());
+        out[20..24].copy_from_slice(&20_000u32.to_be_bytes());
+        assert!(check_image_bounds(&out).is_err());
+        assert!(check_image_bounds(&png(10, 10)).is_ok());
     }
 
     #[test]

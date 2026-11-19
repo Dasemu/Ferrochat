@@ -109,6 +109,7 @@ impl WaClient for RealClient {
 
     fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
+            crate::media::check_download_size(media.file_length)?;
             let params = DownloadParams::encrypted(
                 media.direct_path.clone(),
                 &media.media_key,
@@ -117,10 +118,13 @@ impl WaClient for RealClient {
                 media.file_length,
                 media_type(media.kind),
             );
-            self.client
+            let bytes = self
+                .client
                 .download_from_params(&params)
                 .await
-                .map_err(|e| Error::Net(format!("download failed: {e}")))
+                .map_err(|e| Error::Net(format!("download failed: {e}")))?;
+            crate::media::check_download_size(bytes.len() as u64)?;
+            Ok(bytes)
         })
     }
 
@@ -246,7 +250,7 @@ async fn run(
     secrets: Arc<dyn SecretStore>,
     tx: mpsc::UnboundedSender<Event>,
 ) -> Result<()> {
-    std::fs::create_dir_all(&data_dir)?;
+    crate::config::secure_dir(&data_dir)?;
     let (key, created) = tokio::task::spawn_blocking(move || signal_store_key(secrets.as_ref()))
         .await
         .map_err(|_| Error::Cancelled)??;
@@ -272,11 +276,7 @@ async fn run(
             open_store(&signal_db, key.expose().to_string()).await?
         }
     };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&signal_db, std::fs::Permissions::from_mode(0o600));
-    }
+    crate::config::secure_db_files(&signal_db);
 
     let (wa_tx, mut wa_rx) = mpsc::unbounded_channel::<Arc<WaEvent>>();
     let bot = Bot::builder()

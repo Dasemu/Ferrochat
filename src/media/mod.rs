@@ -6,6 +6,24 @@ pub mod image;
 
 use std::hash::Hash;
 
+use crate::error::{Error, Result};
+
+/// Largest media blob Ferrochat downloads (WhatsApp's own document limit is 2 GB;
+/// a desktop cache keeps a tighter bound).
+pub const MAX_DOWNLOAD_BYTES: u64 = 100 * 1024 * 1024;
+/// Largest decoded image accepted (pixels), to bound decode memory.
+pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
+
+/// Rejects downloads above [`MAX_DOWNLOAD_BYTES`].
+pub fn check_download_size(len: u64) -> Result<()> {
+    if len > MAX_DOWNLOAD_BYTES {
+        return Err(Error::Media(format!(
+            "media too large ({len} bytes, limit {MAX_DOWNLOAD_BYTES})"
+        )));
+    }
+    Ok(())
+}
+
 /// LRU cache bounded by total bytes (architecture §3: decoded images live in
 /// an LRU with a byte budget, default 48 MB).
 pub struct ByteLru<K: Hash + Eq, V> {
@@ -77,6 +95,12 @@ impl<K: Hash + Eq, V> ByteLru<K, V> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_cap() {
+        assert!(check_download_size(10).is_ok());
+        assert!(check_download_size(MAX_DOWNLOAD_BYTES + 1).is_err());
+    }
 
     #[test]
     fn evicts_by_bytes() {
