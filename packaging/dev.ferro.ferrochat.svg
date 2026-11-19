@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- Ferrochat icon: original artwork (same licence as the code). A hexagon
+       ring around a solid hexagon in the app accent colour on a dark tile;
+       no resemblance to any chat service's logo. -->
+  <rect x="8" y="8" width="240" height="240" rx="56" fill="#111b21"/>
+  <path d="M128 48 L197 88 L197 168 L128 208 L59 168 L59 88 Z" fill="none" stroke="#00a884" stroke-width="16" stroke-linejoin="round"/>
+  <path d="M128 98 L154 113 L154 143 L128 158 L102 143 L102 113 Z" fill="#00a884" stroke="#00a884" stroke-width="8" stroke-linejoin="round"/>
+</svg>

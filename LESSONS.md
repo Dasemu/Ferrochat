@@ -84,3 +84,4 @@ next change.
   the bundled source (`LIBOPUS_NO_PKG=1`) to get a static link.
 * Version sync must be a real merge of main into development (simulated in
   `.github/scripts/version.sh`), or the second release conflicts.
+- Bot pushes made with `GITHUB_TOKEN` never trigger `push` workflows, so the release workflow chains off the version workflow with `workflow_run` (conclusion `success`, branch `main`, checkout `ref: main` for the bump commit).
