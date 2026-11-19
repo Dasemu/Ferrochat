@@ -185,6 +185,7 @@ pub fn view(app: &App) -> El<'_> {
             col = col.push(chat_row(app, e, now));
         }
         scrollable(col)
+            .direction(super::thin_scrollbar())
             .style(theme::scrollbar(t))
             .height(Length::Fill)
             .into()

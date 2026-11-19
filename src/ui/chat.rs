@@ -189,6 +189,7 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         left: 56.0,
     }))
     .id(CONVERSATION_SCROLL)
+    .direction(super::thin_scrollbar())
     .anchor_bottom()
     .on_scroll(|v| {
         Message::Ui(Ui::Scrolled {

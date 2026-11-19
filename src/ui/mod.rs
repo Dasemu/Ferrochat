@@ -137,6 +137,12 @@ pub fn badge<'a>(t: &FerroTheme, n: u32, muted: bool) -> El<'a> {
     .into()
 }
 
+/// Thin vertical scrollbar like the official client.
+pub fn thin_scrollbar() -> iced::widget::scrollable::Direction {
+    use iced::widget::scrollable::{Direction, Scrollbar};
+    Direction::Vertical(Scrollbar::new().width(6).scroller_width(6).margin(1))
+}
+
 /// Fixed-size spacer.
 pub fn gap<'a>(w: f32) -> El<'a> {
     Space::new().width(w).into()
