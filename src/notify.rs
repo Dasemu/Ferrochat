@@ -70,6 +70,20 @@ static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize:
 #[cfg(all(unix, not(target_os = "macos")))]
 const MAX_WAITING: usize = 8;
 
+/// Reserves one of the click-waiter slots, if any is free.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn take_waiter_slot() -> bool {
+    use std::sync::atomic::Ordering;
+    let mut cur = WAITING.load(Ordering::SeqCst);
+    while cur < MAX_WAITING {
+        match WAITING.compare_exchange(cur, cur + 1, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return true,
+            Err(now) => cur = now,
+        }
+    }
+    false
+}
+
 /// Shows a notification. Blocking (D-Bus round trip, and until the
 /// notification is dismissed when `on_click` is given): call from
 /// `spawn_blocking`. Clicking the notification runs `on_click`. Failures are
@@ -85,12 +99,7 @@ pub fn show(summary: &str, body: &str, on_click: Option<OnClick>) {
         use std::sync::atomic::Ordering;
         n.hint(notify_rust::Hint::DesktopEntry(APP_ID.into()));
         n.hint(notify_rust::Hint::Category("im.received".into()));
-        let wait = on_click.is_some()
-            && WAITING
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |c| {
-                    (c < MAX_WAITING).then_some(c + 1)
-                })
-                .is_ok();
+        let wait = on_click.is_some() && take_waiter_slot();
         if wait {
             // "default" is the action servers invoke when the body is clicked.
             n.action("default", "Open");

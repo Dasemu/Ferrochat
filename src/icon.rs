@@ -24,7 +24,8 @@ impl Raster {
     /// ARGB32 in network byte order, the StatusNotifierItem pixmap format.
     pub fn argb(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.rgba.len());
-        for px in self.rgba.chunks_exact(4) {
+        let (pixels, _) = self.rgba.as_chunks::<4>();
+        for px in pixels {
             out.extend_from_slice(&[px[3], px[0], px[1], px[2]]);
         }
         out
