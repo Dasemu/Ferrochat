@@ -84,6 +84,16 @@ pub enum Icon {
     Video,
     /// `wifi-off`
     WifiOff,
+    /// `chevron-up`
+    ChevronUp,
+    /// `copy`
+    Copy,
+    /// `pencil`
+    Pencil,
+    /// `reply`
+    Reply,
+    /// `smile-plus`
+    SmilePlus,
     /// `x`
     X,
 }
@@ -130,6 +140,11 @@ impl Icon {
             Icon::Users => include_bytes!("../../assets/icons/users.svg"),
             Icon::Video => include_bytes!("../../assets/icons/video.svg"),
             Icon::WifiOff => include_bytes!("../../assets/icons/wifi-off.svg"),
+            Icon::ChevronUp => include_bytes!("../../assets/icons/chevron-up.svg"),
+            Icon::Copy => include_bytes!("../../assets/icons/copy.svg"),
+            Icon::Pencil => include_bytes!("../../assets/icons/pencil.svg"),
+            Icon::Reply => include_bytes!("../../assets/icons/reply.svg"),
+            Icon::SmilePlus => include_bytes!("../../assets/icons/smile-plus.svg"),
             Icon::X => include_bytes!("../../assets/icons/x.svg"),
         }
     }

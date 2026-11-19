@@ -17,6 +17,10 @@ dark theme.
 
 ![Chat](docs/screenshots/chat.png)
 
+| Reply and menu | Reactions | Search in chat |
+|---|---|---|
+| ![](docs/screenshots/reply.png) | ![](docs/screenshots/reactions.png) | ![](docs/screenshots/chat-search.png) |
+
 ## Features
 
 * QR-code pairing as a linked device (codes refresh automatically, reload
@@ -29,6 +33,18 @@ dark theme.
   mic button, play back with a waveform).
 * Read receipts, both ways: grey / blue ticks on your messages, read and
   played receipts sent when you open a chat or play a voice note.
+* Profile pictures for chats and contacts (bounded in-memory LRU plus a disk
+  cache; the grey default stays as the fallback).
+* Replies (quoted message, click to jump, reply bar), reactions (badge, who
+  reacted, hover picker, send and remove), edit (15 min) and delete for me /
+  for everyone, "Edited" marker.
+* Typing and recording indicators, online / last seen, and our own throttled
+  "typing…" presence.
+* Search in the chat list (chats and cached messages) and inside a chat, with
+  jump to the result.
+* Video (thumbnail and duration, opens in the system player) and stickers
+  (WebP, static; animated ones show their first frame).
+* Group ticks turn blue only once every participant has read the message.
 * Desktop notifications (sender + preview, or sender only).
 
 See [docs/protocol.md](docs/protocol.md) for what works, what is stored on

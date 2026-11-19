@@ -249,7 +249,8 @@ widgets or `ui`:
 
 | Module | Purpose |
 |---|---|
-| `src/media/` | Ogg/Opus voice notes (decode, encode, waveform), `rodio` playback thread, `cpal` microphone capture, JPEG thumbnails, the byte-budgeted `ByteLru`. |
+| `src/media/` | Ogg/Opus voice notes (decode, encode, waveform), `rodio` playback thread, `cpal` microphone capture, JPEG thumbnails, profile-picture tiles and their disk cache, the byte-budgeted `ByteLru`. |
+| `src/app/actions.rs`, `src/app/live.rs` | User actions (reply, react, edit, delete, search, jump, avatars, group receipts) and the pure typing / presence state machines. |
 | `src/notify.rs` | Desktop notifications (`notify-rust`), opening files with `xdg-open`, file-name sanitising. |
 
 `src/net/` contains `types.rs` (domain types), `convert.rs` (pure protobuf ↔
@@ -269,13 +270,17 @@ tests). The app only sees the `WaClient` trait and the `net::Event` stream.
    └─ keyring / pairing errors inline       ├─ Chat list: header (new chat, ⋮ menu → Log out),
                                             │   search, chips (All / Unread / Favourites / Groups),
                                             │   connection + sync banners, rows
-                                            └─ Conversation: header, E2E notice, day chips,
-                                                bubbles (text / image / document / voice),
-                                                emoji panel, composer (+, 😊, text, mic ↔ send),
-                                                image viewer overlay
+                                            └─ Conversation: header (name, typing / online / last
+                                                seen, search), E2E notice, day chips, bubbles (text /
+                                                image / video / sticker / document / voice) with quote,
+                                                reaction badge and hover actions, floating reaction
+                                                picker and message menu, in-chat search bar, reply /
+                                                edit bar, emoji panel, composer (+, 😊, text, mic ↔
+                                                send), image viewer, delete / reactions dialogs
 ```
 
-Keyboard: `Enter` sends, `Esc` closes overlays, then the open chat.
+Keyboard: `Enter` sends (or saves an edit), `Esc` closes the topmost layer (dialog, popup,
+viewer, search, reply / edit bar), then the open chat.
 
 ### 11.3 Palette (dark, default)
 

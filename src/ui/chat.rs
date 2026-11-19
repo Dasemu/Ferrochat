@@ -9,11 +9,21 @@ use iced::{Alignment, Color, ContentFit, Length};
 
 use super::icons::Icon;
 use super::theme::{self, FerroTheme, INTER_MEDIUM};
-use super::{El, avatar, clock, day_separator, fill, gap, icon, local_day, tail, ticks};
-use crate::app::state::Conversation;
-use crate::app::{App, CONVERSATION_SCROLL, Message, Ui};
+use super::{
+    El, avatar_for, clock, day_separator, fill, gap, icon, last_seen_label, local_day, tail, ticks,
+};
+use crate::app::live::typing_label;
+use crate::app::state::{Conversation, reaction_summary};
+use crate::app::{
+    App, CHAT_SEARCH_ID, COMPOSER_ID, CONVERSATION_SCROLL, Dialog, Message, Popup, Ui, row_id,
+};
 use crate::media::image::human_size;
-use crate::net::{Content, Message as ChatMessage, ReceiptStatus, format_duration, is_group_jid};
+use crate::net::{
+    ChatState, Content, Message as ChatMessage, Quote, ReceiptStatus, format_duration, is_group_jid,
+};
+
+/// Quick reactions offered on hover (the official client's defaults).
+pub const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "🙏"];
 
 /// Emoji offered by the picker (system emoji font renders them).
 pub const EMOJI: &[&str] = &[
@@ -69,7 +79,17 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
     let group = is_group_jid(&conv.chat);
     let name = app.chats.display_name(&conv.chat);
 
-    let subtitle = if group {
+    let typing_names: Vec<(String, ChatState)> = app
+        .typing
+        .in_chat(&conv.chat)
+        .into_iter()
+        .map(|(p, st)| (app.chats.display_name(&p), st))
+        .collect();
+    let typing = typing_label(&typing_names, group);
+    let now = chrono::Utc::now().timestamp();
+    let subtitle = if let Some(t) = &typing {
+        t.clone()
+    } else if group {
         let mut senders: Vec<String> = Vec::new();
         for msg in conv.messages.iter().rev().filter(|m| !m.from_me) {
             let n = msg
@@ -86,12 +106,23 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         senders.push("You".into());
         senders.join(", ")
     } else {
-        "click here for contact info".into()
+        match app.presence.get(&conv.chat) {
+            Some(p) if p.online => "online".into(),
+            Some(p) if p.last_seen.is_some() => {
+                last_seen_label(p.last_seen.unwrap_or_default(), now)
+            }
+            _ => "click here for contact info".into(),
+        }
+    };
+    let subtitle_color = if typing.is_some() || subtitle == "online" {
+        p.accent
+    } else {
+        p.text_secondary
     };
 
     let header = container(
         row![
-            avatar(t, group, m.avatar_small),
+            avatar_for(app, &conv.chat, group, m.avatar_small),
             column![
                 text(name)
                     .size(16)
@@ -99,14 +130,15 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
                     .shaping(text::Shaping::Advanced),
                 text(super::ellipsize(&subtitle, 80))
                     .size(13)
-                    .color(p.text_secondary)
+                    .color(subtitle_color)
                     .wrapping(Wrapping::None),
             ]
             .spacing(1),
             fill(),
             button(icon(Icon::Search, m.icon, p.text_secondary))
                 .padding(8)
-                .style(theme::icon_button(t, false)),
+                .style(theme::icon_button(t, app.chat_search.is_some()))
+                .on_press(Message::Ui(Ui::ToggleChatSearch)),
             button(icon(Icon::EllipsisVertical, m.icon, p.text_secondary))
                 .padding(8)
                 .style(theme::icon_button(t, false)),
@@ -120,7 +152,6 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
     .style(theme::solid(p.bg_elevated));
 
     // Messages
-    let now = chrono::Utc::now().timestamp();
     let mut items: Vec<El<'a>> = Vec::with_capacity(conv.messages.len() + 8);
     items.push(
         container(
@@ -194,6 +225,7 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
     .on_scroll(|v| {
         Message::Ui(Ui::Scrolled {
             relative_y: v.relative_offset().y,
+            offset_y: v.absolute_offset().y,
         })
     })
     .style(theme::scrollbar(t))
@@ -205,12 +237,228 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         .style(theme::solid(p.bg_panel));
 
     let mut body = column![header];
+    if let Some(cs) = &app.chat_search {
+        body = body.push(search_bar(app, cs));
+    }
+    let mut layers: Vec<El<'a>> = vec![background.into()];
+    if conv.has_newer {
+        layers.push(
+            container(
+                button(icon(Icon::ChevronDown, 22.0, p.text_secondary))
+                    .padding(10)
+                    .style(theme::icon_button(t, false))
+                    .on_press(Message::Ui(Ui::JumpLatest)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .align_y(Alignment::End)
+            .padding(16)
+            .into(),
+        );
+    }
     if app.emoji_open {
-        body = body.push(iced::widget::stack![background, emoji_panel(t)]);
-    } else {
-        body = body.push(background);
+        layers.push(emoji_panel(t));
+    }
+    if let (Some((id, which)), Some(pos)) = (&app.popup, app.popup_pos)
+        && let Some(msg) = conv.get(id)
+    {
+        layers.push(popup_layer(app, msg, *which, pos));
+    }
+    body = body.push(iced::widget::stack(layers));
+    if let Some(bar) = reply_bar(app, conv) {
+        body = body.push(bar);
     }
     body.push(composer(app)).into()
+}
+
+/// Floating reaction picker / message menu next to its message row. A
+/// transparent layer under the card closes it on any outside click.
+fn popup_layer<'a>(
+    app: &'a App,
+    msg: &'a ChatMessage,
+    which: Popup,
+    pos: crate::app::PopupPos,
+) -> El<'a> {
+    let now = chrono::Utc::now().timestamp();
+    let (card, card_h) = match which {
+        Popup::Reactions => (reaction_picker(app, msg), 52.0),
+        Popup::Menu => {
+            let items = 4 + usize::from(msg.can_edit(now));
+            (message_menu(app, msg), 12.0 + 38.0 * items as f32)
+        }
+    };
+    let top = crate::app::popup_top(pos, card_h);
+    let side = if msg.from_me {
+        Alignment::End
+    } else {
+        Alignment::Start
+    };
+    let dismiss = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::Ui(Ui::ClosePopup));
+    iced::widget::stack![
+        dismiss,
+        container(card)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(side)
+            .padding(iced::Padding {
+                top,
+                right: 76.0,
+                bottom: 0.0,
+                left: 76.0,
+            })
+    ]
+    .into()
+}
+
+/// The in-chat search bar under the header.
+fn search_bar<'a>(app: &'a App, cs: &'a crate::app::ChatSearch) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let status = if cs.query.trim().chars().count() < 2 {
+        String::new()
+    } else if cs.hits.is_empty() {
+        "No results".to_string()
+    } else {
+        format!("{} of {}", cs.index + 1, cs.hits.len())
+    };
+    container(
+        row![
+            container(
+                row![
+                    icon(Icon::Search, 16.0, p.text_secondary),
+                    text_input("Search in this chat", &cs.query)
+                        .id(CHAT_SEARCH_ID)
+                        .on_input(|s| Message::Ui(Ui::ChatSearch(s)))
+                        .on_submit(Message::Ui(Ui::ChatSearchStep { delta: 1 }))
+                        .size(t.metrics.text)
+                        .padding([6, 0])
+                        .style(theme::input(t)),
+                ]
+                .spacing(12)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 14])
+            .width(Length::Fill)
+            .style(theme::rounded(p.bg_input, 18.0)),
+            text(status).size(13).color(p.text_secondary),
+            button(icon(Icon::ChevronUp, 20.0, p.text_secondary))
+                .padding(6)
+                .style(theme::icon_button(t, false))
+                .on_press(Message::Ui(Ui::ChatSearchStep { delta: 1 })),
+            button(icon(Icon::ChevronDown, 20.0, p.text_secondary))
+                .padding(6)
+                .style(theme::icon_button(t, false))
+                .on_press(Message::Ui(Ui::ChatSearchStep { delta: -1 })),
+            button(icon(Icon::X, 20.0, p.text_secondary))
+                .padding(6)
+                .style(theme::icon_button(t, false))
+                .on_press(Message::Ui(Ui::ToggleChatSearch)),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 16])
+    .style(theme::solid(p.bg_sidebar))
+    .into()
+}
+
+/// Reply / edit bar above the composer.
+fn reply_bar<'a>(app: &'a App, conv: &'a Conversation) -> Option<El<'a>> {
+    let t = &app.theme;
+    let p = t.palette;
+    let (label, label_color, preview, close, lead): (String, Color, String, Ui, Option<El<'a>>) =
+        if let Some(id) = &app.editing {
+            let text = match conv.get(id).map(|m| &m.content) {
+                Some(Content::Text(s)) => s.clone(),
+                _ => String::new(),
+            };
+            (
+                "Edit message".into(),
+                p.accent,
+                text,
+                Ui::CancelEdit,
+                Some(icon(Icon::Pencil, 18.0, p.text_secondary)),
+            )
+        } else if let Some(q) = &app.reply_to {
+            (
+                quote_author(app, q),
+                quote_color(app, q),
+                q.preview.clone(),
+                Ui::CancelReply,
+                None,
+            )
+        } else {
+            return None;
+        };
+    let mut inner = row![
+        container(Space::new().width(4).height(Length::Fill)).style(theme::solid(label_color)),
+    ]
+    .spacing(10)
+    .height(Length::Shrink);
+    if let Some(l) = lead {
+        inner = inner.push(l);
+    }
+    inner = inner.push(
+        column![
+            text(label)
+                .size(13.5)
+                .font(INTER_MEDIUM)
+                .color(label_color)
+                .shaping(text::Shaping::Advanced),
+            text(super::ellipsize(&preview, 110))
+                .size(13.5)
+                .color(p.text_secondary)
+                .wrapping(Wrapping::None)
+                .shaping(text::Shaping::Advanced),
+        ]
+        .spacing(2)
+        .width(Length::Fill),
+    );
+    Some(
+        container(
+            row![
+                container(inner.align_y(Alignment::Center))
+                    .padding([8, 12])
+                    .width(Length::Fill)
+                    .height(56)
+                    .style(theme::rounded(p.inset_in, 8.0)),
+                button(icon(Icon::X, 20.0, p.text_secondary))
+                    .padding(8)
+                    .style(theme::icon_button(t, false))
+                    .on_press(Message::Ui(close)),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding(iced::Padding {
+            top: 8.0,
+            right: 16.0,
+            bottom: 0.0,
+            left: 16.0,
+        })
+        .style(theme::solid(p.bg_elevated))
+        .into(),
+    )
+}
+
+/// Accent bar colour of a quote: green for ourselves, the sender colour otherwise.
+fn quote_color(app: &App, q: &Quote) -> Color {
+    if app.own_jid.as_deref() == Some(q.sender.as_str()) {
+        app.theme.palette.accent
+    } else {
+        theme::sender_color(&q.sender)
+    }
+}
+
+/// "You" or the display name of a quoted message's author.
+fn quote_author(app: &App, q: &Quote) -> String {
+    if app.own_jid.as_deref() == Some(q.sender.as_str()) {
+        "You".into()
+    } else {
+        app.chats.display_name(&q.sender)
+    }
 }
 
 fn emoji_panel(t: &FerroTheme) -> El<'_> {
@@ -263,12 +511,20 @@ fn composer(app: &App) -> El<'_> {
         .into();
     }
     let has_text = !app.composer.trim().is_empty();
-    let input = text_input("Type a message", &app.composer)
-        .on_input(|s| Message::Ui(Ui::Composer(s)))
-        .on_submit(Message::Ui(Ui::Send))
-        .size(m.text + 0.5)
-        .padding([9, 0])
-        .style(theme::input(t));
+    let input = text_input(
+        if app.editing.is_some() {
+            "Edit message"
+        } else {
+            "Type a message"
+        },
+        &app.composer,
+    )
+    .id(COMPOSER_ID)
+    .on_input(|s| Message::Ui(Ui::Composer(s)))
+    .on_submit(Message::Ui(Ui::Send))
+    .size(m.text + 0.5)
+    .padding([9, 0])
+    .style(theme::input(t));
     let field = container(
         row![
             button(icon(Icon::Plus, 24.0, p.text_secondary))
@@ -321,13 +577,15 @@ fn meta_row<'a>(t: &FerroTheme, msg: &ChatMessage) -> El<'a> {
     } else {
         p.text_secondary
     };
-    let mut r = row![
+    let mut r = row![].spacing(3).align_y(Alignment::Center);
+    if msg.edited {
+        r = r.push(text("Edited").size(t.metrics.text_tiny).color(color));
+    }
+    r = r.push(
         text(clock(msg.timestamp))
             .size(t.metrics.text_tiny)
-            .color(color)
-    ]
-    .spacing(3)
-    .align_y(Alignment::Center);
+            .color(color),
+    );
     if msg.from_me {
         r = r.push(ticks(t, msg.status, 15.0));
     }
@@ -356,14 +614,17 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
         );
     }
 
+    if let Some(q) = &msg.reply
+        && !matches!(msg.content, Content::Deleted)
+    {
+        col = col.push(quote_block(app, msg, q));
+    }
+
     let body: El<'a> = match &msg.content {
         Content::Text(s) => {
             // Short messages keep the time on the same line, like the original.
-            let short = s.chars().count() < 38 && !s.contains('\n');
-            let txt = text(s.as_str())
-                .size(m.text)
-                .color(fg)
-                .shaping(text::Shaping::Advanced);
+            let short = s.chars().count() < 38 && !s.contains('\n') && msg.reply.is_none();
+            let txt = message_text(app, s, fg);
             if short {
                 return finish(
                     app,
@@ -494,6 +755,94 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             }
             c.push(container(meta_row(t, msg)).align_right(Length::Fill)).into()
         }
+        Content::Video {
+            caption,
+            seconds,
+            width,
+            height,
+            ..
+        } => {
+            let (w, h) = fit(*width, *height, 330.0, 330.0);
+            let pic: El<'a> = match app.thumbs.get(&msg.id) {
+                Some(handle) => image(handle.clone())
+                    .width(w)
+                    .height(h)
+                    .content_fit(ContentFit::Cover)
+                    .border_radius(6.0)
+                    .into(),
+                None => container(icon(Icon::Video, 40.0, p.text_secondary))
+                    .width(w)
+                    .height(h)
+                    .center_x(w)
+                    .center_y(h)
+                    .style(theme::rounded(p.inset_in, 6.0))
+                    .into(),
+            };
+            let shade = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+            let play = container(icon(Icon::Play, 26.0, Color::WHITE))
+                .padding(14)
+                .style(theme::rounded(shade, 30.0));
+            let badge = container(
+                row![
+                    icon(Icon::Video, 12.0, Color::WHITE),
+                    text(format_duration(*seconds)).size(12).color(Color::WHITE),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center),
+            )
+            .padding([2, 7])
+            .style(theme::rounded(shade, 9.0));
+            let layered = iced::widget::stack![
+                pic,
+                container(play).center(Length::Fill),
+                container(badge)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_y(Alignment::End)
+                    .padding(6),
+            ]
+            .width(w)
+            .height(h);
+            let card = button(layered)
+                .padding(0)
+                .style(theme::flat_button(fg))
+                .on_press(Message::Ui(Ui::OpenVideo(msg.id.clone())));
+            let mut c = column![card].spacing(4).width(w);
+            if let Some(cap) = caption {
+                c = c.push(message_text(app, cap, fg));
+            }
+            c.push(container(meta_row(t, msg)).align_right(Length::Fill)).into()
+        }
+        Content::Sticker {
+            width,
+            height,
+            media,
+            ..
+        } => {
+            let (w, h) = fit(*width, *height, 170.0, 170.0);
+            let (w, h) = (w.min(170.0), h.min(170.0));
+            let sticker: El<'a> = match media
+                .as_ref()
+                .and_then(|r| app.images.peek(&r.cache_key()))
+            {
+                Some(handle) => image(handle.clone())
+                    .width(w)
+                    .height(h)
+                    .content_fit(ContentFit::Contain)
+                    .into(),
+                None => container(icon(Icon::Smile, 44.0, p.text_secondary))
+                    .width(w)
+                    .height(h)
+                    .center_x(w)
+                    .center_y(h)
+                    .style(theme::rounded(p.inset_in, 12.0))
+                    .into(),
+            };
+            column![sticker, container(meta_row(t, msg)).align_right(Length::Fill)]
+                .spacing(2)
+                .width(w)
+                .into()
+        }
         Content::Voice {
             seconds, waveform, ..
         } => voice(app, msg, *seconds, waveform),
@@ -530,12 +879,14 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
     finish(app, msg, first, col.push(body).into())
 }
 
-/// Wraps content in the bubble chrome, tail and alignment.
+/// Wraps content in the bubble chrome, tail and alignment, plus the hover
+/// actions, reactions badge and popups that belong to one message row.
 fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) -> El<'a> {
     let t = &app.theme;
     let p = t.palette;
     let out = msg.from_me;
     let color = if out { p.bubble_out } else { p.bubble_in };
+    let sticker = matches!(msg.content, Content::Sticker { .. });
     let mut b = container(content)
         .padding(iced::Padding {
             top: 6.0,
@@ -544,9 +895,12 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
             left: 9.0,
         })
         .max_width(t.metrics.bubble_max)
-        .style(theme::bubble(t, out, first));
-    if matches!(msg.content, Content::Image { .. }) {
+        .style(theme::bubble(t, out, first && !sticker));
+    if matches!(msg.content, Content::Image { .. } | Content::Video { .. }) {
         b = b.padding(3);
+    }
+    if sticker {
+        b = b.padding(2).style(theme::solid(Color::TRANSPARENT));
     }
     let bubble: El<'a> = if msg.status == ReceiptStatus::Failed && out {
         mouse_area(b)
@@ -555,18 +909,417 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
     } else {
         b.into()
     };
-    let tail_or_gap: El<'a> = if first { tail(color, out) } else { gap(8.0) };
-    let line = if out {
-        row![fill(), bubble, tail_or_gap]
+    let tail_or_gap: El<'a> = if first && !sticker {
+        tail(color, out)
     } else {
-        row![tail_or_gap, bubble, fill()]
+        gap(8.0)
     };
-    container(line.align_y(Alignment::Start))
+    let deleted = matches!(msg.content, Content::Deleted | Content::ViewOnce);
+    let popup = app
+        .popup
+        .as_ref()
+        .filter(|(id, _)| *id == msg.id)
+        .map(|(_, w)| *w);
+    let show_actions =
+        !deleted && (app.hovered.as_deref() == Some(msg.id.as_str()) || popup.is_some());
+    let actions: El<'a> = if show_actions {
+        hover_actions(app, msg)
+    } else {
+        gap(0.0)
+    };
+    let line = if out {
+        row![fill(), actions, bubble, tail_or_gap]
+    } else {
+        row![tail_or_gap, bubble, actions, fill()]
+    };
+    let mut stack = column![line.align_y(Alignment::Center)];
+    if !deleted && !msg.reactions.is_empty() {
+        let badge = reaction_badge(app, msg);
+        stack = stack.push(if out {
+            row![fill(), badge, gap(16.0)]
+        } else {
+            row![gap(20.0), badge, fill()]
+        });
+    }
+    let highlighted = app.highlight.as_ref().is_some_and(|(id, _)| *id == msg.id);
+    let hl = p.accent.scale_alpha(0.22);
+    let row_el = container(stack)
+        .id(row_id(&msg.id))
+        .width(Length::Fill)
         .padding(iced::Padding {
             top: if first { 6.0 } else { 0.0 },
             ..Default::default()
         })
+        .style(move |_: &iced::Theme| iced::widget::container::Style {
+            background: highlighted.then_some(iced::Background::Color(hl)),
+            ..Default::default()
+        });
+    let id = msg.id.clone();
+    mouse_area(row_el)
+        .on_enter(Message::Ui(Ui::HoverMessage(id.clone())))
+        .on_exit(Message::Ui(Ui::UnhoverMessage(id.clone())))
+        .on_right_press(Message::Ui(Ui::ToggleMessageMenu(id)))
         .into()
+}
+
+/// Smiley and chevron buttons that appear next to a hovered bubble.
+fn hover_actions<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let btn = |i: Icon, on: Message| -> El<'a> {
+        button(icon(i, 17.0, p.text_secondary))
+            .padding(6)
+            .style(theme::icon_button(t, false))
+            .on_press(on)
+            .into()
+    };
+    container(
+        row![
+            btn(
+                Icon::SmilePlus,
+                Message::Ui(Ui::ToggleReactionPicker(msg.id.clone()))
+            ),
+            btn(
+                Icon::ChevronDown,
+                Message::Ui(Ui::ToggleMessageMenu(msg.id.clone()))
+            ),
+        ]
+        .spacing(2)
+        .align_y(Alignment::Center),
+    )
+    .padding([0, 4])
+    .into()
+}
+
+/// Six quick reactions.
+fn reaction_picker<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let mine = app
+        .own_jid
+        .as_deref()
+        .and_then(|me| msg.reactions.iter().find(|r| r.reactor == me))
+        .map(|r| r.emoji.as_str());
+    let row_el = row(QUICK_REACTIONS.iter().map(|e| {
+        let selected = mine == Some(*e);
+        button(text(*e).size(24).shaping(text::Shaping::Advanced))
+            .padding([4, 6])
+            .style(theme::icon_button(t, selected))
+            .on_press(Message::Ui(Ui::React {
+                id: msg.id.clone(),
+                emoji: (*e).into(),
+            }))
+            .into()
+    }))
+    .spacing(2)
+    .align_y(Alignment::Center);
+    container(row_el)
+        .padding([4, 8])
+        .style(move |th: &iced::Theme| {
+            let mut s = theme::rounded(p.bg_elevated, 26.0)(th);
+            s.shadow = iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                offset: iced::Vector::new(0.0, 2.0),
+                blur_radius: 8.0,
+            };
+            s
+        })
+        .into()
+}
+
+/// Reply / copy / edit / delete.
+fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let now = chrono::Utc::now().timestamp();
+    let item = |i: Icon, label: &'static str, on: Ui| -> El<'a> {
+        button(
+            row![
+                icon(i, 17.0, p.text_secondary),
+                text(label).size(14.5).color(p.text_primary)
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([9, 18])
+        .style(theme::chat_row(t, false))
+        .on_press(Message::Ui(on))
+        .into()
+    };
+    let id = msg.id.clone();
+    let mut col = column![item(Icon::Reply, "Reply", Ui::StartReply(id.clone()))];
+    col = col.push(item(
+        Icon::SmilePlus,
+        "React",
+        Ui::ToggleReactionPicker(id.clone()),
+    ));
+    col = col.push(item(Icon::Copy, "Copy", Ui::CopyText(id.clone())));
+    if msg.can_edit(now) {
+        col = col.push(item(Icon::Pencil, "Edit", Ui::StartEdit(id.clone())));
+    }
+    col = col.push(item(Icon::Trash2, "Delete", Ui::AskDelete(id)));
+    container(col.width(190))
+        .padding([6, 0])
+        .style(move |th: &iced::Theme| {
+            let mut s = theme::rounded(p.bg_elevated, 8.0)(th);
+            s.shadow = iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                offset: iced::Vector::new(0.0, 2.0),
+                blur_radius: 10.0,
+            };
+            s
+        })
+        .into()
+}
+
+/// The reaction pill under a bubble; click shows who reacted.
+fn reaction_badge<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let (counts, total) = reaction_summary(&msg.reactions);
+    let mut r = row![].spacing(2).align_y(Alignment::Center);
+    for (e, _) in counts.iter().take(3) {
+        r = r.push(text(e.clone()).size(14).shaping(text::Shaping::Advanced));
+    }
+    if total > 1 {
+        r = r.push(text(total.to_string()).size(12).color(p.text_secondary));
+    }
+    let bg = p.bg_elevated;
+    let edge = p.bg_panel;
+    button(r)
+        .padding([2, 7])
+        .style(move |_: &iced::Theme, _| iced::widget::button::Style {
+            background: Some(iced::Background::Color(bg)),
+            text_color: Color::WHITE,
+            border: iced::Border {
+                radius: 11.0.into(),
+                width: 2.0,
+                color: edge,
+            },
+            ..Default::default()
+        })
+        .on_press(Message::Ui(Ui::ShowReactions(msg.id.clone())))
+        .into()
+}
+
+/// The quoted message inside a reply bubble; click jumps to the original.
+fn quote_block<'a>(app: &'a App, msg: &'a ChatMessage, q: &'a Quote) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let inset = if msg.from_me { p.inset_out } else { p.inset_in };
+    let bar = quote_color(app, q);
+    let inner = row![
+        container(Space::new().width(4).height(Length::Fill)).style(theme::solid(bar)),
+        column![
+            text(quote_author(app, q))
+                .size(13)
+                .font(INTER_MEDIUM)
+                .color(bar)
+                .shaping(text::Shaping::Advanced),
+            text(super::ellipsize(&q.preview, 90))
+                .size(13.5)
+                .color(if msg.from_me {
+                    p.bubble_out_meta
+                } else {
+                    p.text_secondary
+                })
+                .wrapping(Wrapping::None)
+                .shaping(text::Shaping::Advanced),
+        ]
+        .spacing(2)
+        .padding([6, 8]),
+    ]
+    .height(Length::Shrink);
+    button(inner)
+        .padding(0)
+        .width(Length::Fill)
+        .style(move |th, st| {
+            let mut s = theme::flat_button(p.text_primary)(th, st);
+            s.background = Some(iced::Background::Color(inset));
+            s.border.radius = 6.0.into();
+            s
+        })
+        .on_press(Message::Ui(Ui::JumpTo(q.id.clone())))
+        .into()
+}
+
+/// Message text; the active in-chat search term is highlighted.
+fn message_text<'a>(app: &'a App, s: &'a str, fg: Color) -> El<'a> {
+    let m = app.theme.metrics;
+    let term = app
+        .chat_search
+        .as_ref()
+        .map(|c| c.query.trim().to_lowercase())
+        .filter(|q| q.chars().count() >= 2);
+    if let Some(term) = term {
+        let spans = highlight_spans(s, &term, app.theme.palette.notice_text);
+        if spans.len() > 1 {
+            return iced::widget::rich_text::<(), Message, iced::Theme, iced::Renderer>(spans)
+                .size(m.text)
+                .color(fg)
+                .into();
+        }
+    }
+    text(s)
+        .size(m.text)
+        .color(fg)
+        .shaping(text::Shaping::Advanced)
+        .into()
+}
+
+/// Splits `s` into plain and highlighted spans around case-insensitive
+/// matches of `term` (already lower-cased).
+pub fn highlight_spans<'a>(
+    s: &'a str,
+    term: &str,
+    bg: Color,
+) -> Vec<iced::widget::text::Span<'a, (), iced::Font>> {
+    use iced::widget::span;
+    let lower = s.to_lowercase();
+    // Lower-casing can change byte lengths; only highlight when it did not.
+    if lower.len() != s.len() || term.is_empty() {
+        return vec![span(s)];
+    }
+    let mut spans = Vec::new();
+    let mut at = 0;
+    while let Some(pos) = lower.get(at..).and_then(|rest| rest.find(term)) {
+        let (start, end) = (at + pos, at + pos + term.len());
+        if !s.is_char_boundary(start) || !s.is_char_boundary(end) {
+            break;
+        }
+        if start > at {
+            spans.push(span(&s[at..start]));
+        }
+        spans.push(span(&s[start..end]).background(bg).color(Color::BLACK));
+        at = end;
+    }
+    if at < s.len() {
+        spans.push(span(&s[at..]));
+    }
+    if spans.is_empty() {
+        spans.push(span(s));
+    }
+    spans
+}
+
+/// Modal over the conversation: delete confirmation or reaction list.
+pub fn dialog<'a>(app: &'a App) -> Option<El<'a>> {
+    let t = &app.theme;
+    let p = t.palette;
+    let d = app.dialog.as_ref()?;
+    let msg = app.dialog_message()?;
+    let now = chrono::Utc::now().timestamp();
+    let body: El<'a> = match d {
+        Dialog::Delete(_) => {
+            let btn = |label: &'static str, on: Message, danger: bool| -> El<'a> {
+                button(text(label).size(14.5).font(INTER_MEDIUM).color(if danger {
+                    p.danger
+                } else {
+                    p.accent
+                }))
+                .padding([9, 16])
+                .style(theme::link_button(t))
+                .on_press(on)
+                .into()
+            };
+            let mut col = column![
+                text("Delete message?").size(18).color(p.text_primary),
+                text(if msg.can_revoke(now) {
+                    "You can delete this message for everyone or just for you."
+                } else {
+                    "This message will be deleted only on this device."
+                })
+                .size(14)
+                .color(p.text_secondary),
+            ]
+            .spacing(10);
+            let mut buttons = column![]
+                .spacing(2)
+                .align_x(Alignment::End)
+                .width(Length::Fill);
+            if msg.can_revoke(now) {
+                buttons = buttons.push(btn(
+                    "Delete for everyone",
+                    Message::Ui(Ui::ConfirmDelete {
+                        id: msg.id.clone(),
+                        everyone: true,
+                    }),
+                    true,
+                ));
+            }
+            buttons = buttons
+                .push(btn(
+                    "Delete for me",
+                    Message::Ui(Ui::ConfirmDelete {
+                        id: msg.id.clone(),
+                        everyone: false,
+                    }),
+                    true,
+                ))
+                .push(btn("Cancel", Message::Ui(Ui::CloseDialog), false));
+            col = col.push(buttons);
+            col.into()
+        }
+        Dialog::Reactions(_) => {
+            let mut col = column![
+                text(format!("{} reactions", msg.reactions.len()))
+                    .size(18)
+                    .color(p.text_primary)
+            ]
+            .spacing(12);
+            for r in &msg.reactions {
+                let me = app.own_jid.as_deref() == Some(r.reactor.as_str());
+                let name = if me {
+                    "You".to_string()
+                } else {
+                    app.chats.display_name(&r.reactor)
+                };
+                col = col.push(
+                    row![
+                        avatar_for(app, &r.reactor, false, 36.0),
+                        text(name)
+                            .size(15)
+                            .color(p.text_primary)
+                            .shaping(text::Shaping::Advanced)
+                            .width(Length::Fill),
+                        text(r.emoji.as_str())
+                            .size(22)
+                            .shaping(text::Shaping::Advanced),
+                    ]
+                    .spacing(12)
+                    .align_y(Alignment::Center),
+                );
+            }
+            col = col.push(
+                container(
+                    button(text("Close").size(14.5).font(INTER_MEDIUM).color(p.accent))
+                        .padding([9, 16])
+                        .style(theme::link_button(t))
+                        .on_press(Message::Ui(Ui::CloseDialog)),
+                )
+                .align_right(Length::Fill),
+            );
+            col.into()
+        }
+    };
+    let card = container(body)
+        .padding(24)
+        .width(380)
+        .style(move |th: &iced::Theme| {
+            let mut s = theme::rounded(p.bg_elevated, 12.0)(th);
+            s.shadow = iced::Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 24.0,
+            };
+            s
+        });
+    Some(opaque(
+        container(card)
+            .center(Length::Fill)
+            .style(theme::solid(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
+    ))
 }
 
 fn voice<'a>(app: &'a App, msg: &'a ChatMessage, seconds: u32, wf: &'a [u8]) -> El<'a> {
@@ -642,7 +1395,16 @@ fn voice<'a>(app: &'a App, msg: &'a ChatMessage, seconds: u32, wf: &'a [u8]) -> 
     ))
     .padding(2);
     let avatar_part: El<'a> = iced::widget::stack![
-        avatar(t, false, 46.0),
+        avatar_for(
+            app,
+            if out {
+                app.own_jid.as_deref().unwrap_or_default()
+            } else {
+                &msg.sender
+            },
+            false,
+            46.0
+        ),
         container(mic_badge)
             .width(46)
             .height(46)
@@ -740,6 +1502,22 @@ pub fn viewer<'a>(app: &'a App, id: &'a str) -> El<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlight_spans_split_around_matches() {
+        let spans = highlight_spans("Hola hola HOLA", "hola", Color::WHITE);
+        // plain, match, plain, match, plain, match => 3 matches + 2 gaps
+        assert_eq!(spans.len(), 5);
+        assert_eq!(
+            highlight_spans("nothing here", "zzz", Color::WHITE).len(),
+            1
+        );
+        // Characters whose lower-case form has a different length are never
+        // sliced at a wrong boundary.
+        assert_eq!(highlight_spans("İstanbul", "stan", Color::WHITE).len(), 1);
+        assert_eq!(highlight_spans("", "x", Color::WHITE).len(), 1);
+        assert_eq!(highlight_spans("ñandú ñ", "ñ", Color::WHITE).len(), 3);
+    }
 
     #[test]
     fn fit_keeps_aspect_and_bounds() {

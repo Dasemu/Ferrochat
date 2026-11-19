@@ -51,9 +51,19 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `TemporaryBan`, `ClientOutdated` | `Fatal` | shown on the login screen |
 | `Messages` | `LidMappings` + `Messages { origin: Live \| Offline }` | stored first; ids the store did not have count as unread (live and offline-drained alike); one notification per live message, one summary per offline drain |
 | `Receipt` | `Receipt` or `ChatRead` (read-self) | tick state machine |
-| `HistorySync` | `LidMappings` + `History` / `Messages { origin: History }` in chunks of 500 | chats, names, cached messages; never counted as unread |
+| `HistorySync` | `LidMappings` + `History` / `Messages { origin: History }` in chunks of 500 | chats, names, cached messages (with their reactions and quotes); never counted as unread |
+| `Messages` with a reaction | `Reaction { chat, target, reactor, emoji, ts }` | one reaction per reactor, newest wins, empty emoji removes it |
+| `Messages` with `protocolMessage{MESSAGE_EDIT}` | `Edited { chat, id, sender, from_me, content }` | applied only when `sender` sent the original; "Edited" marker |
+| `Receipt` in a group | `Receipt { participant: Some(..) }` | stored per participant; the tick is the aggregate (see below) |
+| `ChatPresence` | `ChatState { chat, participant, state }` | "typing…" / "recording audio…" in the header and the chat list; expires after 10 s |
+| `Presence` | `Presence { jid, online, last_seen }` | "online" / "last seen …" under the contact name |
+| `PictureUpdate` | `PictureChanged { jid }` | drops the cached picture and refetches |
+| `DeleteMessageForMeUpdate` | `DeletedForMe { chat, id }` | removes the message from the cache |
 | `PushNameUpdate`, `ContactUpdate` | `ContactName` | display names |
 | `MarkChatAsReadUpdate` | `ChatRead` | badge cleared |
+
+Reactions, edits and "delete for me" events wait until the message batch that
+may contain their target is in the cache (`App::deferred`).
 
 Message bodies handled: `conversation`, `extendedTextMessage`,
 `imageMessage`, `documentMessage` (also wrapped in
@@ -64,9 +74,43 @@ the same participant otherwise; group-admin revokes are ignored because they
 cannot be verified locally). Ephemeral wrappers are unwrapped; disappearing
 messages carry `expires_at` and are pruned from the cache when it passes.
 **View-once** messages are rendered as "View once message: open it on your
-phone": their media reference is never exposed, downloaded or stored. Video, stickers, locations,
-contacts and polls show an "unsupported" placeholder; reactions and key
-distribution messages are not bubbles.
+phone": their media reference is never exposed, downloaded or stored.
+`videoMessage` (and round video notes) show the inline JPEG thumbnail and the
+duration; a click downloads the file (capped at 100 MB) into the cache
+directory and opens it with the system player (`open` crate, extension from an
+allowlist). `stickerMessage` is downloaded (cap 2 MB, 1 Mpx), decoded to RGBA
+and drawn statically; animated stickers show their first frame. Locations,
+contacts and polls show an "unsupported" placeholder; key distribution
+messages are not bubbles. Replies come from `contextInfo` (`stanzaId`,
+`participant`, `quotedMessage`) and are rendered as a quote above the text; a
+click jumps to the original, loading the cache around it when needed.
+
+### 2.1 What we send
+
+| Action | Library call | Notes |
+|---|---|---|
+| Reply | `send_message_with_options` with `ExtendedTextMessage.contextInfo` | the quoted body is the one-line preview, so media quotes arrive as text on the other side |
+| React / remove | `Client::send_reaction` (empty emoji removes) | groups carry the original author as `participant` |
+| Edit | `Client::edit_message` | only text, 15 minutes after sending |
+| Delete for everyone | `Client::revoke_message(Sender)` | 2 days 12 hours after sending |
+| Delete for me | `chat_actions().delete_message_for_me` | app-state sync to our other devices |
+| Typing / recording | `chatstate().send_composing / send_recording / send_paused` | `composing` when typing starts, again every 10 s while it continues, `paused` after 5 s idle, on send, when the field empties and when the chat is closed |
+| Presence | `presence().subscribe` when a DM is opened | the library announces us as available itself |
+| Profile pictures | `contacts().get_profile_picture(preview)` + one GET through the library's HTTP client | max 3 lookups at once, only for rows on screen |
+| Group size | `groups().query_info` (cached by the library) | for the aggregate ticks |
+
+The 10 s / 5 s typing timings and the 15 min / 2.5 day windows follow what
+WhatsApp Web does as far as we know; they are constants in `app/live.rs` and
+`net/types.rs` and have not been checked against a live account.
+
+### 2.2 Group ticks
+
+WhatsApp sends one receipt per participant. Ferrochat stores them
+(`receipts` table) and shows two grey ticks once every other participant has
+received the message and blue ticks once every other participant has read it.
+The participant count (everyone but us) comes from the library's group
+metadata; until it is known no group message advances past one tick. Direct
+chats are unchanged.
 
 ## 3. What lands on disk
 
@@ -75,6 +119,8 @@ distribution messages are not bubbles.
 | OS keyring, service `dev.ferro.ferrochat`, account `signal-store-key` | 256-bit random key (hex) for the session store | Secret Service (KWallet / GNOME Keyring), Keychain, Credential Manager |
 | `$XDG_DATA_HOME/ferrochat/session.sqlcipher` (+ `-wal`, `-shm`) | The library's whole Signal / device state: identity key pair, noise key, signed pre-keys, sessions, sender keys, app-state sync keys, LID mappings | **SQLCipher** (AES-256, HMAC per page) keyed with the raw key above (`PRAGMA key = "x'…'"`, no PBKDF2). File mode 0600. Tested: no `SQLite format 3` header and no schema text in the file; a wrong key is rejected. |
 | `$XDG_DATA_HOME/ferrochat/cache.sqlite3` (+ `-wal`, `-shm`) | Cache: chats, message bodies, media references (CDN path + per-file media key, needed to download later), contact names, own JID | Plain SQLite, mode 0600, like the official desktop client's local database. Deletable at any time; rebuilt from history sync. Never contains credentials or Signal keys. |
+| `$XDG_CACHE_HOME/ferrochat/avatars/*.img` / `*.none` | Profile picture previews (JPEG as served) and "no picture" markers. File names are a hash of the JID. Refreshed after 7 days / 12 h or when the contact changes the picture; at most 1500 files and 32 MB; deleted on logout | Directory 0700 |
+| `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB) so the system player can read them | Directory 0700 |
 | `$XDG_STATE_HOME/ferrochat/log` (rotated at 5 MB) | Logs | Bodies, phone numbers, QR payloads, keys and file names are redacted (`Redacted`, `MaskedJid`, manual `Debug` impls; covered by `tests/redaction.rs`). |
 | `~/Downloads/<name>` | Documents the user opened | Only on explicit click. |
 
@@ -84,7 +130,7 @@ and images are probed (header only) and rejected above 40 Mpx before
 decoding. Notification titles and bodies are markup-escaped (`&`, `<`, `>`)
 because KDE renders a subset of HTML in them.
 
-Images and voice notes are kept in memory only (byte-bounded LRUs: 48 MB
+Decoded profile pictures live in a 12 MB LRU (96x96 tiles, round). Images and voice notes are kept in memory only (byte-bounded LRUs: 48 MB
 images, 16 MB decoded audio) and re-downloaded after a restart.
 
 The session store is **never deleted automatically** except on a real
