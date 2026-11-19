@@ -51,8 +51,16 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 # Opens documents without a shell (ShellExecuteW on Windows, xdg-open/open elsewhere).
 open = { version = "5", features = ["shellexecute-on-windows"] }
 lru = "0.16"
+# Renders the app's SVG icon to ARGB32 tray pixmaps / the window icon (already in the tree via iced's svg).
+resvg = { version = "0.45", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# StatusNotifierItem tray icon, pure Rust over zbus 5 (the zbus already in the tree).
+ksni = "0.3"
 
 [dev-dependencies]
+# Fake StatusNotifierWatcher for the tray integration test (zbus 5, already in the tree).
+zbus = { version = "5", default-features = false, features = ["tokio"] }
 waproto = { version = "0.7", features = ["serde-deserialize"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
 

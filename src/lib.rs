@@ -4,11 +4,17 @@
 
 pub mod app;
 pub mod auth;
+pub mod autostart;
 pub mod config;
 pub mod error;
+pub mod ext;
+pub mod icon;
+pub mod instance;
 pub mod media;
 pub mod mock;
 pub mod net;
 pub mod notify;
+pub mod settings;
 pub mod store;
+pub mod tray;
 pub mod ui;
