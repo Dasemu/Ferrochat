@@ -34,8 +34,12 @@ See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
   github-actions[bot] are skipped. Protected branches need a bot bypass.
 
 ## Deployment
-No packaging yet; ship `target/release/ferrochat`. Wayland `app_id` / desktop
-entry id: `dev.ferro.ferrochat`.
+Releases are automatic: `.github/workflows/release.yml` chains off the "Version bump" workflow
+via `workflow_run` (GITHUB_TOKEN bot pushes don't trigger `push` workflows), builds on
+ubuntu-22.04, and creates GitHub Release `v<Cargo version>` with `ferrochat-v<ver>-linux-x86_64.tar.gz`
++ `.sha256` (skips if the release exists; manual re-run: workflow_dispatch). Users run
+`install.sh` (`curl ... | sh`; `-s -- --uninstall`); test it with `FERRO_RELEASE_API=file://...`.
+Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
 
 ## Gotchas
 - Only ONE `libsqlite3-sys` may link: it is pinned to 0.37 with `bundled-sqlcipher`;

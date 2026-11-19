@@ -106,3 +106,7 @@ next change.
 * `xdotool windowclose` destroys the window, it does not send
   `WM_DELETE_WINDOW`; to test close requests under Xvfb send the client
   message yourself.
+
+## Release automation
+
+- Bot pushes made with `GITHUB_TOKEN` never trigger `push` workflows, so the release workflow chains off the version workflow with `workflow_run` (conclusion `success`, branch `main`, checkout `ref: main` for the bump commit).
