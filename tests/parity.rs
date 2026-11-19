@@ -50,7 +50,9 @@ impl Driver {
         match ev {
             Event::History { chats, names, .. } => {
                 self.store.upsert_chats(&chats).unwrap();
-                self.store.set_contact_names(&names).unwrap();
+                self.store
+                    .set_contact_names(&ferrochat::net::push_names(&names))
+                    .unwrap();
                 self.chats.apply_history(&chats, &names);
             }
             Event::Messages { messages, origin } => {
@@ -222,11 +224,7 @@ async fn history_brings_replies_reactions_video_and_stickers() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(
-        video,
-        (14, true),
-        "duration and thumbnail survive the cache"
-    );
+    assert_eq!(video, (3, true), "duration and thumbnail survive the cache");
     assert!(
         msgs.iter()
             .any(|m| matches!(m.content, Content::Sticker { .. }))

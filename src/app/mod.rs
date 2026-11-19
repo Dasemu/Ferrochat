@@ -1,12 +1,20 @@
 //! App state and the single `update` mutation point.
 
 mod actions;
+pub mod input;
+pub mod linkify;
+pub mod lists;
+pub mod video;
 pub use actions::{PopupPos, popup_top, row_id};
 mod background;
 pub use background::WindowGeom;
+#[cfg(test)]
+mod flows;
 pub mod live;
 pub mod message;
 pub mod state;
+#[cfg(test)]
+mod test_support;
 pub mod window;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -20,7 +28,7 @@ use iced::widget::{image, operation};
 use iced::{Subscription, Task};
 
 pub use message::{Done, Fetched, Located, Message, Setting, Ui};
-use state::{ChatList, Conversation, Filter};
+use state::{ChatList, Conversation, Filter, NameBook};
 
 use crate::auth::secrets::{KeyringStore, MemoryStore, SIGNAL_STORE_KEY, SecretStore};
 use crate::auth::{AuthEvent, AuthState};
@@ -56,6 +64,9 @@ pub const HIGHLIGHT_FOR: Duration = Duration::from_millis(1800);
 pub const MAX_STICKER_BYTES: u64 = 2 * 1024 * 1024;
 /// Videos kept in the cache directory.
 pub const MAX_VIDEO_FILES: usize = 4;
+/// Cache key / value recording that the full app-state resync was requested.
+const RESYNC_KEY: &str = "appstate_resync";
+const RESYNC_VERSION: &str = "1";
 /// Unprocessed reactions / edits buffered behind a message insert.
 const MAX_DEFERRED: usize = 5000;
 
@@ -75,6 +86,38 @@ pub enum Dialog {
     Delete(String),
     /// "Reactions" list for this message id.
     Reactions(String),
+}
+
+/// What a right-click menu in the chat list belongs to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MenuTarget {
+    /// A chat row.
+    Chat(String),
+    /// A custom list chip (list id).
+    Chip(String),
+}
+
+/// A right-click menu floating at the pointer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SidebarMenu {
+    /// What it acts on.
+    pub target: MenuTarget,
+    /// Window position of the click.
+    pub at: iced::Point,
+}
+
+/// The dialog to create, rename or delete a list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ListDialog {
+    /// New list (`id` empty) or rename.
+    Edit {
+        /// Existing list id, `None` for a new list.
+        id: Option<String>,
+        /// Name typed.
+        name: String,
+    },
+    /// "Delete list?" for this id.
+    Delete(String),
 }
 
 /// The in-chat search bar.
@@ -119,6 +162,12 @@ pub struct App {
     pub(crate) chats: ChatList,
     pub(crate) search: String,
     pub(crate) filter: Filter,
+    /// The chat list shows archived chats.
+    pub(crate) archived_view: bool,
+    /// Right-click menu in the chat list.
+    pub(crate) sidebar_menu: Option<SidebarMenu>,
+    /// Create / rename / delete list dialog.
+    pub(crate) list_dialog: Option<ListDialog>,
     pub(crate) open: Option<Conversation>,
     pending_read: usize,
     pub(crate) composer: String,
@@ -147,6 +196,13 @@ pub struct App {
     download_queue: VecDeque<String>,
     /// App-level reconnect backoff after a non-transient refusal.
     offline_attempt: u32,
+    /// The video viewer (at most one: one decoder at a time).
+    pub(crate) video: Option<video::VideoView>,
+    video_session: u32,
+    /// The window is full screen because of the video viewer.
+    pub(crate) video_fullscreen: bool,
+    /// The one-time full app-state resync (names, archive, lists) ran.
+    resync_done: bool,
     /// Message under the pointer (hover actions).
     pub(crate) hovered: Option<String>,
     /// Open reaction picker / menu.
@@ -320,8 +376,11 @@ impl App {
         let (store, chats) = match store {
             Ok(s) => {
                 let rows = s.chat_rows().unwrap_or_default();
-                let names = s.contact_names().unwrap_or_default();
-                (s, ChatList::from_rows(rows, names))
+                let names = NameBook::from_rows(s.contact_names().unwrap_or_default());
+                let mut list = ChatList::from_rows(rows, names);
+                let (defs, members) = s.load_lists().unwrap_or_default();
+                list.load_lists(defs, members);
+                (s, list)
             }
             Err(e) => {
                 // In-memory SQLite only fails on allocation failure.
@@ -372,6 +431,13 @@ impl App {
             chats,
             search: String::new(),
             filter: Filter::All,
+            archived_view: false,
+            video: None,
+            video_session: 0,
+            video_fullscreen: false,
+            resync_done: false,
+            sidebar_menu: None,
+            list_dialog: None,
             open: None,
             pending_read: 0,
             composer: String::new(),
@@ -454,7 +520,13 @@ impl App {
         }
         if app.cfg.screenshot.is_some() {
             tasks.push(Task::perform(
-                tokio::time::sleep(Duration::from_millis(2500)),
+                tokio::time::sleep(Duration::from_millis(
+                    if matches!(app.cfg.screenshot, Some((ScreenshotTarget::Video, _))) {
+                        9000
+                    } else {
+                        2500
+                    },
+                )),
                 |_| Message::CaptureScreenshot,
             ));
         }
@@ -488,7 +560,11 @@ impl App {
             iced::window::close_requests().map(Message::CloseRequested),
             iced::window::close_events().map(Message::WindowClosed),
             Subscription::run(crate::ext::stream).map(Message::External),
-            iced::event::listen_with(|event, _status, id| match event {
+            iced::event::listen_with(|event, status, id| match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    input::set(position);
+                    None
+                }
                 iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
                 iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
                 iced::Event::Window(iced::window::Event::Resized(size)) => {
@@ -501,9 +577,28 @@ impl App {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
                 }) => Some(Message::Ui(Ui::CloseChat)),
+                // Space pauses the video viewer, unless a text field took it.
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
+                    ..
+                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::VideoToggle)),
                 _ => None,
             }),
         ];
+        // Only once the helper runs: the stream takes the receiver on start.
+        if let Some(v) = self
+            .video
+            .as_ref()
+            .filter(|v| v.phase != video::VideoPhase::Downloading)
+        {
+            subs.push(Subscription::run_with(
+                video::VideoKey {
+                    session: v.session,
+                    rx: v.rx.clone(),
+                },
+                video::video_stream,
+            ));
+        }
         let playing = self.voice.as_ref().is_some_and(|v| !v.paused);
         if playing || self.recording_since.is_some() {
             subs.push(iced::time::every(Duration::from_millis(100)).map(|_| Message::Tick));
@@ -535,6 +630,10 @@ impl App {
                 Task::none()
             }
             Message::Quit => self.quit(),
+            Message::Video(m) => {
+                self.on_video_event(*m);
+                Task::none()
+            }
             Message::Ui(ui) => self.on_ui(ui),
             Message::Net(ev) => self.on_net(ev),
             Message::Done(done) => self.on_done(*done),
@@ -588,9 +687,16 @@ impl App {
             Ui::OpenChat(chat) => return self.open_chat(chat),
             Ui::CloseChat => {
                 // Esc closes the topmost layer first, the conversation last.
+                let mut close_video = None;
                 let consumed = std::mem::take(&mut self.settings_open)
+                    || self.list_dialog.take().is_some()
+                    || self.sidebar_menu.take().is_some()
                     || self.dialog.take().is_some()
                     || self.popup.take().is_some()
+                    || self.video.is_some() && {
+                        close_video = Some(self.close_video());
+                        true
+                    }
                     || self.viewer.take().is_some()
                     || self.chat_search.take().is_some()
                     || self.reply_to.take().is_some()
@@ -606,6 +712,9 @@ impl App {
                 }
                 self.emoji_open = false;
                 self.menu_open = false;
+                if let Some(t) = close_video {
+                    return Task::batch([task, t]);
+                }
                 return task;
             }
             Ui::Composer(t) => {
@@ -809,6 +918,7 @@ impl App {
     fn open_chat(&mut self, chat: String) -> Task<Message> {
         self.emoji_open = false;
         self.menu_open = false;
+        self.sidebar_menu = None;
         if self.open.as_ref().is_some_and(|c| c.chat == chat) {
             return Task::none();
         }
@@ -1312,12 +1422,14 @@ impl App {
 
     fn index_thumbs(&mut self, msgs: &[ChatMessage]) {
         for m in msgs {
-            if let Content::Image {
-                thumbnail: Some(t), ..
-            }
-            | Content::Video {
-                thumbnail: Some(t), ..
-            } = &m.content
+            let thumb = match &m.content {
+                Content::Image { thumbnail, .. } | Content::Video { thumbnail, .. } => {
+                    thumbnail.as_ref()
+                }
+                Content::Link { preview, .. } => preview.thumbnail.as_ref(),
+                _ => None,
+            };
+            if let Some(t) = thumb
                 && !self.thumbs.contains_key(&m.id)
             {
                 self.thumbs
@@ -1410,9 +1522,14 @@ impl App {
                     self.own_jid = Some(j.clone());
                 }
                 self.advance_auth(AuthEvent::Connected { jid: jid.clone() });
+                let resync = self.maybe_resync();
                 if let Some(j) = jid {
-                    return store_task(&self.store, move |s| s.set_kv("own_jid", &j));
+                    return Task::batch([
+                        store_task(&self.store, move |s| s.set_kv("own_jid", &j)),
+                        resync,
+                    ]);
                 }
+                return resync;
             }
             Event::LoggedOut { reason } => {
                 self.toast(reason.clone());
@@ -1430,16 +1547,40 @@ impl App {
                     c.id = self.lid_map.normalize(&c.id);
                 }
                 self.chats.apply_history(&chats, &names);
+                let rows = crate::net::push_names(&names);
                 let mut tasks = vec![
                     store_task(&self.store, move |s| {
                         s.upsert_chats(&chats)?;
-                        s.set_contact_names(&names)
+                        s.set_contact_names(&rows)
                     }),
                     self.want_visible_avatars(),
                 ];
+                if let Some((t, _)) = self.cfg.screenshot
+                    && t.list_only()
+                    && !self.scene_started
+                {
+                    self.scene_started = true;
+                    match t {
+                        ScreenshotTarget::Archived => {
+                            tasks.push(Task::done(Message::Ui(Ui::OpenArchived)));
+                        }
+                        ScreenshotTarget::Lists => {
+                            tasks.push(Task::done(Message::Ui(Ui::Filter(Filter::List(
+                                "1".into(),
+                            )))));
+                        }
+                        ScreenshotTarget::ChatMenu => {
+                            input::set(iced::Point::new(170.0, 250.0));
+                            tasks.push(Task::done(Message::Ui(Ui::ChatMenu(
+                                "34622222222@s.whatsapp.net".into(),
+                            ))));
+                        }
+                        _ => {}
+                    }
+                }
                 if matches!(
                     self.cfg.screenshot,
-                    Some((t, _)) if t != ScreenshotTarget::Login && t != ScreenshotTarget::ChatList
+                    Some((t, _)) if !t.list_only()
                 ) && self.open.is_none()
                 {
                     tasks.push(Task::done(Message::Ui(Ui::OpenChat(
@@ -1474,10 +1615,37 @@ impl App {
                     s.apply_receipt(&chat, &ids, status).map(|_| ())
                 });
             }
-            Event::ContactName { jid, name } => {
+            Event::ContactName { jid, name, source } => {
                 let jid = self.lid_map.normalize(&jid);
-                self.chats.names.insert(jid.clone(), name.clone());
-                return store_task(&self.store, move |s| s.set_contact_names(&[(jid, name)]));
+                if !self.chats.set_name(&jid, source, &name) {
+                    return Task::none();
+                }
+                return store_task(&self.store, move |s| {
+                    s.set_contact_names(&[(jid, source, name)])
+                });
+            }
+            Event::ChatFlag { chat, flag } => {
+                let chat = self.lid_map.normalize(&chat);
+                self.chats.apply_flag(&chat, flag);
+                return store_task(&self.store, move |s| s.set_chat_flag(&chat, flag));
+            }
+            Event::ListEdit { def, deleted } => {
+                self.chats.apply_list_edit(def.clone(), deleted);
+                if deleted {
+                    if self.filter == Filter::List(def.id.clone()) {
+                        self.filter = Filter::All;
+                    }
+                    return store_task(&self.store, move |s| s.delete_list(&def.id));
+                }
+                let saved = self.chats.list(&def.id).cloned().unwrap_or(def);
+                return store_task(&self.store, move |s| s.save_list(&saved));
+            }
+            Event::ListChat { list, chat, member } => {
+                let chat = self.lid_map.normalize(&chat);
+                self.chats.apply_list_chat(&list, &chat, member);
+                return store_task(&self.store, move |s| {
+                    s.set_list_member(&list, &chat, member)
+                });
             }
             Event::ChatRead { chat } => {
                 let chat = self.lid_map.normalize(&chat);
@@ -1529,6 +1697,35 @@ impl App {
             Event::Fatal(msg) => self.advance_auth(AuthEvent::Fatal(msg)),
         }
         Task::none()
+    }
+
+    /// Asks for a full app-state snapshot once per cache. Sessions linked by
+    /// an older Ferrochat already hold the contact / archive / list
+    /// collections at their latest version, so the mutations that carry the
+    /// address-book names would never be replayed otherwise.
+    fn maybe_resync(&mut self) -> Task<Message> {
+        if self.resync_done {
+            return Task::none();
+        }
+        let Some(client) = self.client.clone() else {
+            return Task::none();
+        };
+        if self.store.kv(RESYNC_KEY).ok().flatten().as_deref() == Some(RESYNC_VERSION) {
+            self.resync_done = true;
+            return Task::none();
+        }
+        self.resync_done = true;
+        let store = self.store.clone();
+        Task::perform(
+            async move {
+                client.resync_app_state().await.map_err(|e| e.to_string())?;
+                tokio::task::spawn_blocking(move || store.set_kv(RESYNC_KEY, RESYNC_VERSION))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(|e| e.to_string())
+            },
+            |r| Message::done(Done::Stored(r)),
+        )
     }
 
     /// Restarts the protocol client (new subscription generation).
@@ -1606,6 +1803,7 @@ impl App {
             Origin::Live | Origin::Offline => new_ids.into_iter().collect(),
         };
         let counts = origin != Origin::History;
+        let pushed = self.chats.learn_push_names(&messages);
         self.chats.apply_messages(
             &messages,
             open_chat.as_deref(),
@@ -1614,6 +1812,11 @@ impl App {
         );
         self.index_thumbs(&messages);
         let mut tasks = Vec::new();
+        if !pushed.is_empty() {
+            tasks.push(store_task(&self.store, move |s| {
+                s.set_contact_names(&pushed)
+            }));
+        }
         if origin == Origin::Live {
             for m in messages.iter().filter(|m| !m.from_me) {
                 // A message from someone ends their "typing…".
@@ -1663,12 +1866,12 @@ impl App {
                 Origin::Live => notify
                     .iter()
                     .map(|m| {
-                        let sender = m
-                            .sender_name
-                            .clone()
-                            .unwrap_or_else(|| self.chats.display_name(&m.sender));
+                        let sender = self
+                            .chats
+                            .resolve(&m.sender, m.sender_name.as_deref())
+                            .plain();
                         let group =
-                            net::is_group_jid(&m.chat).then(|| self.chats.display_name(&m.chat));
+                            net::is_group_jid(&m.chat).then(|| self.chats.plain_name(&m.chat));
                         let (summary, body) = crate::notify::notification_text(
                             &sender,
                             group.as_deref(),
@@ -1901,6 +2104,7 @@ impl App {
             Done::Located(loc) => return self.on_located(loc),
             Done::PopupAt { id, loc } => self.on_popup_at(id, loc),
             Done::LastMessage { chat, last } => self.chats.set_last(&chat, last.map(|b| *b)),
+            Done::VideoFile { id, result } => self.on_video_file(id, result),
             Done::VideoOpened(Ok(_)) => self.toast("Opened in your video player."),
             Done::VideoOpened(Err(e)) => self.toast(format!("Could not open the video: {e}")),
             Done::Stored(Err(e)) => tracing::warn!(error = %e, "cache write failed"),
@@ -1909,6 +2113,15 @@ impl App {
                 tracing::warn!(error = %e, "autostart entry not changed");
                 self.toast("Could not change the start-at-login setting.");
             }
+            Done::FlagFailed { chat, undo, error } => {
+                return self.on_flag_failed(chat, undo, error);
+            }
+            Done::MemberFailed {
+                list,
+                chat,
+                undo,
+                error,
+            } => return self.on_member_failed(list, chat, undo, error),
             Done::Stored(Ok(())) | Done::Nothing => {}
             Done::CleanedUp(problems) => {
                 if !problems.is_empty() {
@@ -1987,10 +2200,40 @@ impl App {
                     v.push(ui(Ui::AskDelete(a)));
                 }
             }
+            ScreenshotTarget::Video => {
+                if let Some(id) = c
+                    .messages
+                    .iter()
+                    .find(|m| matches!(m.content, Content::Video { .. }))
+                    .map(|m| m.id.clone())
+                {
+                    v.push(ui(Ui::OpenVideo(id)));
+                }
+            }
             _ => {}
         }
         self.hovered = hover;
         v
+    }
+
+    /// Display name of an `@<user>` mention in message text, from the saved,
+    /// business or push name of that number (or LID).
+    pub fn mention_name(&self, user: &str) -> Option<String> {
+        let pn = format!("{user}@s.whatsapp.net");
+        let jid = if self.chats.names.best(&pn).is_some() {
+            pn
+        } else {
+            self.lid_map.normalize(&format!("{user}@lid"))
+        };
+        if self.own_jid.as_deref() == Some(jid.as_str()) {
+            return Some("You".into());
+        }
+        self.chats.names.best(&jid).map(|(_, n)| n.to_string())
+    }
+
+    /// Logical size of the main window.
+    pub fn window_size(&self) -> iced::Size {
+        self.geom.size
     }
 
     /// Current playback / recording status (for tests).

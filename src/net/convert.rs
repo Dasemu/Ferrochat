@@ -6,9 +6,10 @@
 use whatsapp_rust::wacore::types::presence::ReceiptType;
 use whatsapp_rust::waproto::whatsapp as wa;
 
+use super::Event;
 use super::types::{
-    ChatMeta, Content, MediaKind, MediaRef, Message, OutgoingKind, OutgoingMedia,
-    QUOTE_PREVIEW_MAX, Quote, Reaction, ReceiptStatus,
+    ChatFlag, ChatMeta, Content, LinkPreview, ListDef, ListKind, MediaKind, MediaRef, Message,
+    NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote, Reaction, ReceiptStatus,
 };
 
 /// Unwraps ephemeral / view-once / edited / caption wrappers (up to a few
@@ -102,7 +103,10 @@ pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
     if let Some(ext) = m.extended_text_message.as_option()
         && let Some(text) = non_empty(ext.text.as_ref())
     {
-        return Some(Content::Text(text));
+        return Some(match link_preview(ext) {
+            Some(preview) => Content::Link { text, preview },
+            None => Content::Text(text),
+        });
     }
     if let Some(img) = m.image_message.as_option() {
         return Some(Content::Image {
@@ -223,6 +227,110 @@ fn video_content(v: &wa::message::VideoMessage) -> Content {
             v.mimetype.as_ref(),
         ),
     }
+}
+
+/// Largest inline preview thumbnail kept (they are a few kB in practice).
+const MAX_PREVIEW_THUMB: usize = 64 * 1024;
+
+/// The link preview the sender attached to an extended text message. Only
+/// http(s) previews with a title count; the thumbnail is size-capped.
+pub fn link_preview(ext: &wa::message::ExtendedTextMessage) -> Option<LinkPreview> {
+    let title = non_empty(ext.title.as_ref())?;
+    let url = non_empty(ext.matched_text.as_ref())?;
+    let lower = url.to_ascii_lowercase();
+    if !(lower.starts_with("http://") || lower.starts_with("https://")) || url.len() > 2048 {
+        return None;
+    }
+    Some(LinkPreview {
+        url,
+        title,
+        description: non_empty(ext.description.as_ref()).unwrap_or_default(),
+        thumbnail: ext
+            .jpeg_thumbnail
+            .clone()
+            .filter(|t| !t.is_empty() && t.len() <= MAX_PREVIEW_THUMB),
+    })
+}
+
+/// A saved-contact sync action → name events. The address-book name is the
+/// full name, else the first name; an action without either removes the saved
+/// name. The action may carry both the phone-number and the LID id of the
+/// contact: the name is recorded under each, and the pair is learned.
+pub fn contact_events(jid: &str, a: &wa::sync_action_value::ContactAction) -> Vec<Event> {
+    let name = non_empty(a.full_name.as_ref())
+        .or_else(|| non_empty(a.first_name.as_ref()))
+        .unwrap_or_default();
+    let mut ids = vec![bare_jid(jid)];
+    let pn = a.pn_jid.as_deref().filter(|j| !j.is_empty()).map(bare_jid);
+    let lid = a.lid_jid.as_deref().filter(|j| !j.is_empty()).map(bare_jid);
+    for extra in pn.iter().chain(lid.iter()) {
+        if !ids.contains(extra) {
+            ids.push(extra.clone());
+        }
+    }
+    let mut out = Vec::new();
+    if let (Some(pn), Some(lid)) = (&pn, &lid)
+        && let Some(pair) = lid_pair(lid, Some(pn))
+    {
+        out.push(Event::LidMappings(vec![pair]));
+    }
+    out.extend(ids.into_iter().map(|jid| Event::ContactName {
+        jid,
+        name: name.clone(),
+        source: NameSource::Saved,
+    }));
+    out
+}
+
+/// A `label_edit` sync action → list event. Only user-created lists and the
+/// Favourites list become chips; other kinds are kept as `Other`.
+pub fn list_edit_event(id: &str, a: &wa::sync_action_value::LabelEditAction) -> Event {
+    use wa::sync_action_value::label_edit_action::ListType;
+    let kind = match a.r#type {
+        Some(ListType::CUSTOM) => ListKind::Custom,
+        Some(ListType::FAVORITES) => ListKind::Favourites,
+        _ => ListKind::Other,
+    };
+    Event::ListEdit {
+        def: ListDef {
+            id: id.to_string(),
+            name: a.name.clone().unwrap_or_default(),
+            color: a.color.unwrap_or_default(),
+            kind,
+            order: a.order_index.unwrap_or_default(),
+        },
+        deleted: a.deleted.unwrap_or(false),
+    }
+}
+
+/// The `label_edit` payload that creates / renames a custom list.
+pub fn list_edit_action(def: &ListDef) -> wa::sync_action_value::LabelEditAction {
+    wa::sync_action_value::LabelEditAction {
+        name: Some(def.name.clone()),
+        color: Some(def.color),
+        deleted: Some(false),
+        order_index: Some(def.order),
+        is_active: Some(true),
+        r#type: Some(wa::sync_action_value::label_edit_action::ListType::CUSTOM),
+        ..Default::default()
+    }
+}
+
+/// Archive / pin / mute sync actions → chat flag events.
+pub fn archive_flag(a: &wa::sync_action_value::ArchiveChatAction) -> ChatFlag {
+    ChatFlag::Archived(a.archived.unwrap_or(false))
+}
+
+/// See [`archive_flag`].
+pub fn pin_flag(a: &wa::sync_action_value::PinAction) -> ChatFlag {
+    ChatFlag::Pinned(a.pinned.unwrap_or(false))
+}
+
+/// See [`archive_flag`]. A mute whose end time has passed counts as unmuted.
+pub fn mute_flag(a: &wa::sync_action_value::MuteAction, now_secs: i64) -> ChatFlag {
+    let end = a.mute_end_timestamp.unwrap_or(0);
+    // WhatsApp uses -1 for "forever"; the timestamp is in seconds.
+    ChatFlag::Muted(a.muted.unwrap_or(false) && (end <= 0 || end > now_secs))
 }
 
 /// The `contextInfo` of whichever body the message carries.
@@ -1345,5 +1453,180 @@ mod parity_tests {
         let mine = reaction_key("g@g.us", "ID", true, "me@s.whatsapp.net", true);
         assert_eq!(mine.participant, None);
         assert_eq!(mine.from_me, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod name_and_list_tests {
+    use super::*;
+    use wa::sync_action_value::{ContactAction, LabelEditAction, MuteAction, label_edit_action};
+
+    #[test]
+    fn contact_action_yields_saved_name_for_every_id() {
+        let a = ContactAction {
+            full_name: Some("Ana García".into()),
+            first_name: Some("Ana".into()),
+            lid_jid: Some("999@lid".into()),
+            pn_jid: Some("34600111222@s.whatsapp.net".into()),
+            ..Default::default()
+        };
+        let evs = contact_events("34600111222@s.whatsapp.net", &a);
+        let names: Vec<_> = evs
+            .iter()
+            .filter_map(|e| match e {
+                Event::ContactName { jid, name, source } => {
+                    Some((jid.as_str(), name.as_str(), *source))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (
+                    "34600111222@s.whatsapp.net",
+                    "Ana García",
+                    NameSource::Saved
+                ),
+                ("999@lid", "Ana García", NameSource::Saved),
+            ]
+        );
+        assert!(
+            matches!(&evs[0], Event::LidMappings(p) if p == &[("999@lid".to_string(), "34600111222@s.whatsapp.net".to_string())])
+        );
+    }
+
+    #[test]
+    fn contact_action_falls_back_to_first_name_and_can_clear() {
+        let a = ContactAction {
+            first_name: Some("Ana".into()),
+            ..Default::default()
+        };
+        let evs = contact_events("1@s.whatsapp.net", &a);
+        assert!(matches!(&evs[..], [Event::ContactName { name, .. }] if name == "Ana"));
+        // Neither name: the saved name is removed (empty name).
+        let evs = contact_events("1@s.whatsapp.net", &ContactAction::default());
+        assert!(
+            matches!(&evs[..], [Event::ContactName { name, source: NameSource::Saved, .. }] if name.is_empty())
+        );
+    }
+
+    #[test]
+    fn label_edit_maps_kinds_and_deletion() {
+        let custom = LabelEditAction {
+            name: Some("Familia".into()),
+            color: Some(4),
+            order_index: Some(2),
+            r#type: Some(label_edit_action::ListType::CUSTOM),
+            ..Default::default()
+        };
+        match list_edit_event("7", &custom) {
+            Event::ListEdit { def, deleted } => {
+                assert!(!deleted);
+                assert_eq!(def.id, "7");
+                assert_eq!(def.name, "Familia");
+                assert_eq!(def.kind, ListKind::Custom);
+                assert_eq!((def.color, def.order), (4, 2));
+            }
+            e => panic!("{e:?}"),
+        }
+        let fav = LabelEditAction {
+            r#type: Some(label_edit_action::ListType::FAVORITES),
+            ..Default::default()
+        };
+        assert!(
+            matches!(list_edit_event("f", &fav), Event::ListEdit { def, .. } if def.kind == ListKind::Favourites)
+        );
+        let business = LabelEditAction {
+            name: Some("New customer".into()),
+            ..Default::default()
+        };
+        assert!(
+            matches!(list_edit_event("b", &business), Event::ListEdit { def, .. } if def.kind == ListKind::Other)
+        );
+        let gone = LabelEditAction {
+            deleted: Some(true),
+            ..Default::default()
+        };
+        assert!(matches!(
+            list_edit_event("7", &gone),
+            Event::ListEdit { deleted: true, .. }
+        ));
+    }
+
+    #[test]
+    fn outgoing_list_edit_is_a_custom_list() {
+        let def = ListDef {
+            id: "9".into(),
+            name: "Trabajo".into(),
+            color: 3,
+            kind: ListKind::Custom,
+            order: 1,
+        };
+        let a = list_edit_action(&def);
+        assert_eq!(a.name.as_deref(), Some("Trabajo"));
+        assert_eq!(a.deleted, Some(false));
+        assert_eq!(a.r#type, Some(label_edit_action::ListType::CUSTOM));
+        assert_eq!(a.order_index, Some(1));
+    }
+
+    #[test]
+    fn chat_flags_from_sync_actions() {
+        assert_eq!(
+            archive_flag(&wa::sync_action_value::ArchiveChatAction {
+                archived: Some(true),
+                ..Default::default()
+            }),
+            ChatFlag::Archived(true)
+        );
+        assert_eq!(
+            pin_flag(&wa::sync_action_value::PinAction::default()),
+            ChatFlag::Pinned(false)
+        );
+        let mute = |muted, end| MuteAction {
+            muted: Some(muted),
+            mute_end_timestamp: Some(end),
+            ..Default::default()
+        };
+        assert_eq!(mute_flag(&mute(true, -1), 1000), ChatFlag::Muted(true));
+        assert_eq!(mute_flag(&mute(true, 2000), 1000), ChatFlag::Muted(true));
+        // The mute already expired.
+        assert_eq!(mute_flag(&mute(true, 500), 1000), ChatFlag::Muted(false));
+        assert_eq!(mute_flag(&mute(false, 0), 1000), ChatFlag::Muted(false));
+    }
+
+    #[test]
+    fn link_preview_is_read_from_extended_text() {
+        let ext = wa::message::ExtendedTextMessage {
+            text: Some("look https://example.com/x".into()),
+            matched_text: Some("https://example.com/x".into()),
+            title: Some("Example".into()),
+            description: Some("A page".into()),
+            jpeg_thumbnail: Some(vec![1, 2, 3]),
+            ..Default::default()
+        };
+        let msg = wa::Message {
+            extended_text_message: buffa_some(ext.clone()),
+            ..Default::default()
+        };
+        match content_from_wa(&msg) {
+            Some(Content::Link { text, preview }) => {
+                assert_eq!(text, "look https://example.com/x");
+                assert_eq!(preview.title, "Example");
+                assert_eq!(preview.thumbnail, Some(vec![1, 2, 3]));
+            }
+            c => panic!("{c:?}"),
+        }
+        // No title: plain text. A non-http target never becomes a preview.
+        let mut no_title = ext.clone();
+        no_title.title = None;
+        assert!(link_preview(&no_title).is_none());
+        let mut bad = ext.clone();
+        bad.matched_text = Some("javascript:alert(1)".into());
+        assert!(link_preview(&bad).is_none());
+        // An oversized thumbnail is dropped, the preview stays.
+        let mut big = ext;
+        big.jpeg_thumbnail = Some(vec![0; MAX_PREVIEW_THUMB + 1]);
+        assert_eq!(link_preview(&big).unwrap().thumbnail, None);
     }
 }

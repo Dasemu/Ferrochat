@@ -27,7 +27,8 @@ use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
 
 use super::convert::{self, Envelope, Uploaded};
 use super::types::{
-    ChatState, Content, MediaKind, MediaRef, MsgKey, Origin, OutgoingKind, OutgoingMedia, Quote,
+    ChatState, Content, ListDef, MediaKind, MediaRef, MsgKey, NameSource, Origin, OutgoingKind,
+    OutgoingMedia, Quote,
 };
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
@@ -313,6 +314,100 @@ impl WaClient for RealClient {
                 })
                 .count();
             Ok(others)
+        })
+    }
+
+    fn set_archived<'a>(&'a self, chat: &'a str, archived: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let actions = self.client.chat_actions();
+            if archived {
+                actions.archive_chat(&jid, None).await
+            } else {
+                actions.unarchive_chat(&jid, None).await
+            }
+            .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn set_pinned<'a>(&'a self, chat: &'a str, pinned: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let actions = self.client.chat_actions();
+            if pinned {
+                actions.pin_chat(&jid).await
+            } else {
+                actions.unpin_chat(&jid).await
+            }
+            .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn save_list<'a>(&'a self, list: &'a ListDef) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            use whatsapp_rust::waproto::buffa::MessageField;
+            use whatsapp_rust::waproto::whatsapp as wa;
+            let value = wa::SyncActionValue {
+                label_edit_action: MessageField::some(convert::list_edit_action(list)),
+                timestamp: Some(now_secs() * 1000),
+                ..Default::default()
+            };
+            self.client
+                .send_app_state_action(&whatsapp_rust::schemas::LABEL_EDIT, &[&list.id], &value)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn delete_list<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.client
+                .labels()
+                .delete_label(id)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn set_list_member<'a>(
+        &'a self,
+        list: &'a str,
+        chat: &'a str,
+        member: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let labels = self.client.labels();
+            if member {
+                labels.add_chat_label(list, &jid).await
+            } else {
+                labels.remove_chat_label(list, &jid).await
+            }
+            .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn resync_app_state(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            use whatsapp_rust::sync_task::MajorSyncTask;
+            use whatsapp_rust::wacore::appstate::patch_decode::WAPatchName;
+            // Contacts live in `critical_unblock_low`; archive, pin, mute and
+            // labels in `regular_low` / `regular`. A snapshot replays every
+            // mutation as an event, whatever version we had stored.
+            for name in [
+                WAPatchName::CriticalUnblockLow,
+                WAPatchName::Regular,
+                WAPatchName::RegularLow,
+                WAPatchName::RegularHigh,
+            ] {
+                self.client
+                    .process_sync_task(MajorSyncTask::AppStateSync {
+                        name,
+                        full_sync: true,
+                    })
+                    .await;
+            }
+            Ok(())
         })
     }
 
@@ -682,8 +777,22 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             let mut out = Vec::new();
             let mut extra = Vec::new();
             let mut pairs = Vec::new();
+            let mut business = Vec::new();
             for m in batch.messages.iter() {
                 let info = &m.info;
+                if !info.source.is_from_me
+                    && let Some(name) = info
+                        .verified_name
+                        .as_ref()
+                        .and_then(|v| v.name.clone())
+                        .filter(|n| !n.is_empty())
+                {
+                    business.push(Event::ContactName {
+                        jid: convert::bare_jid(&info.source.sender.to_string()),
+                        name,
+                        source: NameSource::Business,
+                    });
+                }
                 let env = Envelope {
                     id: info.id.to_string(),
                     chat: info.source.chat.to_string(),
@@ -723,7 +832,7 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                     None => {}
                 }
             }
-            let mut v = Vec::new();
+            let mut v = business;
             if !pairs.is_empty() {
                 v.push(Event::LidMappings(pairs));
             }
@@ -767,19 +876,35 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
         WaEvent::PushNameUpdate(p) => vec![Event::ContactName {
             jid: convert::bare_jid(&p.jid.to_string()),
             name: p.new_push_name.clone(),
+            source: NameSource::Push,
         }],
-        WaEvent::ContactUpdate(c) => match c
-            .action
-            .full_name
-            .clone()
-            .or_else(|| c.action.first_name.clone())
-        {
+        WaEvent::ContactUpdate(c) => convert::contact_events(&c.jid.to_string(), &c.action),
+        WaEvent::BusinessStatusUpdate(b) => match &b.verified_name {
             Some(name) if !name.is_empty() => vec![Event::ContactName {
-                jid: convert::bare_jid(&c.jid.to_string()),
-                name,
+                jid: convert::bare_jid(&b.jid.to_string()),
+                name: name.clone(),
+                source: NameSource::Business,
             }],
             _ => vec![],
         },
+        WaEvent::ArchiveUpdate(a) => vec![Event::ChatFlag {
+            chat: convert::bare_jid(&a.jid.to_string()),
+            flag: convert::archive_flag(&a.action),
+        }],
+        WaEvent::PinUpdate(p) => vec![Event::ChatFlag {
+            chat: convert::bare_jid(&p.jid.to_string()),
+            flag: convert::pin_flag(&p.action),
+        }],
+        WaEvent::MuteUpdate(m) => vec![Event::ChatFlag {
+            chat: convert::bare_jid(&m.jid.to_string()),
+            flag: convert::mute_flag(&m.action, now_secs()),
+        }],
+        WaEvent::LabelEditUpdate(l) => vec![convert::list_edit_event(&l.label_id, &l.action)],
+        WaEvent::LabelAssociationUpdate(l) => vec![Event::ListChat {
+            list: l.label_id.clone(),
+            chat: convert::bare_jid(&l.chat_jid.to_string()),
+            member: l.action.labeled.unwrap_or(false),
+        }],
         WaEvent::ChatPresence(c) => vec![Event::ChatState {
             chat: convert::bare_jid(&c.source.chat.to_string()),
             participant: c

@@ -8,7 +8,8 @@ use std::io::Cursor;
 
 use crate::media::audio;
 use crate::net::types::{
-    ChatMeta, ChatState, Content, MediaKind, MediaRef, Message, Quote, Reaction, ReceiptStatus,
+    ChatMeta, ChatState, Content, LinkPreview, ListDef, ListKind, MediaKind, MediaRef, Message,
+    Quote, Reaction, ReceiptStatus,
 };
 
 /// Own (fake) JID in mock mode.
@@ -22,8 +23,17 @@ pub struct MockData {
     pub own_jid: String,
     /// Chats.
     pub chats: Vec<ChatMeta>,
-    /// Contact names.
+    /// Push names (what contacts call themselves).
     pub names: Vec<(String, String)>,
+    /// Names saved in the (fake) phone's address book, sent as app-state
+    /// contact updates after the history.
+    pub saved: Vec<(String, String)>,
+    /// Business verified names.
+    pub business: Vec<(String, String)>,
+    /// Chat lists defined on the (fake) phone.
+    pub lists: Vec<ListDef>,
+    /// `(list id, chat)` memberships.
+    pub list_members: Vec<(String, String)>,
     /// Messages, any order.
     pub messages: Vec<Message>,
     /// Downloadable media keyed by `direct_path`.
@@ -281,15 +291,60 @@ pub fn mock_data(now: i64) -> MockData {
     let climbing = "120363000000000003@g.us";
     let elena = "34666666666@s.whatsapp.net";
     let mum = "34677777777@s.whatsapp.net";
+    let archived_ex = "34688000111@s.whatsapp.net";
+    let archived_group = "120363000000000004@g.us";
 
+    // What the contacts call themselves (push names) ...
     let names = vec![
+        (lucia.to_string(), "Lu".to_string()),
+        (marcos.to_string(), "Marcos".to_string()),
+        (carmen.to_string(), "Carmen R.".to_string()),
+        (pablo.to_string(), "Pablo".to_string()),
+        (elena.to_string(), "Ele".to_string()),
+        (mum.to_string(), "Mama".to_string()),
+        (
+            "34612121212@s.whatsapp.net".to_string(),
+            "Jorge".to_string(),
+        ),
+        (archived_ex.to_string(), "Álvaro".to_string()),
+    ];
+    // ... and what the user saved them as on the phone (app-state sync).
+    let saved = vec![
         (lucia.to_string(), "Lucía Fernández".to_string()),
         (marcos.to_string(), "Marcos Díaz".to_string()),
         (carmen.to_string(), "Carmen Ruiz".to_string()),
-        (clinic.to_string(), "Clínica Dental Sonrisa".to_string()),
-        (pablo.to_string(), "Pablo".to_string()),
         (elena.to_string(), "Elena Martín".to_string()),
         (mum.to_string(), "Mamá".to_string()),
+        (
+            "34688888888@s.whatsapp.net".to_string(),
+            "Tía Rosa".to_string(),
+        ),
+        (
+            "34699999999@s.whatsapp.net".to_string(),
+            "Irene (UX)".to_string(),
+        ),
+    ];
+    let business = vec![(clinic.to_string(), "Clínica Dental Sonrisa".to_string())];
+    let list = |id: &str, name: &str, kind: ListKind, order: i32| ListDef {
+        id: id.into(),
+        name: name.into(),
+        color: order,
+        kind,
+        order,
+    };
+    let lists = vec![
+        list("fav", "", ListKind::Favourites, 0),
+        list("1", "Familia", ListKind::Custom, 1),
+        list("2", "Trabajo", ListKind::Custom, 2),
+        list("3", "Viajes", ListKind::Custom, 3),
+    ];
+    let list_members = vec![
+        ("fav".to_string(), lucia.to_string()),
+        ("fav".to_string(), mum.to_string()),
+        ("1".to_string(), family.to_string()),
+        ("1".to_string(), mum.to_string()),
+        ("2".to_string(), design.to_string()),
+        ("3".to_string(), lucia.to_string()),
     ];
 
     let png = sunset_png(640, 420);
@@ -324,8 +379,10 @@ pub fn mock_data(now: i64) -> MockData {
     );
     media.insert(voice_out.direct_path.clone(), ogg_out);
 
-    let clip = b"\x00\x00\x00\x18ftypmp42 mock clip, never played".to_vec();
-    let clip_ref = media_ref("/mock/clip.mp4", MediaKind::Video, "video/mp4", &clip);
+    // A real 3-second test clip (VP8 in WebM, a few kB) so the in-app player
+    // works in mock mode too.
+    let clip = include_bytes!("../assets/mock-clip.webm").to_vec();
+    let clip_ref = media_ref("/mock/clip.webm", MediaKind::Video, "video/webm", &clip);
     media.insert(clip_ref.direct_path.clone(), clip);
     let clip_thumb = thumbnail_of(&sunset_png(320, 180));
     let webp = sticker_webp();
@@ -450,7 +507,7 @@ pub fn mock_data(now: i64) -> MockData {
         now - 3450,
         Content::Video {
             caption: None,
-            seconds: 14,
+            seconds: 3,
             width: 320,
             height: 180,
             thumbnail: clip_thumb,
@@ -480,6 +537,30 @@ pub fn mock_data(now: i64) -> MockData {
     );
     b.mark_edited();
     b.react(lucia, "👍", now - 100);
+
+    b.push(
+        lucia,
+        l,
+        now - 90,
+        text("Mira esto https://www.rust-lang.org/learn y también www.example.com."),
+        Read,
+    );
+    b.push(
+        lucia,
+        None,
+        now - 80,
+        Content::Link {
+            text: "Esta guía de viaje es buena: https://example.com/lisboa".into(),
+            preview: LinkPreview {
+                url: "https://example.com/lisboa".into(),
+                title: "Qué ver en Lisboa en tres días".into(),
+                description: "Barrios, miradores y los mejores pastéis de nata de la ciudad."
+                    .into(),
+                thumbnail: thumbnail_of(&sunset_png(320, 180)),
+            },
+        },
+        Sent,
+    );
 
     let f1 = Some(("34688888888@s.whatsapp.net", "Tía Rosa"));
     let f2 = Some((mum, "Mamá"));
@@ -609,6 +690,21 @@ pub fn mock_data(now: i64) -> MockData {
         Read,
     );
 
+    b.push(
+        archived_ex,
+        Some((archived_ex, "Álvaro")),
+        now - 86_400 * 30,
+        text("Nos vemos en la boda 👋"),
+        Read,
+    );
+    b.push(
+        archived_group,
+        Some(("34612121212@s.whatsapp.net", "Jorge")),
+        now - 86_400 * 40,
+        text("Recordad pagar el alquiler antes del día 5"),
+        Read,
+    );
+
     let last_of = |chat: &str| {
         b.msgs
             .iter()
@@ -626,7 +722,7 @@ pub fn mock_data(now: i64) -> MockData {
         archived: false,
         muted,
     };
-    let chats = vec![
+    let mut chats = vec![
         chat(lucia, None, 0, true, false),
         chat(family, Some("Familia 🏡"), 3, false, false),
         chat(marcos, None, 1, false, false),
@@ -637,7 +733,18 @@ pub fn mock_data(now: i64) -> MockData {
         chat(climbing, Some("Escalada los sábados 🧗"), 12, false, true),
         chat(elena, None, 0, false, false),
         chat(mum, None, 0, false, false),
+        chat(archived_ex, None, 0, false, false),
+        chat(
+            archived_group,
+            Some("Piso Madrid (antiguo)"),
+            0,
+            false,
+            true,
+        ),
     ];
+    for c in &mut chats {
+        c.archived = c.id == archived_ex || c.id == archived_group;
+    }
 
     let mut avatars = HashMap::new();
     for (i, jid) in [lucia, marcos, mum, carmen, elena, family, climbing]
@@ -655,6 +762,10 @@ pub fn mock_data(now: i64) -> MockData {
         own_jid: OWN_JID.into(),
         chats,
         names,
+        saved,
+        business,
+        lists,
+        list_members,
         messages: b.msgs,
         media,
         avatars,
@@ -670,7 +781,8 @@ mod tests {
     #[test]
     fn mock_data_is_consistent() {
         let d = mock_data(1_700_000_000);
-        assert_eq!(d.chats.len(), 10);
+        assert_eq!(d.chats.len(), 12);
+        assert_eq!(d.chats.iter().filter(|c| c.archived).count(), 2);
         // Every message belongs to a known chat; every media ref is downloadable.
         for m in &d.messages {
             assert!(d.chats.iter().any(|c| c.id == m.chat), "{}", m.chat);

@@ -13,6 +13,11 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
+- Video: `target/debug/ferrochat-player` must exist next to `ferrochat`
+  (`cargo build` builds both). Needs `libgstreamer1.0-dev
+  libgstreamer-plugins-base1.0-dev` to build and `gstreamer1.0-plugins-good`
+  to run the tests. `--no-default-features` builds without the helper.
+
 ## Architecture
 See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
 `docs/protocol.md` (library decision, event mapping, what lands on disk).
@@ -62,3 +67,16 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   window and no tray (`app/window.rs` invariant). `ksni` must stay on zbus 5 (shared with ashpd).
 - Keep iced default features on (x11/wayland backends).
 - No Secret Service in CI: tests use `MemoryStore`.
+- Hover must never change layout: the message hover buttons live in a slot
+  that is always laid out (`chat::action_slot`); `ui::chat::layout_tests`
+  fails if a hovered row changes size.
+- Names have sources (saved > business > push "~ Name" > number): never write
+  names into one map; use `ChatList::resolve` / `set_name`. Display names of
+  senders must not prefer `Message::sender_name` (a push name).
+- `ferrochat` must not link GStreamer: only `src/bin/ferrochat-player.rs` may
+  `use gstreamer`. Video frames are `image::Handle`s made in `update`, never
+  in `view`; the video viewer replaces the whole view while open.
+- Chat flags / lists are optimistic: apply, persist, send, revert on failure
+  (`app/lists.rs`). Never send the `favorites` app-state action (it carries
+  the whole list and would overwrite the phone's).
+- App-level tests: `app::test_support::Harness` (real `App` + fake client).

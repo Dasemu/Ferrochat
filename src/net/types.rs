@@ -70,11 +70,40 @@ impl fmt::Debug for MediaRef {
     }
 }
 
+/// A link preview as attached by the sender (WhatsApp clients never fetch
+/// previews on the receiving side, so neither do we).
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkPreview {
+    /// The URL the preview is for.
+    pub url: String,
+    /// Page title.
+    pub title: String,
+    /// Short description.
+    pub description: String,
+    /// Inline JPEG thumbnail (stored separately in the cache).
+    #[serde(skip)]
+    pub thumbnail: Option<Vec<u8>>,
+}
+
+impl fmt::Debug for LinkPreview {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LinkPreview")
+    }
+}
+
 /// The body of a message.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub enum Content {
     /// Plain or extended text.
     Text(String),
+    /// Text that carries a link preview (title, description, thumbnail)
+    /// built by the sender's phone.
+    Link {
+        /// The message text.
+        text: String,
+        /// The preview card.
+        preview: LinkPreview,
+    },
     /// A photo.
     Image {
         /// Optional caption.
@@ -156,7 +185,9 @@ impl Content {
     /// One-line preview for the chat list and notifications.
     pub fn preview(&self) -> String {
         match self {
-            Content::Text(t) => t.lines().next().unwrap_or_default().to_string(),
+            Content::Text(t) | Content::Link { text: t, .. } => {
+                t.lines().next().unwrap_or_default().to_string()
+            }
             Content::Image { caption, .. } => match caption {
                 Some(c) if !c.is_empty() => format!("📷 {c}"),
                 _ => "📷 Photo".into(),
@@ -179,6 +210,14 @@ impl Content {
         }
     }
 
+    /// The text of a plain or link message.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Content::Text(t) | Content::Link { text: t, .. } => Some(t),
+            _ => None,
+        }
+    }
+
     /// The downloadable media of this content, if any.
     pub fn media(&self) -> Option<&MediaRef> {
         match self {
@@ -195,6 +234,7 @@ impl Content {
     pub fn kind_tag(&self) -> &'static str {
         match self {
             Content::Text(_) => "text",
+            Content::Link { .. } => "link",
             Content::Image { .. } => "image",
             Content::Document { .. } => "document",
             Content::Voice { .. } => "voice",
@@ -212,6 +252,7 @@ impl fmt::Debug for Content {
         // Never print message bodies or file names.
         match self {
             Content::Text(t) => write!(f, "Text(len={})", t.chars().count()),
+            Content::Link { text, .. } => write!(f, "Link(len={})", text.chars().count()),
             Content::Image { width, height, .. } => write!(f, "Image({width}x{height})"),
             Content::Document { size, .. } => write!(f, "Document(size={size})"),
             Content::Voice { seconds, ptt, .. } => write!(f, "Voice({seconds}s, ptt={ptt})"),
@@ -441,7 +482,9 @@ impl fmt::Debug for MsgKey {
 pub fn merge_edit(old: &Content, new: &Content) -> Option<Content> {
     let new_text = |c: &Content| -> Option<Option<String>> {
         match c {
-            Content::Text(t) => Some(Some(t.clone()).filter(|t| !t.is_empty())),
+            Content::Text(t) | Content::Link { text: t, .. } => {
+                Some(Some(t.clone()).filter(|t| !t.is_empty()))
+            }
             Content::Image { caption, .. }
             | Content::Video { caption, .. }
             | Content::Document { caption, .. } => Some(caption.clone()),
@@ -451,6 +494,11 @@ pub fn merge_edit(old: &Content, new: &Content) -> Option<Content> {
     let text = new_text(new)?;
     match old {
         Content::Text(_) => Some(Content::Text(text?)),
+        // An edit replaces the text; the sender's preview stays attached.
+        Content::Link { preview, .. } => Some(Content::Link {
+            text: text?,
+            preview: preview.clone(),
+        }),
         Content::Image { .. } | Content::Video { .. } | Content::Document { .. } => {
             let mut c = old.clone();
             match &mut c {
@@ -474,7 +522,7 @@ impl Message {
     /// Our text message is still inside WhatsApp's edit window.
     pub fn can_edit(&self, now: i64) -> bool {
         self.from_me
-            && matches!(self.content, Content::Text(_))
+            && matches!(self.content, Content::Text(_) | Content::Link { .. })
             && self.status != ReceiptStatus::Failed
             && self.status != ReceiptStatus::Pending
             && now - self.timestamp <= EDIT_WINDOW_SECS
@@ -593,13 +641,159 @@ pub fn is_group_jid(jid: &str) -> bool {
 pub fn fallback_name(jid: &str) -> String {
     let user = jid.split('@').next().unwrap_or(jid);
     let user = user.split([':', '.']).next().unwrap_or(user);
-    if jid.ends_with("@s.whatsapp.net") && user.chars().all(|c| c.is_ascii_digit()) {
-        format!("+{user}")
+    if jid.ends_with("@s.whatsapp.net")
+        && !user.is_empty()
+        && user.chars().all(|c| c.is_ascii_digit())
+    {
+        format_phone(user)
     } else if is_group_jid(jid) {
         "Group".into()
     } else {
         user.to_string()
     }
+}
+
+/// Number of digits of the country calling code at the start of `digits`
+/// (ITU-T E.164: the codes are prefix-free, so the first digits decide).
+fn country_code_len(digits: &str) -> usize {
+    let b = digits.as_bytes();
+    match b.first() {
+        Some(b'1' | b'7') => 1,
+        Some(_) => {
+            const TWO: &[&str] = &[
+                "20", "27", "30", "31", "32", "33", "34", "36", "39", "40", "41", "43", "44", "45",
+                "46", "47", "48", "49", "51", "52", "53", "54", "55", "56", "57", "58", "60", "61",
+                "62", "63", "64", "65", "66", "81", "82", "84", "86", "90", "91", "92", "93", "94",
+                "95", "98",
+            ];
+            if digits.get(..2).is_some_and(|c| TWO.contains(&c)) {
+                2
+            } else {
+                3
+            }
+        }
+        None => 0,
+    }
+}
+
+/// `34600111222` -> `+34 600 111 222`: country code, then the national number
+/// in groups of three (a trailing single digit joins the previous group).
+/// Not a libphonenumber replacement, only a readable fallback title.
+pub fn format_phone(digits: &str) -> String {
+    let cc = country_code_len(digits).min(digits.len());
+    let (code, national) = digits.split_at(cc);
+    let mut groups: Vec<&str> = national
+        .as_bytes()
+        .chunks(3)
+        .map(|c| std::str::from_utf8(c).unwrap_or_default())
+        .collect();
+    if groups.len() > 1 && groups.last().is_some_and(|g| g.len() == 1) {
+        let last = groups.pop().unwrap_or_default();
+        if let Some(prev) = groups.pop() {
+            let start = national.len() - last.len() - prev.len();
+            groups.push(&national[start..]);
+        }
+    }
+    if groups.is_empty() {
+        format!("+{code}")
+    } else {
+        format!("+{code} {}", groups.join(" "))
+    }
+}
+
+/// Push names from history sync as `(jid, source, name)` rows.
+pub fn push_names(names: &[(String, String)]) -> Vec<(String, NameSource, String)> {
+    names
+        .iter()
+        .map(|(j, n)| (j.clone(), NameSource::Push, n.clone()))
+        .collect()
+}
+
+/// Where a contact name comes from, ordered by display priority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum NameSource {
+    /// The name the contact chose for itself (shown as "~ Name").
+    Push = 1,
+    /// A business account's verified name.
+    Business = 2,
+    /// The name saved in the user's phone address book (app-state sync).
+    Saved = 3,
+}
+
+impl NameSource {
+    /// Database code.
+    pub fn code(self) -> i64 {
+        self as i64
+    }
+
+    /// From a database code.
+    pub fn from_code(c: i64) -> Option<Self> {
+        match c {
+            1 => Some(Self::Push),
+            2 => Some(Self::Business),
+            3 => Some(Self::Saved),
+            _ => None,
+        }
+    }
+}
+
+/// A chat property changed on another device (app-state sync).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatFlag {
+    /// Archived / unarchived.
+    Archived(bool),
+    /// Pinned / unpinned.
+    Pinned(bool),
+    /// Muted / unmuted.
+    Muted(bool),
+}
+
+/// What a chat list "label" is (WhatsApp's `LabelEditAction.ListType`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ListKind {
+    /// A list the user created ("Lists" in the official app).
+    Custom,
+    /// The Favourites list.
+    Favourites,
+    /// Anything else (business labels, predefined server lists): kept so
+    /// associations are not lost, not shown as a chip.
+    #[default]
+    Other,
+}
+
+impl ListKind {
+    /// Database code.
+    pub fn code(self) -> i64 {
+        match self {
+            Self::Custom => 1,
+            Self::Favourites => 2,
+            Self::Other => 0,
+        }
+    }
+
+    /// From a database code.
+    pub fn from_code(c: i64) -> Self {
+        match c {
+            1 => Self::Custom,
+            2 => Self::Favourites,
+            _ => Self::Other,
+        }
+    }
+}
+
+/// A chat list definition synced through app state (`label_edit`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListDef {
+    /// Label id (opaque, chosen by the creating client).
+    pub id: String,
+    /// Name shown on the chip.
+    pub name: String,
+    /// WhatsApp colour index.
+    pub color: i32,
+    /// Kind.
+    pub kind: ListKind,
+    /// Position among the lists.
+    pub order: i32,
 }
 
 /// Media the user wants to send.
@@ -761,9 +955,33 @@ mod tests {
 
     #[test]
     fn fallback_names() {
-        assert_eq!(fallback_name("34600111222@s.whatsapp.net"), "+34600111222");
+        assert_eq!(
+            fallback_name("34600111222@s.whatsapp.net"),
+            "+34 600 111 222"
+        );
         assert_eq!(fallback_name("1203630@g.us"), "Group");
         assert!(is_group_jid("1203630@g.us"));
+        assert_eq!(fallback_name("abc@lid"), "abc");
+    }
+
+    #[test]
+    fn phone_numbers_are_grouped() {
+        assert_eq!(format_phone("34600111222"), "+34 600 111 222");
+        assert_eq!(format_phone("14155550123"), "+1 415 555 0123");
+        assert_eq!(format_phone("447911123456"), "+44 791 112 3456");
+        assert_eq!(format_phone("5491155551234"), "+54 911 555 512 34");
+        assert_eq!(format_phone("351"), "+351");
+        assert_eq!(format_phone(""), "+");
+    }
+
+    #[test]
+    fn name_sources_rank_and_round_trip() {
+        assert!(NameSource::Saved > NameSource::Business);
+        assert!(NameSource::Business > NameSource::Push);
+        for s in [NameSource::Push, NameSource::Business, NameSource::Saved] {
+            assert_eq!(NameSource::from_code(s.code()), Some(s));
+        }
+        assert_eq!(NameSource::from_code(9), None);
     }
 
     fn text_msg(from_me: bool, ts: i64, status: ReceiptStatus) -> Message {

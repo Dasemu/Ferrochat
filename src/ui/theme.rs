@@ -34,6 +34,8 @@ pub struct Palette {
     pub accent: Color,
     /// Text on accent.
     pub accent_text: Color,
+    /// Links inside message bubbles.
+    pub link: Color,
     /// Errors.
     pub danger: Color,
     /// Read ticks.
@@ -93,6 +95,7 @@ pub const DARK: Palette = Palette {
     text_muted: hex(0x667781),
     accent: hex(0x00a884),
     accent_text: hex(0x111b21),
+    link: hex(0x53bdeb),
     danger: hex(0xf15c6d),
     success: hex(0x53bdeb),
     border: hex(0x222d34),
@@ -126,6 +129,7 @@ pub const LIGHT: Palette = Palette {
     text_muted: hex(0x8696a0),
     accent: hex(0x00a884),
     accent_text: hex(0xffffff),
+    link: hex(0x027eb5),
     danger: hex(0xea0038),
     success: hex(0x53bdeb),
     border: hex(0xe9edef),

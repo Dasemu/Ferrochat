@@ -1,0 +1,472 @@
+//! App-level flows against the fake protocol client: the real `App`, the
+//! real store, the scripted fake. These are the integration tests for names,
+//! archive, pins, lists and links.
+
+use super::state::Filter;
+use super::test_support::Harness;
+use super::{MenuTarget, Ui};
+use crate::mock::{self, OWN_JID, SHOWCASE_CHAT};
+use crate::net::fake::{FakeOptions, Sent};
+use crate::net::{ChatFlag, Event, ListDef, ListKind, NameSource};
+
+const MARCOS: &str = "34622222222@s.whatsapp.net";
+const PABLO: &str = "34655555555@s.whatsapp.net";
+const CLINIC: &str = "34644444444@s.whatsapp.net";
+const ARCHIVED_GROUP: &str = "120363000000000004@g.us";
+const STRANGER: &str = "34600999888@s.whatsapp.net";
+
+fn resyncs(h: &Harness) -> usize {
+    h.fake
+        .log()
+        .iter()
+        .filter(|s| matches!(s, Sent::Resync))
+        .count()
+}
+
+#[tokio::test]
+async fn names_follow_the_priority_in_the_running_app() {
+    let h = Harness::new().await;
+    let c = &h.app.chats;
+    // Saved in the phone's address book beats the push name ("Lu").
+    assert_eq!(c.display_name(SHOWCASE_CHAT), "Lucía Fernández");
+    // Business verified name.
+    assert_eq!(c.display_name(CLINIC), "Clínica Dental Sonrisa");
+    // Only a push name: shown with "~".
+    assert_eq!(c.display_name(PABLO), "~ Pablo");
+    // Nothing known: the formatted number.
+    assert_eq!(c.display_name(STRANGER), "+34 600 999 888");
+    // Group senders use the same book, not the name carried by the message.
+    assert_eq!(
+        c.sender_name("34688888888@s.whatsapp.net", Some("Rosa")),
+        "Tía Rosa"
+    );
+}
+
+#[tokio::test]
+async fn a_late_saved_name_replaces_the_push_name_and_survives_a_restart() {
+    let mut h = Harness::new().await;
+    h.net(Event::ContactName {
+        jid: PABLO.into(),
+        name: "Pablo Gómez".into(),
+        source: NameSource::Saved,
+    })
+    .await;
+    assert_eq!(h.app.chats.display_name(PABLO), "Pablo Gómez");
+    // A push name arriving afterwards must not override it.
+    h.net(Event::ContactName {
+        jid: PABLO.into(),
+        name: "Pablito".into(),
+        source: NameSource::Push,
+    })
+    .await;
+    assert_eq!(h.app.chats.display_name(PABLO), "Pablo Gómez");
+    // Persisted: a fresh book built from the store shows the same.
+    let book = super::state::NameBook::from_rows(h.app.store.contact_names().unwrap());
+    assert_eq!(book.best(PABLO), Some((NameSource::Saved, "Pablo Gómez")));
+    // The contact is removed from the address book: back to the push name.
+    h.net(Event::ContactName {
+        jid: PABLO.into(),
+        name: String::new(),
+        source: NameSource::Saved,
+    })
+    .await;
+    assert_eq!(h.app.chats.display_name(PABLO), "~ Pablito");
+}
+
+#[tokio::test]
+async fn lid_contacts_get_the_name_under_their_phone_number() {
+    let mut h = Harness::new().await;
+    h.net(Event::LidMappings(vec![(
+        "111222333@lid".into(),
+        STRANGER.into(),
+    )]))
+    .await;
+    h.net(Event::ContactName {
+        jid: "111222333@lid".into(),
+        name: "Nueva Persona".into(),
+        source: NameSource::Saved,
+    })
+    .await;
+    assert_eq!(h.app.chats.display_name(STRANGER), "Nueva Persona");
+}
+
+#[tokio::test]
+async fn existing_sessions_get_one_full_app_state_resync() {
+    let mut h = Harness::new().await;
+    assert_eq!(resyncs(&h), 1, "requested right after connecting");
+    assert_eq!(
+        h.app.store.kv("appstate_resync").unwrap().as_deref(),
+        Some("1")
+    );
+    // Reconnecting does not ask again.
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    assert_eq!(resyncs(&h), 1);
+}
+
+#[tokio::test]
+async fn the_resync_marker_in_the_cache_prevents_repeats_across_runs() {
+    let mut cfg = crate::config::Config::defaults();
+    cfg.mock = true;
+    let (mut app, _) = super::App::boot(cfg);
+    app.store.set_kv("appstate_resync", "1").unwrap();
+    let (fake, _stream) = crate::net::fake::start(FakeOptions::default(), mock::mock_data(1));
+    app.client = Some(fake.clone());
+    let _ = app.update(super::Message::Net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    }));
+    assert!(fake.log().iter().all(|s| !matches!(s, Sent::Resync)));
+}
+
+#[tokio::test]
+async fn archived_chats_are_hidden_listed_and_unarchivable() {
+    let mut h = Harness::new().await;
+    assert_eq!(h.app.chats.archived_count(), 2);
+    let main = h.app.chats.filtered_view("", &Filter::All, false);
+    assert!(main.iter().all(|e| !e.meta.archived));
+    assert_eq!(main.len(), 10);
+
+    h.ui(Ui::OpenArchived).await;
+    assert!(h.app.archived_view);
+    let archived = h.app.chats.filtered_view("", &Filter::All, true);
+    assert_eq!(archived.len(), 2);
+
+    // An archived chat opens like any other.
+    h.ui(Ui::OpenChat(ARCHIVED_GROUP.into())).await;
+    assert_eq!(
+        h.app.open.as_ref().map(|c| c.chat.as_str()),
+        Some(ARCHIVED_GROUP)
+    );
+
+    // Unarchive from the context menu: synced to the phone, persisted, listed.
+    h.ui(Ui::ToggleArchive(ARCHIVED_GROUP.into())).await;
+    assert!(h.fake.log().contains(&Sent::Archive {
+        chat: ARCHIVED_GROUP.into(),
+        archived: false
+    }));
+    assert_eq!(h.app.chats.archived_count(), 1);
+    let rows = h.app.store.chat_rows().unwrap();
+    assert!(
+        !rows
+            .iter()
+            .find(|r| r.meta.id == ARCHIVED_GROUP)
+            .unwrap()
+            .meta
+            .archived
+    );
+
+    h.ui(Ui::CloseArchived).await;
+    assert!(!h.app.archived_view);
+    assert_eq!(h.app.chats.filtered_view("", &Filter::All, false).len(), 11);
+
+    // Archive another one.
+    h.ui(Ui::ToggleArchive(MARCOS.into())).await;
+    assert!(h.fake.log().contains(&Sent::Archive {
+        chat: MARCOS.into(),
+        archived: true
+    }));
+    assert!(h.app.chats.get(MARCOS).unwrap().meta.archived);
+}
+
+#[tokio::test]
+async fn archive_done_on_the_phone_arrives_through_app_state() {
+    let mut h = Harness::new().await;
+    h.net(Event::ChatFlag {
+        chat: MARCOS.into(),
+        flag: ChatFlag::Archived(true),
+    })
+    .await;
+    assert!(h.app.chats.get(MARCOS).unwrap().meta.archived);
+    assert!(
+        h.app
+            .store
+            .chat_rows()
+            .unwrap()
+            .iter()
+            .any(|r| r.meta.id == MARCOS && r.meta.archived)
+    );
+    // The phone does not get an echo of its own change.
+    assert!(
+        h.fake
+            .log()
+            .iter()
+            .all(|s| !matches!(s, Sent::Archive { .. }))
+    );
+    h.net(Event::ChatFlag {
+        chat: MARCOS.into(),
+        flag: ChatFlag::Archived(false),
+    })
+    .await;
+    assert!(!h.app.chats.get(MARCOS).unwrap().meta.archived);
+}
+
+#[tokio::test]
+async fn a_failed_archive_is_reverted_with_a_message() {
+    let mut h = Harness::with(FakeOptions {
+        auto_receipts: false,
+        fail_sends: true,
+        ..FakeOptions::default()
+    })
+    .await;
+    h.ui(Ui::ToggleArchive(MARCOS.into())).await;
+    assert!(!h.app.chats.get(MARCOS).unwrap().meta.archived, "reverted");
+    assert!(h.app.toast.is_some());
+    assert!(
+        !h.app
+            .store
+            .chat_rows()
+            .unwrap()
+            .iter()
+            .any(|r| r.meta.id == MARCOS && r.meta.archived)
+    );
+}
+
+#[tokio::test]
+async fn at_most_three_chats_can_be_pinned() {
+    let mut h = Harness::new().await;
+    // The showcase chat is already pinned.
+    assert_eq!(h.app.chats.pinned_count(), 1);
+    for chat in [MARCOS, PABLO] {
+        h.ui(Ui::TogglePin(chat.into())).await;
+    }
+    assert_eq!(h.app.chats.pinned_count(), 3);
+    h.ui(Ui::TogglePin(CLINIC.into())).await;
+    assert_eq!(h.app.chats.pinned_count(), 3);
+    assert!(
+        h.app
+            .toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("pin up to 3")
+    );
+    let pins = h
+        .fake
+        .log()
+        .into_iter()
+        .filter(|s| matches!(s, Sent::Pin { .. }))
+        .count();
+    assert_eq!(pins, 2);
+    // Unpinning works at the limit.
+    h.ui(Ui::TogglePin(MARCOS.into())).await;
+    assert_eq!(h.app.chats.pinned_count(), 2);
+    assert!(h.fake.log().contains(&Sent::Pin {
+        chat: MARCOS.into(),
+        pinned: false
+    }));
+}
+
+#[tokio::test]
+async fn lists_from_the_phone_become_chips_with_members() {
+    let h = Harness::new().await;
+    let names: Vec<_> = h.app.chats.custom_lists().map(|l| l.name.clone()).collect();
+    assert_eq!(names, ["Familia", "Trabajo", "Viajes"]);
+    assert!(h.app.chats.in_list("1", "120363000000000001@g.us"));
+    // Persisted in the cache too.
+    let (defs, members) = h.app.store.load_lists().unwrap();
+    assert_eq!(defs.len(), 4);
+    assert!(members.contains(&("2".into(), "120363000000000002@g.us".into())));
+}
+
+#[tokio::test]
+async fn creating_renaming_and_deleting_a_list_syncs_to_the_phone() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::NewList).await;
+    assert!(h.app.list_dialog.is_some());
+    h.ui(Ui::ListName("Amigos".into())).await;
+    h.ui(Ui::SaveList).await;
+    assert!(h.app.list_dialog.is_none());
+    let created = h
+        .app
+        .chats
+        .custom_lists()
+        .find(|l| l.name == "Amigos")
+        .cloned()
+        .expect("list created");
+    assert_eq!(
+        created.id, "4",
+        "next free number after the lists 1, 2 and 3"
+    );
+    assert_eq!(
+        h.app.filter,
+        Filter::List(created.id.clone()),
+        "opens the new list"
+    );
+    assert!(h.fake.log().contains(&Sent::SaveList(created.clone())));
+    assert!(
+        h.app
+            .store
+            .load_lists()
+            .unwrap()
+            .0
+            .iter()
+            .any(|l| l.name == "Amigos")
+    );
+
+    // Add a chat to it: membership is synced and the filter shows it.
+    h.ui(Ui::ToggleInList {
+        chat: MARCOS.into(),
+        list: created.id.clone(),
+    })
+    .await;
+    assert!(h.fake.log().contains(&Sent::ListMember {
+        list: created.id.clone(),
+        chat: MARCOS.into(),
+        member: true
+    }));
+    let rows = h.app.chats.filtered_view("", &h.app.filter, false);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].meta.id, MARCOS);
+    h.ui(Ui::ToggleInList {
+        chat: MARCOS.into(),
+        list: created.id.clone(),
+    })
+    .await;
+    assert!(
+        h.app
+            .chats
+            .filtered_view("", &h.app.filter, false)
+            .is_empty()
+    );
+
+    // Rename.
+    h.ui(Ui::RenameList(created.id.clone())).await;
+    h.ui(Ui::ListName("Colegas".into())).await;
+    h.ui(Ui::SaveList).await;
+    assert_eq!(h.app.chats.list(&created.id).unwrap().name, "Colegas");
+    assert!(
+        h.fake
+            .log()
+            .iter()
+            .any(|s| matches!(s, Sent::SaveList(d) if d.id == created.id && d.name == "Colegas"))
+    );
+
+    // Delete.
+    h.ui(Ui::AskDeleteList(created.id.clone())).await;
+    h.ui(Ui::ConfirmDeleteList(created.id.clone())).await;
+    assert!(h.app.chats.list(&created.id).is_none());
+    assert_eq!(h.app.filter, Filter::All);
+    assert!(h.fake.log().contains(&Sent::DeleteList(created.id.clone())));
+    assert!(
+        h.app
+            .store
+            .load_lists()
+            .unwrap()
+            .0
+            .iter()
+            .all(|l| l.id != created.id)
+    );
+}
+
+#[tokio::test]
+async fn duplicate_and_empty_list_names_are_refused() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::NewList).await;
+    h.ui(Ui::ListName("familia".into())).await;
+    h.ui(Ui::SaveList).await;
+    assert!(h.app.list_dialog.is_some(), "dialog stays open");
+    assert!(
+        h.app
+            .toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("already exists")
+    );
+    h.ui(Ui::ListName("   ".into())).await;
+    h.ui(Ui::SaveList).await;
+    assert!(h.app.list_dialog.is_some());
+    assert!(h.fake.log().iter().all(|s| !matches!(s, Sent::SaveList(_))));
+}
+
+#[tokio::test]
+async fn list_edits_from_the_phone_update_chips_live() {
+    let mut h = Harness::new().await;
+    h.net(Event::ListEdit {
+        def: ListDef {
+            id: "9".into(),
+            name: "Nuevo".into(),
+            kind: ListKind::Custom,
+            order: 9,
+            ..Default::default()
+        },
+        deleted: false,
+    })
+    .await;
+    assert!(h.app.chats.custom_lists().any(|l| l.name == "Nuevo"));
+    h.ui(Ui::Filter(Filter::List("9".into()))).await;
+    h.net(Event::ListEdit {
+        def: ListDef {
+            id: "9".into(),
+            ..Default::default()
+        },
+        deleted: true,
+    })
+    .await;
+    assert!(h.app.chats.list("9").is_none());
+    assert_eq!(h.app.filter, Filter::All, "the open list was deleted");
+}
+
+#[tokio::test]
+async fn favourites_sync_through_the_phones_list_when_there_is_one() {
+    let mut h = Harness::new().await;
+    // The mock phone has a Favourites list with the showcase chat and Mamá.
+    assert!(h.app.chats.is_favourite(SHOWCASE_CHAT));
+    assert_eq!(h.app.chats.filtered("", Filter::Favourites).len(), 2);
+    h.ui(Ui::ToggleFavourite(MARCOS.into())).await;
+    assert!(h.app.chats.is_favourite(MARCOS));
+    assert!(h.fake.log().contains(&Sent::ListMember {
+        list: "fav".into(),
+        chat: MARCOS.into(),
+        member: true
+    }));
+    h.ui(Ui::ToggleFavourite(SHOWCASE_CHAT.into())).await;
+    assert!(!h.app.chats.is_favourite(SHOWCASE_CHAT));
+}
+
+#[tokio::test]
+async fn context_menus_remember_where_they_were_opened() {
+    let mut h = Harness::new().await;
+    crate::app::input::set(iced::Point::new(120.0, 300.0));
+    h.ui(Ui::ChatMenu(MARCOS.into())).await;
+    let m = h.app.sidebar_menu.clone().unwrap();
+    assert_eq!(m.target, MenuTarget::Chat(MARCOS.into()));
+    assert_eq!(m.at, iced::Point::new(120.0, 300.0));
+    h.ui(Ui::ChipMenu("1".into())).await;
+    assert_eq!(
+        h.app.sidebar_menu.as_ref().unwrap().target,
+        MenuTarget::Chip("1".into())
+    );
+    // Escape closes the menu before anything else.
+    h.ui(Ui::CloseChat).await;
+    assert!(h.app.sidebar_menu.is_none());
+}
+
+#[tokio::test]
+async fn only_web_links_are_opened() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenLink("file:///etc/passwd".into())).await;
+    assert!(
+        h.app
+            .toast
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cannot be opened")
+    );
+}
+
+#[tokio::test]
+async fn a_message_push_name_does_not_replace_the_saved_name_in_the_list() {
+    let mut h = Harness::new().await;
+    let mut msg = h.app.chats.get(MARCOS).unwrap().last.clone().unwrap();
+    msg.id = "NEWMSG".into();
+    msg.sender_name = Some("Marquitos".into());
+    msg.from_me = false;
+    msg.timestamp += 10;
+    h.net(Event::Messages {
+        messages: vec![msg],
+        origin: crate::net::Origin::Live,
+    })
+    .await;
+    assert_eq!(h.app.chats.display_name(MARCOS), "Marcos Díaz");
+}

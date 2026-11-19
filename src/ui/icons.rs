@@ -1,10 +1,13 @@
 //! Lucide icons (ISC licence, see assets/icons/LICENSE), embedded with
 //! `include_bytes!`. Generated from the files in `assets/icons/`.
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use iced::widget::svg;
 
 /// Every icon the UI uses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Icon {
     /// `archive`
     Archive,
@@ -96,6 +99,18 @@ pub enum Icon {
     SmilePlus,
     /// `x`
     X,
+    /// `external-link`
+    ExternalLink,
+    /// `maximize`
+    Maximize,
+    /// `minimize`
+    Minimize,
+    /// `rotate-ccw`
+    RotateCcw,
+    /// `volume-2`
+    Volume2,
+    /// `volume-x`
+    VolumeX,
 }
 
 impl Icon {
@@ -146,11 +161,27 @@ impl Icon {
             Icon::Reply => include_bytes!("../../assets/icons/reply.svg"),
             Icon::SmilePlus => include_bytes!("../../assets/icons/smile-plus.svg"),
             Icon::X => include_bytes!("../../assets/icons/x.svg"),
+            Icon::ExternalLink => include_bytes!("../../assets/icons/external-link.svg"),
+            Icon::Maximize => include_bytes!("../../assets/icons/maximize.svg"),
+            Icon::Minimize => include_bytes!("../../assets/icons/minimize.svg"),
+            Icon::RotateCcw => include_bytes!("../../assets/icons/rotate-ccw.svg"),
+            Icon::Volume2 => include_bytes!("../../assets/icons/volume-2.svg"),
+            Icon::VolumeX => include_bytes!("../../assets/icons/volume-x.svg"),
         }
     }
 
-    /// An svg handle; iced caches the rasterisation by content hash.
+    /// The svg handle of this icon, created once and cloned afterwards
+    /// (a handle built per frame would be re-hashed and, were its id not
+    /// content-derived, re-rasterised on every redraw).
     pub fn handle(self) -> svg::Handle {
-        svg::Handle::from_memory(self.bytes())
+        static CACHE: OnceLock<Mutex<HashMap<Icon, svg::Handle>>> = OnceLock::new();
+        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+        match cache.lock() {
+            Ok(mut m) => m
+                .entry(self)
+                .or_insert_with(|| svg::Handle::from_memory(self.bytes()))
+                .clone(),
+            Err(_) => svg::Handle::from_memory(self.bytes()),
+        }
     }
 }
