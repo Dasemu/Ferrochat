@@ -1,0 +1,616 @@
+//! Live protocol client on top of `whatsapp-rust`.
+//!
+//! * The library's Signal/session state lives in a SQLCipher database
+//!   (`session.sqlcipher`). Its 256-bit raw key is generated on first run and
+//!   kept in the OS keyring (see [`crate::auth::secrets::signal_store_key`]),
+//!   so only ciphertext touches the disk.
+//! * Library events are forwarded through a channel and converted to
+//!   [`super::Event`]s by the pure functions in [`super::convert`].
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use diesel::RunQueryDsl;
+use futures::future::BoxFuture;
+use futures::stream::Stream;
+use tokio::sync::mpsc;
+use whatsapp_rust::bot::{Bot, BotHandle};
+use whatsapp_rust::download::{DownloadParams, MediaType};
+use whatsapp_rust::prelude::{Event as WaEvent, EventHandler};
+use whatsapp_rust::send::SendOptions;
+use whatsapp_rust::upload::UploadOptions;
+use whatsapp_rust::wacore::store::DevicePropsOverride;
+use whatsapp_rust::{Client, Jid};
+use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
+
+use super::convert::{self, Envelope, Uploaded};
+use super::types::{Content, MediaKind, MediaRef, Origin, OutgoingKind, OutgoingMedia};
+use super::{Connection, Event, WaClient};
+use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
+use crate::error::{Error, MaskedJid, Result};
+use zeroize::Zeroizing;
+
+/// Live client handle.
+pub struct RealClient {
+    client: Arc<Client>,
+    handle: Mutex<Option<BotHandle>>,
+    signal_db: PathBuf,
+}
+
+fn parse_jid(s: &str) -> Result<Jid> {
+    s.parse::<Jid>()
+        .map_err(|e| Error::Protocol(format!("invalid jid {}: {e}", MaskedJid(s))))
+}
+
+fn media_type(kind: MediaKind) -> MediaType {
+    match kind {
+        MediaKind::Image => MediaType::Image,
+        MediaKind::Document => MediaType::Document,
+        MediaKind::Audio => MediaType::Audio,
+    }
+}
+
+impl WaClient for RealClient {
+    fn send_text<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            self.client
+                .send_message_with_options(
+                    jid,
+                    convert::build_text(text),
+                    SendOptions::default().with_message_id(id),
+                )
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(())
+        })
+    }
+
+    fn send_media<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        media: OutgoingMedia,
+    ) -> BoxFuture<'a, Result<Content>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let mt = match media.kind {
+                OutgoingKind::Image { .. } => MediaType::Image,
+                OutgoingKind::Document => MediaType::Document,
+                OutgoingKind::Voice { .. } => MediaType::Audio,
+            };
+            let up = self
+                .client
+                .upload(media.bytes.clone(), mt, UploadOptions::default())
+                .await
+                .map_err(|e| Error::Net(format!("upload failed: {e}")))?;
+            let uploaded = Uploaded {
+                url: up.url,
+                direct_path: up.direct_path,
+                media_key: up.media_key.to_vec(),
+                file_sha256: up.file_sha256.to_vec(),
+                file_enc_sha256: up.file_enc_sha256.to_vec(),
+                file_length: up.file_length,
+                media_key_timestamp: up.media_key_timestamp,
+                streaming_sidecar: up.streaming_sidecar,
+            };
+            let (msg, content) = convert::build_media(&media, &uploaded);
+            self.client
+                .send_message_with_options(jid, msg, SendOptions::default().with_message_id(id))
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(content)
+        })
+    }
+
+    fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>> {
+        Box::pin(async move {
+            crate::media::check_download_size(media.file_length)?;
+            let params = DownloadParams::encrypted(
+                media.direct_path.clone(),
+                &media.media_key,
+                &media.file_sha256,
+                &media.file_enc_sha256,
+                media.file_length,
+                media_type(media.kind),
+            );
+            let bytes = self
+                .client
+                .download_from_params(&params)
+                .await
+                .map_err(|e| Error::Net(format!("download failed: {e}")))?;
+            crate::media::check_download_size(bytes.len() as u64)?;
+            Ok(bytes)
+        })
+    }
+
+    fn mark_read<'a>(
+        &'a self,
+        chat: &'a str,
+        sender: Option<&'a str>,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let chat = parse_jid(chat)?;
+            let sender = sender.map(parse_jid).transpose()?;
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            self.client
+                .mark_as_read(&chat, sender.as_ref(), &ids)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn mark_played<'a>(
+        &'a self,
+        chat: &'a str,
+        sender: Option<&'a str>,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let chat = parse_jid(chat)?;
+            let sender = sender.map(parse_jid).transpose()?;
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            self.client
+                .mark_as_played(&chat, sender.as_ref(), &ids)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn logout(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            // Deregister (best effort: it cannot reach the server offline),
+            // then stop the client, and only then delete its database.
+            if tokio::time::timeout(LOGOUT_TIMEOUT, self.client.logout())
+                .await
+                .is_err()
+            {
+                tracing::warn!("logout request timed out; unlinking locally");
+            }
+            let handle = self.handle.lock().ok().and_then(|mut h| h.take());
+            if let Some(h) = handle
+                && tokio::time::timeout(LOGOUT_TIMEOUT, h.shutdown())
+                    .await
+                    .is_err()
+            {
+                tracing::warn!("client shutdown timed out");
+            }
+            remove_db(&self.signal_db)
+        })
+    }
+}
+
+/// Upper bound for the logout IQ and the client shutdown.
+pub const LOGOUT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Removes the encrypted session database and its WAL/SHM side files.
+/// Missing files are fine; any other failure is reported.
+pub fn remove_db(path: &Path) -> Result<()> {
+    let mut first_err = None;
+    for suffix in ["", "-wal", "-shm", "-journal"] {
+        let mut p = path.as_os_str().to_owned();
+        p.push(suffix);
+        match std::fs::remove_file(PathBuf::from(p)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                first_err.get_or_insert(e);
+            }
+        }
+    }
+    match first_err {
+        Some(e) => Err(Error::Io(e)),
+        None => Ok(()),
+    }
+}
+
+/// Library event handler: forwards into our channel, conversion happens on
+/// our own task so the dispatch path stays cheap.
+struct Forwarder(mpsc::UnboundedSender<Arc<WaEvent>>);
+
+impl EventHandler for Forwarder {
+    fn handle_event(&self, event: Arc<WaEvent>) {
+        let _ = self.0.send(event);
+    }
+}
+
+/// Why the session store could not be opened.
+#[derive(Debug)]
+pub enum SessionError {
+    /// The file is not decryptable with this key (SQLITE_NOTADB): the key
+    /// was lost or replaced. Only the user may decide to discard it.
+    KeyMismatch,
+    /// Anything else (I/O, permissions, busy, migrations): never a reason
+    /// to delete the session.
+    Other(Error),
+}
+
+impl std::fmt::Display for SessionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SessionError::KeyMismatch => f.write_str("session store key mismatch"),
+            SessionError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+fn pragma_key(key_hex: &str) -> Zeroizing<String> {
+    Zeroizing::new(format!("PRAGMA key = \"x'{key_hex}'\";"))
+}
+
+/// Opens the SQLCipher-encrypted session store with a hex raw key. Never
+/// deletes anything.
+pub async fn open_store(
+    path: &Path,
+    key_hex: Zeroizing<String>,
+) -> std::result::Result<SqliteStore, SessionError> {
+    if path.exists() {
+        // Fail fast on a wrong key: the library's pool would otherwise keep
+        // retrying the connection for its full timeout.
+        let (p, k) = (path.to_path_buf(), key_hex.clone());
+        tokio::task::spawn_blocking(move || verify_key(&p, &k))
+            .await
+            .map_err(|_| SessionError::Other(Error::Cancelled))??;
+    }
+    let url = path.to_string_lossy().to_string();
+    let config = SqliteStoreConfig::default().with_connection_init(move |conn| {
+        // Raw-key form: no PBKDF2 at every open, the key is already 256 random bits.
+        diesel::sql_query(pragma_key(&key_hex).as_str()).execute(conn)?;
+        // Fails here (not later) when the key does not match the file.
+        diesel::sql_query("SELECT count(*) FROM sqlite_master;").execute(conn)?;
+        Ok(())
+    });
+    SqliteStore::with_config(&url, config)
+        .await
+        .map_err(|e| SessionError::Other(Error::Auth(format!("cannot open session store: {e}"))))
+}
+
+/// Checks the key against an existing file. Only `SQLITE_NOTADB` (what
+/// SQLCipher returns for a wrong key) counts as a key mismatch.
+pub fn verify_key(path: &Path, key_hex: &str) -> std::result::Result<(), SessionError> {
+    let classify = |e: rusqlite::Error| match e.sqlite_error_code() {
+        Some(rusqlite::ErrorCode::NotADatabase) => SessionError::KeyMismatch,
+        _ => SessionError::Other(Error::Store(e)),
+    };
+    let conn = rusqlite::Connection::open(path).map_err(classify)?;
+    conn.execute_batch(&pragma_key(key_hex)).map_err(classify)?;
+    conn.query_row("SELECT count(*) FROM sqlite_master", [], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map_err(classify)?;
+    Ok(())
+}
+
+/// Starts the live client and returns its event stream. The first event is
+/// [`Event::SessionFound`] / [`Event::NoSession`], then [`Event::Ready`].
+pub fn start(
+    data_dir: PathBuf,
+    signal_db: PathBuf,
+    secrets: Arc<dyn SecretStore>,
+) -> impl Stream<Item = Event> + Send + 'static {
+    let (tx, rx) = mpsc::unbounded_channel::<Event>();
+    tokio::spawn(async move {
+        if let Err(e) = run(data_dir, signal_db, secrets, tx.clone()).await {
+            tracing::error!(error = %e, "protocol client stopped");
+            let _ = tx.send(Event::Fatal(e.user_message()));
+        }
+    });
+    futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) })
+}
+
+/// Loads the key and opens the store. Returns `Ok(None)` after emitting
+/// [`Event::SessionUnreadable`] when the user has to decide.
+pub async fn prepare_session(
+    data_dir: &Path,
+    signal_db: &Path,
+    secrets: Arc<dyn SecretStore>,
+    tx: &mpsc::UnboundedSender<Event>,
+) -> Result<Option<SqliteStore>> {
+    crate::config::secure_dir(data_dir)?;
+    let had_session = signal_db.exists();
+    let key = tokio::task::spawn_blocking(move || {
+        if had_session {
+            // Never mint a new key over an existing session: that would make
+            // it unreadable. Missing/malformed key → ask the user.
+            get_signal_store_key(secrets.as_ref())
+        } else {
+            signal_store_key(secrets.as_ref()).map(|(k, _)| Some(k))
+        }
+    })
+    .await
+    .map_err(|_| Error::Cancelled)??;
+    let Some(key) = key else {
+        let _ = tx.send(Event::SessionUnreadable(
+            "The key for your saved session is missing from the system keyring.".into(),
+        ));
+        return Ok(None);
+    };
+    let _ = tx.send(if had_session {
+        Event::SessionFound
+    } else {
+        Event::NoSession
+    });
+    let _ = tx.send(Event::Connection(Connection::Connecting));
+    match open_store(signal_db, Zeroizing::new(key.expose().to_string())).await {
+        Ok(store) => {
+            crate::config::secure_db_files(signal_db);
+            Ok(Some(store))
+        }
+        Err(SessionError::KeyMismatch) => {
+            let _ = tx.send(Event::SessionUnreadable(
+                "Your saved session cannot be decrypted with the key in the system keyring.".into(),
+            ));
+            Ok(None)
+        }
+        Err(SessionError::Other(e)) => Err(e),
+    }
+}
+
+async fn run(
+    data_dir: PathBuf,
+    signal_db: PathBuf,
+    secrets: Arc<dyn SecretStore>,
+    tx: mpsc::UnboundedSender<Event>,
+) -> Result<()> {
+    let Some(store) = prepare_session(&data_dir, &signal_db, secrets, &tx).await? else {
+        // Wait for the UI to restart us after the user decided.
+        tx.closed().await;
+        return Ok(());
+    };
+
+    let (wa_tx, mut wa_rx) = mpsc::unbounded_channel::<Arc<WaEvent>>();
+    let bot = Bot::builder()
+        .with_backend(store)
+        .with_device_props(DevicePropsOverride::new().with_os("Ferrochat"))
+        .with_event_handler(Forwarder(wa_tx))
+        .build()
+        .await
+        .map_err(|e| Error::Protocol(format!("client setup failed: {e}")))?;
+    let client = bot.client();
+    let handle = bot.spawn();
+    let real = Arc::new(RealClient {
+        client: client.clone(),
+        handle: Mutex::new(Some(handle)),
+        signal_db: signal_db.clone(),
+    });
+    let _ = tx.send(Event::Ready(real.clone()));
+
+    let mut attempt = 0u32;
+    loop {
+        tokio::select! {
+            _ = tx.closed() => {
+                // The UI dropped the subscription (logout / reload / exit).
+                let handle = real.handle.lock().ok().and_then(|mut h| h.take());
+                if let Some(h) = handle {
+                    let _ = tokio::time::timeout(LOGOUT_TIMEOUT, h.shutdown()).await;
+                }
+                return Ok(());
+            }
+            ev = wa_rx.recv() => {
+                let Some(ev) = ev else { return Ok(()) };
+                let terminal = is_terminal(&ev);
+                for out in translate(&ev, &client, &mut attempt) {
+                    if tx.send(out).is_err() {
+                        break;
+                    }
+                }
+                if terminal {
+                    // Stop the library's own reconnect loop; the app decides
+                    // (backoff / user retry / re-pair).
+                    let handle = real.handle.lock().ok().and_then(|mut h| h.take());
+                    if let Some(h) = handle {
+                        let _ = tokio::time::timeout(LOGOUT_TIMEOUT, h.shutdown()).await;
+                    }
+                    tx.closed().await;
+                    return Ok(());
+                }
+            }
+        }
+    }
+}
+
+/// Events after which the library must not keep reconnecting on its own.
+fn is_terminal(ev: &WaEvent) -> bool {
+    match ev {
+        WaEvent::StreamReplaced(_)
+        | WaEvent::LoggedOut(_)
+        | WaEvent::TemporaryBan(_)
+        | WaEvent::ClientOutdated(_) => true,
+        WaEvent::ConnectFailure(f) => !f.reason.should_reconnect(),
+        _ => false,
+    }
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Max messages / chats per event, so the UI applies a big history sync in
+/// slices between frames instead of freezing.
+pub const HISTORY_CHUNK: usize = 500;
+
+/// Splits a converted history blob into small events.
+pub fn history_events(parts: convert::HistoryParts, progress: Option<u32>) -> Vec<Event> {
+    let mut v = Vec::new();
+    if !parts.lid_pairs.is_empty() {
+        v.push(Event::LidMappings(parts.lid_pairs));
+    }
+    let mut chats = parts.chats.chunks(HISTORY_CHUNK).peekable();
+    let mut first = true;
+    while chats.peek().is_some() || first {
+        let chunk = chats.next().map(<[_]>::to_vec).unwrap_or_default();
+        v.push(Event::History {
+            chats: chunk,
+            names: if first {
+                parts.names.clone()
+            } else {
+                Vec::new()
+            },
+            progress,
+        });
+        first = false;
+    }
+    for chunk in parts.messages.chunks(HISTORY_CHUNK) {
+        v.push(Event::Messages {
+            messages: chunk.to_vec(),
+            origin: Origin::History,
+        });
+    }
+    v
+}
+
+/// Library event → zero or more app events.
+fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
+    match ev {
+        WaEvent::PairingQrCode(q) => vec![Event::Qr {
+            code: q.code.clone(),
+            valid_for_secs: q.timeout.as_secs(),
+        }],
+        WaEvent::PairingQrCodesExhausted(_) => vec![Event::QrExhausted],
+        WaEvent::PairSuccess(p) => vec![Event::PairSuccess {
+            jid: convert::bare_jid(&p.id.to_string()),
+        }],
+        WaEvent::PairError(p) => vec![Event::PairError(p.error.clone())],
+        WaEvent::Connected(_) => {
+            *attempt = 0;
+            vec![
+                Event::Connection(Connection::Connected),
+                Event::Connected {
+                    jid: client.pn().map(|j| convert::bare_jid(&j.to_string())),
+                },
+            ]
+        }
+        WaEvent::Disconnected(_) | WaEvent::StreamError(_) => {
+            *attempt += 1;
+            vec![Event::Connection(Connection::Reconnecting {
+                attempt: *attempt,
+            })]
+        }
+        WaEvent::ConnectFailure(f) => {
+            if f.reason.is_logged_out() {
+                vec![Event::LoggedOut {
+                    reason: "WhatsApp ended this session. Link the device again.".into(),
+                }]
+            } else if f.reason.should_reconnect() {
+                *attempt += 1;
+                vec![Event::Connection(Connection::Reconnecting {
+                    attempt: *attempt,
+                })]
+            } else {
+                vec![Event::Connection(Connection::Offline {
+                    reason: format!("WhatsApp refused the connection ({:?}).", f.reason),
+                })]
+            }
+        }
+        WaEvent::LoggedOut(l) => vec![Event::LoggedOut {
+            reason: format!("This device was unlinked ({:?}).", l.reason),
+        }],
+        // Not a logout: the session is still valid, another client took the
+        // stream. Never wipe anything here.
+        WaEvent::StreamReplaced(_) => vec![Event::Connection(Connection::Replaced)],
+        WaEvent::TemporaryBan(_) => vec![Event::Fatal(
+            "WhatsApp temporarily banned this account. Third-party clients break WhatsApp's \
+             terms of service."
+                .into(),
+        )],
+        WaEvent::ClientOutdated(_) => vec![Event::Fatal(
+            "WhatsApp rejected this client version. Update Ferrochat.".into(),
+        )],
+        WaEvent::Messages(batch) => {
+            let drained = !matches!(batch.origin, whatsapp_rust::prelude::BatchOrigin::Live)
+                || batch.messages.iter().any(|m| m.info.is_offline);
+            let mut out = Vec::new();
+            let mut pairs = Vec::new();
+            for m in batch.messages.iter() {
+                let info = &m.info;
+                let env = Envelope {
+                    id: info.id.to_string(),
+                    chat: info.source.chat.to_string(),
+                    sender: info.source.sender.to_string(),
+                    from_me: info.source.is_from_me,
+                    push_name: info.push_name.to_string(),
+                    timestamp: info.timestamp.timestamp(),
+                    sender_alt: info.source.sender_alt.as_ref().map(|j| j.to_string()),
+                    recipient_alt: info.source.recipient_alt.as_ref().map(|j| j.to_string()),
+                    ephemeral_secs: info.ephemeral_expiration,
+                };
+                pairs.extend(env.lid_pairs());
+                if let Some(target) = convert::revoked_target(&m.message) {
+                    // The revoker is `sender`; the store only applies it to a
+                    // message from that same sender.
+                    out.push(super::Message {
+                        id: target,
+                        content: Content::Deleted,
+                        ..match convert::message_from_envelope(&env, &m.message) {
+                            Some(msg) => msg,
+                            None => continue,
+                        }
+                    });
+                } else if let Some(msg) = convert::message_from_envelope(&env, &m.message) {
+                    out.push(msg);
+                }
+            }
+            let mut v = Vec::new();
+            if !pairs.is_empty() {
+                v.push(Event::LidMappings(pairs));
+            }
+            if !out.is_empty() {
+                v.push(Event::Messages {
+                    messages: out,
+                    origin: if drained {
+                        Origin::Offline
+                    } else {
+                        Origin::Live
+                    },
+                });
+            }
+            v
+        }
+        WaEvent::Receipt(r) => {
+            let chat = convert::bare_jid(&r.source.chat.to_string());
+            if convert::is_self_read(&r.r#type) {
+                return vec![Event::ChatRead { chat }];
+            }
+            match convert::receipt_status(&r.r#type) {
+                Some(status) => vec![Event::Receipt {
+                    chat,
+                    ids: r.message_ids.iter().map(|i| i.to_string()).collect(),
+                    status,
+                }],
+                None => vec![],
+            }
+        }
+        WaEvent::HistorySync(lazy) => match lazy.get() {
+            Some(hs) => history_events(convert::from_history(hs, now_secs()), lazy.progress()),
+            None => vec![],
+        },
+        WaEvent::PushNameUpdate(p) => vec![Event::ContactName {
+            jid: convert::bare_jid(&p.jid.to_string()),
+            name: p.new_push_name.clone(),
+        }],
+        WaEvent::ContactUpdate(c) => match c
+            .action
+            .full_name
+            .clone()
+            .or_else(|| c.action.first_name.clone())
+        {
+            Some(name) if !name.is_empty() => vec![Event::ContactName {
+                jid: convert::bare_jid(&c.jid.to_string()),
+                name,
+            }],
+            _ => vec![],
+        },
+        WaEvent::MarkChatAsReadUpdate(m) if m.action.read == Some(true) => {
+            vec![Event::ChatRead {
+                chat: convert::bare_jid(&m.jid.to_string()),
+            }]
+        }
+        _ => vec![],
+    }
+}

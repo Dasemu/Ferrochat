@@ -1,0 +1,59 @@
+{
+  "sync_type": "INITIAL_BOOTSTRAP",
+  "conversations": [
+    {
+      "id": "34600111222@s.whatsapp.net",
+      "messages": [
+        {
+          "message": {
+            "key": {
+              "remote_jid": "34600111222@s.whatsapp.net",
+              "from_me": true,
+              "id": "3EB0HIST0001"
+            },
+            "message": {
+              "conversation": "See you tomorrow"
+            },
+            "message_timestamp": 1700000400,
+            "status": "READ"
+          },
+          "msg_order_id": 1
+        },
+        {
+          "message": {
+            "key": {
+              "remote_jid": "34600111222@s.whatsapp.net",
+              "from_me": false,
+              "id": "3EB0HIST0002"
+            },
+            "message": {
+              "conversation": "Great!"
+            },
+            "message_timestamp": 1700000500,
+            "push_name": "Ana"
+          },
+          "msg_order_id": 2
+        }
+      ],
+      "unread_count": 2,
+      "conversation_timestamp": 1700000500,
+      "pinned": 1700000000
+    },
+    {
+      "id": "120363000000000009@g.us",
+      "name": "Book club",
+      "archived": true,
+      "mute_end_time": 4000000000
+    },
+    {
+      "id": "status@broadcast"
+    }
+  ],
+  "progress": 40,
+  "pushnames": [
+    {
+      "id": "34600111222@s.whatsapp.net",
+      "pushname": "Ana"
+    }
+  ]
+}
