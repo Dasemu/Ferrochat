@@ -84,3 +84,25 @@ next change.
   the bundled source (`LIBOPUS_NO_PKG=1`) to get a static link.
 * Version sync must be a real merge of main into development (simulated in
   `.github/scripts/version.sh`), or the second release conflicts.
+
+## Tray / background mode
+
+* `ksni` 0.3 depends on zbus 5, which the tree already had (via `rfd`/`ashpd`
+  and the keyring); `notify-rust` brings zbus 6. Two zbus versions are
+  pre-existing, adding the tray did not add a third.
+* `ksni::spawn` fails when no StatusNotifierWatcher is on the bus. That result
+  is the only trustworthy "is there a tray" signal; the window mode must be
+  decided from it, never assumed. Watch `watcher_offline` too and reopen the
+  window if the panel dies while hidden.
+* `iced::daemon` stays alive with zero windows and drops the compositor when
+  the last window closes. Set `exit_on_close_request: false` on the window and
+  route `close_requests()` through the state machine.
+* After the window is closed glibc keeps the freed pages; `malloc_trim(0)`
+  gives them back (a few MB). The font system and the app state dominate the
+  remaining resident size.
+* zbus proxies cache properties by default and ksni announces changes with
+  `New*` signals, not `PropertiesChanged`: build the test proxy with
+  `CacheProperties::No`.
+* `xdotool windowclose` destroys the window, it does not send
+  `WM_DELETE_WINDOW`; to test close requests under Xvfb send the client
+  message yourself.

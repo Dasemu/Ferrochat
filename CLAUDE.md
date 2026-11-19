@@ -9,7 +9,8 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings> docs/screenshots/<name>.png`
+- Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
 ## Architecture
@@ -52,5 +53,8 @@ entry id: `dev.ferro.ferrochat`.
   they race the cache write and are lost.
 - Group ticks: per-participant receipts are stored; blue only when all read.
 - iced style fns returning `impl Fn` need `+ use<>` (edition 2024 captures).
+- The app is an `iced::daemon`: the main window is opened by `App::boot` / `background.rs`,
+  hiding to the tray CLOSES it (frees the renderer). Never leave the process running with no
+  window and no tray (`app/window.rs` invariant). `ksni` must stay on zbus 5 (shared with ashpd).
 - Keep iced default features on (x11/wayland backends).
 - No Secret Service in CI: tests use `MemoryStore`.

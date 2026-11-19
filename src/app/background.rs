@@ -35,6 +35,22 @@ impl WindowGeom {
     }
 }
 
+/// Returns freed heap pages to the OS (glibc keeps them otherwise, so the
+/// resident size would not drop after the window and its surfaces are gone).
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim_memory() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: `malloc_trim` takes no pointers and is safe to call at any time.
+    unsafe {
+        malloc_trim(0);
+    }
+}
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn trim_memory() {}
+
 /// Maps a tray click / menu entry to the message that handles it.
 impl From<TrayCmd> for Message {
     fn from(cmd: TrayCmd) -> Self {
@@ -152,6 +168,9 @@ impl App {
 
     pub(super) fn on_window_closed(&mut self, id: window::Id) -> Task<Message> {
         if Some(id) != self.window_id {
+            // Our own close (hide to tray): hand the renderer's freed pages
+            // back to the OS.
+            trim_memory();
             return Task::none();
         }
         self.window_id = None;
