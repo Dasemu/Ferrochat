@@ -5,7 +5,23 @@ use std::path::Path;
 
 use crate::config::{APP_ID, NotificationPreview};
 
+/// Escapes `&`, `<`, `>` (KDE / GNOME interpret a subset of HTML markup in
+/// notification text).
+pub fn escape_markup(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Builds the notification `(summary, body)` following the privacy setting.
+/// Both are markup-escaped.
 pub fn notification_text(
     sender: &str,
     group: Option<&str>,
@@ -20,7 +36,7 @@ pub fn notification_text(
         NotificationPreview::SenderAndPreview => preview.chars().take(160).collect(),
         NotificationPreview::SenderOnly => "New message".to_string(),
     };
-    (summary, body)
+    (escape_markup(&summary), escape_markup(&body))
 }
 
 /// Shows a notification. Blocking (D-Bus round trip): call from
@@ -93,6 +109,18 @@ mod tests {
         );
         assert_eq!(s, "Ana @ Family");
         assert_eq!(b, "hello");
+    }
+
+    #[test]
+    fn markup_is_escaped() {
+        let (s, b) = notification_text(
+            "<b>Eve</b>",
+            None,
+            "a & b <a href=x>click</a>",
+            NotificationPreview::SenderAndPreview,
+        );
+        assert_eq!(s, "&lt;b&gt;Eve&lt;/b&gt;");
+        assert_eq!(b, "a &amp; b &lt;a href=x&gt;click&lt;/a&gt;");
     }
 
     #[test]
