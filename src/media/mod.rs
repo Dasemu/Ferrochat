@@ -4,6 +4,8 @@
 pub mod audio;
 pub mod avatar;
 pub mod image;
+pub mod video;
+pub mod video_proto;
 
 use std::borrow::Borrow;
 use std::hash::Hash;

@@ -27,6 +27,20 @@ pub fn view_window(app: &App, _window: iced::window::Id) -> El<'_> {
 /// Root view dispatcher.
 pub fn view(app: &App) -> El<'_> {
     let t = &app.theme;
+    // While a video plays, only the viewer is built: it covers the window,
+    // and rebuilding the chat list and conversation for every video frame
+    // would cost far more than decoding it.
+    if let Some(v) = &app.video {
+        let mut layers = vec![chat::video_viewer(app, v)];
+        if let Some(msg) = &app.toast {
+            layers.push(toast(t, msg));
+        }
+        return container(stack(layers))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::solid(t.palette.bg_app))
+            .into();
+    }
     let base: El<'_> = if app.auth.shows_login() {
         login::view(app)
     } else {
@@ -53,8 +67,14 @@ pub fn view(app: &App) -> El<'_> {
         .into()
     };
     let mut layers = vec![base];
+    if let Some(menu) = sidebar::context_menu(app) {
+        layers.push(menu);
+    }
     if let Some(id) = &app.viewer {
         layers.push(chat::viewer(app, id));
+    }
+    if let Some(d) = sidebar::list_dialog(app) {
+        layers.push(d);
     }
     if let Some(d) = chat::dialog(app) {
         layers.push(d);

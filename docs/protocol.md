@@ -59,7 +59,12 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `Presence` | `Presence { jid, online, last_seen }` | "online" / "last seen …" under the contact name |
 | `PictureUpdate` | `PictureChanged { jid }` | drops the cached picture and refetches |
 | `DeleteMessageForMeUpdate` | `DeletedForMe { chat, id }` | removes the message from the cache |
-| `PushNameUpdate`, `ContactUpdate` | `ContactName` | display names |
+| `PushNameUpdate` | `ContactName { source: Push }` | the name the contact chose (shown "~ Name") |
+| `ContactUpdate` (app-state `contact`) | `ContactName { source: Saved }` for the phone and LID ids, `LidMappings` | the name saved in the phone's address book |
+| `BusinessStatusUpdate`, `verified_name` on a message | `ContactName { source: Business }` | verified business name |
+| `ArchiveUpdate`, `PinUpdate`, `MuteUpdate` (app-state `archive`, `pin_v1`, `mute`) | `ChatFlag` | archive / pin / mute applied, persisted |
+| `LabelEditUpdate` (app-state `label_edit`) | `ListEdit` | list created / renamed / deleted |
+| `LabelAssociationUpdate` (`label_jid`) | `ListChat` | chat added to / removed from a list |
 | `MarkChatAsReadUpdate` | `ChatRead` | badge cleared |
 
 Reactions, edits and "delete for me" events wait until the message batch that
@@ -77,8 +82,12 @@ messages carry `expires_at` and are pruned from the cache when it passes.
 phone": their media reference is never exposed, downloaded or stored.
 `videoMessage` (and round video notes) show the inline JPEG thumbnail and the
 duration; a click downloads the file (capped at 100 MB) into the cache
-directory and opens it with the system player (`open` crate, extension from an
-allowlist). `stickerMessage` is downloaded (cap 2 MB, 1 Mpx), decoded to RGBA
+directory and plays it in the in-app viewer (§6.1). "Open externally"
+(message menu, or the viewer) hands the file to the system player (`open`
+crate, extension from an allowlist). `extendedTextMessage` with a `title`
+and an http(s) `matchedText` becomes a text message with the sender's link
+preview (title, description, inline thumbnail); previews are never fetched
+on our side, like the official clients. `stickerMessage` is downloaded (cap 2 MB, 1 Mpx), decoded to RGBA
 and drawn statically; animated stickers show their first frame. Locations,
 contacts and polls show an "unsupported" placeholder; key distribution
 messages are not bubbles. Replies come from `contextInfo` (`stanzaId`,
@@ -103,7 +112,73 @@ The 10 s / 5 s typing timings and the 15 min / 2.5 day windows follow what
 WhatsApp Web does as far as we know; they are constants in `app/live.rs` and
 `net/types.rs` and have not been checked against a live account.
 
-### 2.2 Group ticks
+### 2.2 Contact names
+
+The user sees the name saved in the phone's address book, as WhatsApp
+Desktop does. The phone is the only source of those names; a linked device
+receives them through **app-state sync**: `contact` mutations (index
+`["contact", jid]`, value `ContactAction { fullName, firstName, lidJid,
+pnJid }`) in the `critical_unblock_low` collection. `whatsapp-rust` decodes
+them into `Event::ContactUpdate`; Ferrochat stores them by source in the
+`contact_names (jid, source, name)` table (`Push` 1, `Business` 2, `Saved` 3)
+and shows, in this order:
+
+1. saved name (full name, else first name),
+2. business verified name,
+3. push name, marked `~ Name` (people who are not contacts),
+4. a name the chat record itself carries (history sync),
+5. the number, grouped (`+34 600 111 222`).
+
+Groups show their subject; the same order applies to chat list rows, the
+conversation header, group sender names, quotes, reaction lists and
+`@mentions` in text (a mention shows the person's name instead of the number).
+A push name carried by a message never replaces a saved name (that was the
+bug: all sources shared one map and the last writer won). A `ContactAction`
+carries both the phone-number and the LID id: the name is stored under both
+and the pair is learned.
+
+**Existing sessions.** A session linked before this was implemented already
+holds the collections at their latest version, so the contact mutations are
+never replayed. On the first connection of a cache that has no
+`appstate_resync` marker the app calls `Client::process_sync_task(
+MajorSyncTask::AppStateSync { full_sync: true })` for `critical_unblock_low`,
+`regular`, `regular_low` and `regular_high` (the library then requests a
+snapshot and replays every mutation as an event) and stores the marker. Fresh
+links get the same data from the initial sync.
+
+Known limits: a contact *removed* from the address book arrives as a syncd
+`REMOVE`, which `whatsapp-rust` 0.7 does not turn into an event, so the old
+saved name stays until the next full resync (clearing the cache). Names of
+contacts the phone has not synced (not in the address book) stay push names.
+
+### 2.3 Archive, pins and lists
+
+| Feature | Receive | Send |
+|---|---|---|
+| Archive | `archive` mutation → `ArchiveUpdate` → `ChatFlag::Archived` | `chat_actions().archive_chat` / `unarchive_chat` |
+| Pin (max 3) | `pin_v1` → `PinUpdate` | `chat_actions().pin_chat` / `unpin_chat` |
+| Custom lists | `label_edit` with `ListType::CUSTOM` (name, colour, order, deleted) → `ListEdit`; `label_jid` → `ListChat` | `send_app_state_action(LABEL_EDIT, ...)` with `type = CUSTOM`; `labels().delete_label`, `add_chat_label`, `remove_chat_label` |
+| Favourites | a synced list of type `FAVORITES` (members through `label_jid`) | membership through `label_jid` when that list exists |
+
+Changes are applied locally first, persisted (`chats.archived/pinned`,
+`lists`, `list_chats`) and sent; a failed send is reverted with a toast. The
+"Archived" row opens the archived list (archived chats stay out of the main
+list; searching finds them, as in the official app). Lists appear as chips
+after Favourites and Groups; a right click on a chip renames or deletes the
+list, a right click on a chat adds it to or removes it from lists.
+
+**Not verifiable without a phone, and the limits.** `whatsapp-rust` 0.7
+exposes labels but has no helper for list *types*; Ferrochat writes the
+`LabelEditAction` itself (`type = CUSTOM`), which matches the proto
+(`LabelEditAction.ListType`) but has not been checked against a real
+account. The library emits no event for the `favorites` action
+(`FavoritesAction`), so favourites chosen on the phone through that action
+are not visible; when no `FAVORITES` list has been synced, Ferrochat keeps
+favourites on this device only (`ferrochat:favourites` in `list_chats`) and
+never sends the `favorites` action, because it would overwrite the phone's
+list with an incomplete one.
+
+### 2.4 Group ticks
 
 WhatsApp sends one receipt per participant. Ferrochat stores them
 (`receipts` table) and shows two grey ticks once every other participant has
@@ -118,9 +193,9 @@ chats are unchanged.
 |---|---|---|
 | OS keyring, service `dev.ferro.ferrochat`, account `signal-store-key` | 256-bit random key (hex) for the session store | Secret Service (KWallet / GNOME Keyring), Keychain, Credential Manager |
 | `$XDG_DATA_HOME/ferrochat/session.sqlcipher` (+ `-wal`, `-shm`) | The library's whole Signal / device state: identity key pair, noise key, signed pre-keys, sessions, sender keys, app-state sync keys, LID mappings | **SQLCipher** (AES-256, HMAC per page) keyed with the raw key above (`PRAGMA key = "x'…'"`, no PBKDF2). File mode 0600. Tested: no `SQLite format 3` header and no schema text in the file; a wrong key is rejected. |
-| `$XDG_DATA_HOME/ferrochat/cache.sqlite3` (+ `-wal`, `-shm`) | Cache: chats, message bodies, media references (CDN path + per-file media key, needed to download later), contact names, own JID | Plain SQLite, mode 0600, like the official desktop client's local database. Deletable at any time; rebuilt from history sync. Never contains credentials or Signal keys. |
+| `$XDG_DATA_HOME/ferrochat/cache.sqlite3` (+ `-wal`, `-shm`) | Cache: chats, message bodies, media references (CDN path + per-file media key, needed to download later), contact names (by source), chat lists and their members, own JID | Plain SQLite, mode 0600, like the official desktop client's local database. Deletable at any time; rebuilt from history sync. Never contains credentials or Signal keys. |
 | `$XDG_CACHE_HOME/ferrochat/avatars/*.img` / `*.none` | Profile picture previews (JPEG as served) and "no picture" markers. File names are a hash of the JID. Refreshed after 7 days / 12 h or when the contact changes the picture; at most 1500 files and 32 MB; deleted on logout | Directory 0700 |
-| `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB) so the system player can read them | Directory 0700 |
+| `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB), decrypted, so the player (in-app helper or system player) can read them | Directory 0700. `--mock` writes its 27 kB clip to `$TMPDIR/ferrochat-mock-<pid>` and removes it when the viewer closes. |
 | `$XDG_CONFIG_HOME/ferrochat/settings.json` | Preferences: close to tray, start minimized, mute notifications | Plain JSON, no secrets; not written in `--mock` |
 | `~/.config/autostart/dev.ferro.ferrochat.desktop` | "Start at login" entry (`Exec=<binary> --minimized`) | Only when the user turns the toggle on; the toggle removes it |
 | `$XDG_DATA_HOME/ferrochat/ferrochat.sock` | Single-instance hand-off: accepts only the line `show` | Unix socket in the 0700 data directory, mode 0600, removed on exit |
@@ -205,6 +280,35 @@ Ogg demux with the pure-Rust `ogg` crate, Opus decode with `opus` (libopus
 bindings; `symphonia` has no Opus decoder), output through `rodio` on a
 dedicated audio thread. The UI polls position every 100 ms while playing and
 draws the waveform bars as played / unplayed.
+
+### 6.1 Video playback
+
+Videos play inside the app. Decoding runs in a helper process,
+`ferrochat-player` (GStreamer: `playbin` with an RGBA `appsink`), one process
+per open video:
+
+* The helper writes tagged binary messages to stdout (ready, RGBA frames of at
+  most 960x540, position / state every 250 ms, failure) and reads text
+  commands from stdin (`play`, `pause`, `seek <ms>`, `volume`, `mute`,
+  `quit`); the format is `src/media/video_proto.rs`, with tests for hostile
+  input (size caps, unknown tags).
+* The app keeps the newest frame as an `image::Handle` created when the frame
+  arrives, never in `view`; stale frames are dropped when the UI is behind.
+  While a video plays, only the viewer is built, so frames do not rebuild the
+  chat list and conversation.
+* Closing the viewer drops the `Player`, which ends the process: the decoder,
+  its buffers and the audio stream are freed. At most one exists at a time.
+* The main binary does not link GStreamer. A machine without it starts
+  normally; opening a video shows which packages to install (or which codec
+  is missing), plus an "Open externally" button. The system player is only ever
+  used through that explicit button or the message menu entry.
+* Controls: play / pause (also click on the picture and Space), seek bar with
+  elapsed and total time, volume and mute, full screen, close (Esc).
+
+`iced_video_player` 0.6 (GStreamer, iced 0.14) was evaluated and rejected: it
+renders through a wgpu shader only (nothing is drawn on the tiny-skia
+fallback), links GStreamer into the main binary (no graceful degradation), and
+decodes in-process (memory cannot be given back by closing the viewer).
 
 ## 7. Known protocol gaps
 

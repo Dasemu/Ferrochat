@@ -188,7 +188,6 @@ impl App {
                     None => Task::none(),
                 }
             }
-            Ui::OpenVideo(id) => self.open_video(&id),
             Ui::SidebarScrolled { offset_y, height } => {
                 let row = self.theme.metrics.row_height;
                 let first = ((offset_y / row).floor() as isize - 2).max(0) as usize;
@@ -204,7 +203,10 @@ impl App {
                 Task::batch([open, self.jump_to(id)])
             }
             Ui::JumpLatest => self.jump_latest(),
-            other => return Err(other),
+            other => match self.on_ui_video(other) {
+                Ok(t) => t,
+                Err(other) => return self.on_ui_lists(other),
+            },
         })
     }
 
@@ -795,7 +797,7 @@ impl App {
         }
         v.extend(
             self.chats
-                .filtered(&self.search, self.filter)
+                .filtered_view(&self.search, &self.filter, self.archived_view)
                 .into_iter()
                 .skip(first)
                 .take(last.saturating_sub(first) + 1)
@@ -1045,7 +1047,7 @@ impl App {
 
     // --------------------------------------------------------------- video
 
-    fn open_video(&mut self, id: &str) -> Task<Message> {
+    pub(super) fn open_video_external(&mut self, id: &str) -> Task<Message> {
         let Some(m) = self.find_message(id).cloned() else {
             return Task::none();
         };
@@ -1056,13 +1058,13 @@ impl App {
             return Task::none();
         };
         if self.cfg.mock {
-            self.toast("Video playback is disabled in mock mode.");
+            self.toast("Opening other apps is disabled in mock mode.");
             return Task::none();
         }
         let Some(client) = self.client.clone() else {
             return Task::none();
         };
-        let dir = self.cfg.cache_dir.join("videos");
+        let dir = self.video_dir();
         let ext = video_extension(&mref.mimetype);
         let name = format!("{}.{ext}", avatar::name_hash(&mref.cache_key()));
         self.toast("Downloading video…");

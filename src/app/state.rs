@@ -3,8 +3,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::net::types::{
-    ChatId, ChatMeta, Content, Message, Reaction, ReceiptStatus, fallback_name, is_group_jid,
-    merge_edit,
+    ChatFlag, ChatId, ChatMeta, Content, ListDef, ListKind, Message, NameSource, Reaction,
+    ReceiptStatus, fallback_name, is_group_jid, merge_edit,
 };
 use crate::store::ChatRow;
 
@@ -12,37 +12,141 @@ use crate::store::ChatRow;
 pub const WINDOW: usize = 200;
 
 /// Chat list filter chips.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Filter {
     /// Everything.
     #[default]
     All,
     /// Chats with unread messages.
     Unread,
-    /// Pinned chats (stand-in for "Favourites").
+    /// The Favourites list.
     Favourites,
     /// Group chats.
     Groups,
+    /// A user-created list (its id).
+    List(String),
 }
 
 impl Filter {
-    /// Chip label.
-    pub fn label(self) -> &'static str {
+    /// Chip label of a built-in filter (custom lists use their own name).
+    pub fn label(&self) -> &'static str {
         match self {
             Filter::All => "All",
             Filter::Unread => "Unread",
             Filter::Favourites => "Favourites",
             Filter::Groups => "Groups",
+            Filter::List(_) => "List",
         }
     }
 
-    /// All chips in display order.
-    pub const ALL: [Filter; 4] = [
+    /// The built-in chips in display order.
+    pub const BUILTIN: [Filter; 4] = [
         Filter::All,
         Filter::Unread,
         Filter::Favourites,
         Filter::Groups,
     ];
+}
+
+/// Reserved list id for favourites kept only on this device (used when the
+/// phone has not synced a Favourites list we can write to).
+pub const LOCAL_FAVOURITES: &str = "ferrochat:favourites";
+
+/// Contact names by source. Display priority: address book, business
+/// verified name, push name.
+#[derive(Debug, Clone, Default)]
+pub struct NameBook {
+    saved: HashMap<String, String>,
+    business: HashMap<String, String>,
+    push: HashMap<String, String>,
+}
+
+impl NameBook {
+    /// Builds from stored `(jid, source, name)` rows.
+    pub fn from_rows(rows: Vec<(String, NameSource, String)>) -> Self {
+        let mut b = Self::default();
+        for (jid, source, name) in rows {
+            b.set(&jid, source, &name);
+        }
+        b
+    }
+
+    fn map(&self, source: NameSource) -> &HashMap<String, String> {
+        match source {
+            NameSource::Saved => &self.saved,
+            NameSource::Business => &self.business,
+            NameSource::Push => &self.push,
+        }
+    }
+
+    /// Records a name; an empty name removes it. Returns true if it changed.
+    pub fn set(&mut self, jid: &str, source: NameSource, name: &str) -> bool {
+        let map = match source {
+            NameSource::Saved => &mut self.saved,
+            NameSource::Business => &mut self.business,
+            NameSource::Push => &mut self.push,
+        };
+        if name.is_empty() {
+            return map.remove(jid).is_some();
+        }
+        if map.get(jid).is_some_and(|n| n == name) {
+            return false;
+        }
+        map.insert(jid.to_string(), name.to_string());
+        true
+    }
+
+    /// The name of `jid` from one source.
+    pub fn get(&self, jid: &str, source: NameSource) -> Option<&str> {
+        self.map(source).get(jid).map(String::as_str)
+    }
+
+    /// The best known name and where it comes from.
+    pub fn best(&self, jid: &str) -> Option<(NameSource, &str)> {
+        [NameSource::Saved, NameSource::Business, NameSource::Push]
+            .into_iter()
+            .find_map(|src| self.get(jid, src).map(|n| (src, n)))
+    }
+}
+
+/// How a chat or sender is called, with the reason (decides the styling:
+/// push names get a "~" like in the official app).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolved {
+    /// Saved in the phone's address book (or a group subject).
+    Saved(String),
+    /// Business verified name.
+    Business(String),
+    /// The name the person chose for itself.
+    Push(String),
+    /// Name carried by the chat record only.
+    ChatName(String),
+    /// Only the number (or "Group") is known.
+    Number(String),
+}
+
+impl Resolved {
+    /// Text to show: push names are prefixed with "~ ".
+    pub fn label(&self) -> String {
+        match self {
+            Resolved::Push(n) => format!("~ {n}"),
+            Resolved::Saved(n)
+            | Resolved::Business(n)
+            | Resolved::ChatName(n)
+            | Resolved::Number(n) => n.clone(),
+        }
+    }
+
+    /// Text without the "~" (typing indicators, notifications, mentions).
+    pub fn plain(&self) -> String {
+        match self {
+            Resolved::Saved(n)
+            | Resolved::Business(n)
+            | Resolved::Push(n)
+            | Resolved::ChatName(n)
+            | Resolved::Number(n) => n.clone(),
+        }
+    }
 }
 
 /// One row of the chat list.
@@ -67,15 +171,19 @@ pub struct ChatList {
     /// Rows, sorted pinned-first then by recency. Read-only outside; use the
     /// methods to mutate so the index stays in sync.
     pub entries: Vec<ChatEntry>,
-    /// JID → display name.
-    pub names: HashMap<String, String>,
+    /// JID → names by source.
+    pub names: NameBook,
+    /// Lists synced through app state (custom lists, favourites, others).
+    pub lists: Vec<ListDef>,
+    /// List id → chats in it.
+    members: HashMap<String, HashSet<String>>,
     /// JID → position in `entries` (O(1) lookups during history sync).
     index: HashMap<String, usize>,
 }
 
 impl ChatList {
     /// Builds from cache rows.
-    pub fn from_rows(rows: Vec<ChatRow>, names: HashMap<String, String>) -> Self {
+    pub fn from_rows(rows: Vec<ChatRow>, names: NameBook) -> Self {
         let mut list = Self {
             entries: rows
                 .into_iter()
@@ -85,10 +193,27 @@ impl ChatList {
                 })
                 .collect(),
             names,
+            lists: Vec::new(),
+            members: HashMap::new(),
             index: HashMap::new(),
         };
         list.sort();
         list
+    }
+
+    /// Loads lists and memberships from the cache.
+    pub fn load_lists(&mut self, defs: Vec<ListDef>, members: Vec<(String, String)>) {
+        self.lists = defs;
+        self.sort_lists();
+        self.members.clear();
+        for (l, c) in members {
+            self.members.entry(l).or_default().insert(c);
+        }
+    }
+
+    fn sort_lists(&mut self) {
+        self.lists
+            .sort_by(|a, b| a.order.cmp(&b.order).then(a.name.cmp(&b.name)));
     }
 
     fn reindex(&mut self) {
@@ -110,17 +235,174 @@ impl ChatList {
         self.reindex();
     }
 
-    /// Display name for a chat or a sender.
-    pub fn display_name(&self, jid: &str) -> String {
-        if let Some(e) = self.get(jid)
-            && let Some(n) = &e.meta.name
-        {
-            return n.clone();
-        }
-        self.names
+    /// How `jid` is called. Groups use their subject. People: saved name,
+    /// then the business verified name, then the push name, then whatever
+    /// name the chat record carries, then the formatted number.
+    /// `push_hint` is a push name seen on a message, used when the book has
+    /// no name yet.
+    pub fn resolve(&self, jid: &str, push_hint: Option<&str>) -> Resolved {
+        let chat_name = self
             .get(jid)
-            .cloned()
-            .unwrap_or_else(|| fallback_name(jid))
+            .and_then(|e| e.meta.name.clone())
+            .filter(|n| !n.is_empty());
+        if is_group_jid(jid) {
+            return match chat_name {
+                Some(n) => Resolved::Saved(n),
+                None => Resolved::Number(fallback_name(jid)),
+            };
+        }
+        match self.names.best(jid) {
+            Some((NameSource::Saved, n)) => return Resolved::Saved(n.to_string()),
+            Some((NameSource::Business, n)) => return Resolved::Business(n.to_string()),
+            Some((NameSource::Push, n)) => return Resolved::Push(n.to_string()),
+            None => {}
+        }
+        if let Some(n) = push_hint.filter(|n| !n.is_empty()) {
+            return Resolved::Push(n.to_string());
+        }
+        match chat_name {
+            Some(n) => Resolved::ChatName(n),
+            None => Resolved::Number(fallback_name(jid)),
+        }
+    }
+
+    /// Display name for a chat or a sender ("~ Name" for push names).
+    pub fn display_name(&self, jid: &str) -> String {
+        self.resolve(jid, None).label()
+    }
+
+    /// Like [`display_name`](Self::display_name) with a push name seen on
+    /// the message as a last resort (group sender labels, previews).
+    pub fn sender_name(&self, jid: &str, push_hint: Option<&str>) -> String {
+        self.resolve(jid, push_hint).label()
+    }
+
+    /// Name without the "~" marker.
+    pub fn plain_name(&self, jid: &str) -> String {
+        self.resolve(jid, None).plain()
+    }
+
+    /// Records a contact name; true when something changed.
+    pub fn set_name(&mut self, jid: &str, source: NameSource, name: &str) -> bool {
+        self.names.set(jid, source, name)
+    }
+
+    /// Learns push names carried by messages. Returns the rows to persist.
+    pub fn learn_push_names(&mut self, msgs: &[Message]) -> Vec<(String, NameSource, String)> {
+        let mut out = Vec::new();
+        for m in msgs {
+            if !m.from_me
+                && let Some(n) = &m.sender_name
+                && self.names.set(&m.sender, NameSource::Push, n)
+            {
+                out.push((m.sender.clone(), NameSource::Push, n.clone()));
+            }
+        }
+        out
+    }
+
+    // ----------------------------------------------------------------- lists
+
+    /// Applies a list created / edited / deleted on the phone (or by us).
+    pub fn apply_list_edit(&mut self, def: ListDef, deleted: bool) {
+        if deleted {
+            self.lists.retain(|l| l.id != def.id);
+            self.members.remove(&def.id);
+            return;
+        }
+        match self.lists.iter_mut().find(|l| l.id == def.id) {
+            Some(l) => {
+                // A partial edit (no name) keeps the known one.
+                let name = if def.name.is_empty() {
+                    l.name.clone()
+                } else {
+                    def.name.clone()
+                };
+                *l = ListDef { name, ..def };
+            }
+            None => self.lists.push(def),
+        }
+        self.sort_lists();
+    }
+
+    /// Applies a membership change.
+    pub fn apply_list_chat(&mut self, list: &str, chat: &str, member: bool) {
+        if member {
+            self.members
+                .entry(list.to_string())
+                .or_default()
+                .insert(chat.to_string());
+        } else if let Some(set) = self.members.get_mut(list) {
+            set.remove(chat);
+        }
+    }
+
+    /// User-created lists in display order.
+    pub fn custom_lists(&self) -> impl Iterator<Item = &ListDef> {
+        self.lists.iter().filter(|l| l.kind == ListKind::Custom)
+    }
+
+    /// The list with this id.
+    pub fn list(&self, id: &str) -> Option<&ListDef> {
+        self.lists.iter().find(|l| l.id == id)
+    }
+
+    /// Is `chat` in list `id`?
+    pub fn in_list(&self, id: &str, chat: &str) -> bool {
+        self.members.get(id).is_some_and(|s| s.contains(chat))
+    }
+
+    /// Id of the synced Favourites list, if the phone has one.
+    pub fn favourites_list(&self) -> Option<&str> {
+        self.lists
+            .iter()
+            .find(|l| l.kind == ListKind::Favourites)
+            .map(|l| l.id.as_str())
+    }
+
+    /// Is `chat` a favourite (synced list or local favourite)?
+    pub fn is_favourite(&self, chat: &str) -> bool {
+        self.in_list(LOCAL_FAVOURITES, chat)
+            || self
+                .favourites_list()
+                .is_some_and(|id| self.in_list(id, chat))
+    }
+
+    /// The list id a favourite toggle writes to: the synced list when it
+    /// exists (so the phone sees it), else the local one.
+    pub fn favourites_target(&self) -> &str {
+        self.favourites_list().unwrap_or(LOCAL_FAVOURITES)
+    }
+
+    /// An unused list id: the next integer, like the official client.
+    pub fn next_list_id(&self) -> String {
+        let max = self
+            .lists
+            .iter()
+            .filter_map(|l| l.id.parse::<u64>().ok())
+            .max()
+            .unwrap_or(0);
+        (max + 1).to_string()
+    }
+
+    /// Order index for a new list (after all others).
+    pub fn next_list_order(&self) -> i32 {
+        self.lists
+            .iter()
+            .map(|l| l.order)
+            .max()
+            .map_or(0, |m| m + 1)
+    }
+
+    /// Archive / pin / mute changed (here or on another device).
+    pub fn apply_flag(&mut self, chat: &str, flag: ChatFlag) {
+        let e = self.entry_mut(chat);
+        match flag {
+            ChatFlag::Archived(v) => e.meta.archived = v,
+            ChatFlag::Pinned(v) => e.meta.pinned = v,
+            ChatFlag::Muted(v) => e.meta.muted = v,
+        }
+        self.sort();
     }
 
     /// Mutable entry, created if missing.
@@ -153,7 +435,7 @@ impl ChatList {
     /// Merges history-sync metadata.
     pub fn apply_history(&mut self, chats: &[ChatMeta], names: &[(String, String)]) {
         for (jid, name) in names {
-            self.names.insert(jid.clone(), name.clone());
+            self.names.set(jid, NameSource::Push, name);
         }
         for c in chats {
             let e = self.entry_mut(&c.id);
@@ -180,12 +462,6 @@ impl ChatList {
         fresh: Option<&HashSet<String>>,
     ) {
         for m in msgs {
-            if !m.from_me
-                && let Some(n) = &m.sender_name
-                && !self.names.contains_key(&m.sender)
-            {
-                self.names.insert(m.sender.clone(), n.clone());
-            }
             let viewing = open_chat == Some(m.chat.as_str()) && focused;
             let e = self.entry_mut(&m.chat);
             let newer = e
@@ -271,17 +547,25 @@ impl ChatList {
         }
     }
 
-    /// Rows matching the search query and filter.
+    /// Rows of the main list matching the search query and filter. Archived
+    /// chats are hidden unless the query is non-empty (search finds them, as
+    /// in the official app).
     pub fn filtered(&self, query: &str, filter: Filter) -> Vec<&ChatEntry> {
+        self.filtered_view(query, &filter, false)
+    }
+
+    /// The archived list (`archived == true`) or the main list.
+    pub fn filtered_view(&self, query: &str, filter: &Filter, archived: bool) -> Vec<&ChatEntry> {
         let q = query.trim().to_lowercase();
         self.entries
             .iter()
-            .filter(|e| !e.meta.archived)
+            .filter(|e| !q.is_empty() || e.meta.archived == archived)
             .filter(|e| match filter {
                 Filter::All => true,
                 Filter::Unread => e.meta.unread > 0,
-                Filter::Favourites => e.meta.pinned,
+                Filter::Favourites => self.is_favourite(&e.meta.id),
                 Filter::Groups => e.is_group(),
+                Filter::List(id) => self.in_list(id, &e.meta.id),
             })
             .filter(|e| {
                 q.is_empty()
@@ -291,6 +575,19 @@ impl ChatList {
                         .is_some_and(|l| l.content.preview().to_lowercase().contains(&q))
             })
             .collect()
+    }
+
+    /// Unread chats among the archived ones (badge on the "Archived" row).
+    pub fn archived_unread(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| e.meta.archived && e.meta.unread > 0)
+            .count()
+    }
+
+    /// Pinned chats (WhatsApp allows three).
+    pub fn pinned_count(&self) -> usize {
+        self.entries.iter().filter(|e| e.meta.pinned).count()
     }
 
     /// Number of archived chats (for the "Archived" row).
@@ -695,9 +992,210 @@ mod tests {
     fn display_names_fall_back() {
         let mut l = list();
         assert_eq!(l.display_name("a"), "Alice");
-        assert_eq!(l.display_name("34600111222@s.whatsapp.net"), "+34600111222");
+        assert_eq!(
+            l.display_name("34600111222@s.whatsapp.net"),
+            "+34 600 111 222"
+        );
         l.apply_history(&[], &[("34600111222@s.whatsapp.net".into(), "Zoe".into())]);
-        assert_eq!(l.display_name("34600111222@s.whatsapp.net"), "Zoe");
+        assert_eq!(l.display_name("34600111222@s.whatsapp.net"), "~ Zoe");
+    }
+
+    const ANA: &str = "34600111222@s.whatsapp.net";
+
+    #[test]
+    fn name_priority_saved_business_push_chat_number() {
+        let mut l = ChatList::default();
+        // Only the number is known.
+        assert_eq!(l.display_name(ANA), "+34 600 111 222");
+        // A name on the chat record only.
+        l.apply_history(
+            &[ChatMeta {
+                id: ANA.into(),
+                name: Some("Chat record".into()),
+                ..Default::default()
+            }],
+            &[],
+        );
+        assert_eq!(l.display_name(ANA), "Chat record");
+        // A push name beats the chat record and is marked with "~".
+        l.set_name(ANA, NameSource::Push, "Anita");
+        assert_eq!(l.display_name(ANA), "~ Anita");
+        assert_eq!(l.plain_name(ANA), "Anita");
+        // A business verified name beats the push name.
+        l.set_name(ANA, NameSource::Business, "Ana Shop");
+        assert_eq!(l.display_name(ANA), "Ana Shop");
+        // The address-book name beats everything, whatever the arrival order.
+        l.set_name(ANA, NameSource::Saved, "Ana (trabajo)");
+        l.set_name(ANA, NameSource::Push, "Anita 2");
+        l.set_name(ANA, NameSource::Business, "Ana Shop 2");
+        assert_eq!(l.display_name(ANA), "Ana (trabajo)");
+        // Removing the saved name falls back to the next source.
+        assert!(l.set_name(ANA, NameSource::Saved, ""));
+        assert_eq!(l.display_name(ANA), "Ana Shop 2");
+        assert!(!l.set_name(ANA, NameSource::Saved, ""));
+    }
+
+    #[test]
+    fn push_name_hint_only_when_nothing_better_is_known() {
+        let mut l = ChatList::default();
+        assert_eq!(l.sender_name(ANA, Some("Hint")), "~ Hint");
+        assert_eq!(l.sender_name(ANA, Some("")), "+34 600 111 222");
+        l.set_name(ANA, NameSource::Saved, "Ana");
+        // A push name carried by a message must not override the saved name.
+        assert_eq!(l.sender_name(ANA, Some("Hint")), "Ana");
+    }
+
+    #[test]
+    fn groups_show_their_subject_not_member_names() {
+        let mut l = ChatList::default();
+        l.apply_history(
+            &[ChatMeta {
+                id: "g@g.us".into(),
+                name: Some("Familia".into()),
+                ..Default::default()
+            }],
+            &[],
+        );
+        l.set_name("g@g.us", NameSource::Push, "Whoever");
+        assert_eq!(l.display_name("g@g.us"), "Familia");
+        assert_eq!(l.display_name("other@g.us"), "Group");
+    }
+
+    #[test]
+    fn message_push_names_are_learned_but_never_override_saved() {
+        let mut l = ChatList::default();
+        let mut msg = m(ANA, "1", 10, false);
+        msg.sender = ANA.into();
+        msg.sender_name = Some("Anita".into());
+        let rows = l.learn_push_names(std::slice::from_ref(&msg));
+        assert_eq!(
+            rows,
+            vec![(ANA.to_string(), NameSource::Push, "Anita".to_string())]
+        );
+        // Seen again: nothing to persist.
+        assert!(l.learn_push_names(std::slice::from_ref(&msg)).is_empty());
+        l.set_name(ANA, NameSource::Saved, "Ana");
+        msg.sender_name = Some("Anita renamed".into());
+        l.learn_push_names(std::slice::from_ref(&msg));
+        assert_eq!(l.display_name(ANA), "Ana");
+    }
+
+    #[test]
+    fn name_book_round_trips_rows() {
+        let b = NameBook::from_rows(vec![
+            ("a".into(), NameSource::Push, "P".into()),
+            ("a".into(), NameSource::Saved, "S".into()),
+            ("b".into(), NameSource::Business, "B".into()),
+        ]);
+        assert_eq!(b.best("a"), Some((NameSource::Saved, "S")));
+        assert_eq!(b.best("b"), Some((NameSource::Business, "B")));
+        assert_eq!(b.best("c"), None);
+    }
+
+    fn custom(id: &str, name: &str, order: i32) -> ListDef {
+        ListDef {
+            id: id.into(),
+            name: name.into(),
+            kind: ListKind::Custom,
+            order,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn lists_reducers_and_filter() {
+        let mut l = list();
+        l.apply_list_edit(custom("2", "Work", 1), false);
+        l.apply_list_edit(custom("1", "Family", 0), false);
+        let names: Vec<_> = l.custom_lists().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, ["Family", "Work"]);
+        assert_eq!(l.next_list_id(), "3");
+        assert_eq!(l.next_list_order(), 2);
+
+        l.apply_list_chat("1", "a", true);
+        let f = Filter::List("1".into());
+        let rows = l.filtered_view("", &f, false);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].meta.id, "a");
+        assert!(l.in_list("1", "a"));
+        l.apply_list_chat("1", "a", false);
+        assert!(l.filtered_view("", &f, false).is_empty());
+
+        // A partial edit (no name) keeps the known name.
+        l.apply_list_edit(
+            ListDef {
+                id: "2".into(),
+                order: 5,
+                kind: ListKind::Custom,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(l.list("2").unwrap().name, "Work");
+        assert_eq!(l.list("2").unwrap().order, 5);
+
+        // Deleting removes the list and its members.
+        l.apply_list_chat("2", "a", true);
+        l.apply_list_edit(custom("2", "", 0), true);
+        assert!(l.list("2").is_none());
+        assert!(!l.in_list("2", "a"));
+    }
+
+    #[test]
+    fn favourites_use_the_synced_list_when_there_is_one() {
+        let mut l = list();
+        assert_eq!(l.favourites_target(), LOCAL_FAVOURITES);
+        l.apply_list_chat(LOCAL_FAVOURITES, "a", true);
+        assert!(l.is_favourite("a"));
+        assert_eq!(l.filtered("", Filter::Favourites).len(), 1);
+        // The phone syncs a Favourites list: new favourites go there.
+        l.apply_list_edit(
+            ListDef {
+                id: "fav".into(),
+                kind: ListKind::Favourites,
+                ..Default::default()
+            },
+            false,
+        );
+        assert_eq!(l.favourites_target(), "fav");
+        l.apply_list_chat("fav", "g@g.us", true);
+        assert!(l.is_favourite("g@g.us"));
+        assert_eq!(l.filtered("", Filter::Favourites).len(), 2);
+        // Favourites never appear as a custom chip.
+        assert_eq!(l.custom_lists().count(), 0);
+    }
+
+    #[test]
+    fn archive_flag_moves_chats_between_views() {
+        let mut l = list();
+        assert_eq!(l.filtered_view("", &Filter::All, false).len(), 2);
+        assert!(l.filtered_view("", &Filter::All, true).is_empty());
+        l.apply_flag("a", ChatFlag::Archived(true));
+        assert_eq!(l.archived_count(), 1);
+        assert_eq!(l.filtered_view("", &Filter::All, false).len(), 1);
+        assert_eq!(l.filtered_view("", &Filter::All, true).len(), 1);
+        // Searching finds archived chats too, like the official app.
+        assert_eq!(l.filtered_view("ali", &Filter::All, false).len(), 1);
+        // Filters apply inside the archive as well.
+        assert!(l.filtered_view("", &Filter::Groups, true).is_empty());
+        l.apply_flag("a", ChatFlag::Archived(false));
+        assert_eq!(l.archived_count(), 0);
+        // Pin and mute flags.
+        l.apply_flag("a", ChatFlag::Pinned(true));
+        assert_eq!(l.pinned_count(), 1);
+        assert_eq!(l.entries[0].meta.id, "a", "pinned chats sort first");
+        l.apply_flag("a", ChatFlag::Muted(true));
+        assert!(l.get("a").unwrap().meta.muted);
+        // A flag for an unknown chat creates the row.
+        l.apply_flag("new@s.whatsapp.net", ChatFlag::Archived(true));
+        assert_eq!(l.archived_count(), 1);
+    }
+
+    #[test]
+    fn archived_unread_counts_chats() {
+        let mut l = list();
+        l.apply_flag("g@g.us", ChatFlag::Archived(true));
+        assert_eq!(l.archived_unread(), 1);
     }
 
     #[test]

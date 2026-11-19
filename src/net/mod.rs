@@ -80,6 +80,25 @@ pub trait WaClient: Send + Sync {
     fn subscribe_presence<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<()>>;
     /// Number of other participants of a group (everyone but us).
     fn group_size<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<usize>>;
+    /// Archives or unarchives a chat on every device (app-state `archive`).
+    fn set_archived<'a>(&'a self, chat: &'a str, archived: bool) -> BoxFuture<'a, Result<()>>;
+    /// Pins or unpins a chat on every device (app-state `pin_v1`).
+    fn set_pinned<'a>(&'a self, chat: &'a str, pinned: bool) -> BoxFuture<'a, Result<()>>;
+    /// Creates or edits a custom list (app-state `label_edit`).
+    fn save_list<'a>(&'a self, list: &'a ListDef) -> BoxFuture<'a, Result<()>>;
+    /// Deletes a custom list.
+    fn delete_list<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Adds a chat to / removes it from a list (app-state `label_jid`).
+    fn set_list_member<'a>(
+        &'a self,
+        list: &'a str,
+        chat: &'a str,
+        member: bool,
+    ) -> BoxFuture<'a, Result<()>>;
+    /// Asks the server for a full app-state snapshot (contacts, archive,
+    /// pins, lists) so names saved on the phone arrive even when the
+    /// collections were synced before this client used them.
+    fn resync_app_state(&self) -> BoxFuture<'_, Result<()>>;
     /// Unlinks this device, disconnects and deletes the session store.
     fn logout(&self) -> BoxFuture<'_, Result<()>>;
     /// `--mock` only: pretend the phone scanned the QR code. The live client
@@ -233,12 +252,38 @@ pub enum Event {
         /// Contact or group.
         jid: String,
     },
-    /// A contact's display name changed / became known.
+    /// A contact's display name changed / became known. An empty `name`
+    /// from the address book (`Saved`) means the contact lost its saved name.
     ContactName {
         /// JID.
         jid: String,
         /// Name.
         name: String,
+        /// Where the name comes from (decides display priority).
+        source: NameSource,
+    },
+    /// Archive / pin / mute changed on another device.
+    ChatFlag {
+        /// Chat.
+        chat: ChatId,
+        /// New value.
+        flag: ChatFlag,
+    },
+    /// A custom list was created, renamed or deleted on another device.
+    ListEdit {
+        /// The list.
+        def: ListDef,
+        /// Removed.
+        deleted: bool,
+    },
+    /// A chat joined or left a list on another device.
+    ListChat {
+        /// List id.
+        list: String,
+        /// Chat.
+        chat: ChatId,
+        /// Now a member.
+        member: bool,
     },
     /// Chat marked read on another device.
     ChatRead {
@@ -290,7 +335,10 @@ impl fmt::Debug for Event {
             Event::ChatState { state, .. } => write!(f, "ChatState({state:?})"),
             Event::Presence { online, .. } => write!(f, "Presence(online={online})"),
             Event::PictureChanged { .. } => write!(f, "PictureChanged"),
-            Event::ContactName { .. } => write!(f, "ContactName"),
+            Event::ContactName { source, .. } => write!(f, "ContactName({source:?})"),
+            Event::ChatFlag { flag, .. } => write!(f, "ChatFlag({flag:?})"),
+            Event::ListEdit { deleted, .. } => write!(f, "ListEdit(deleted={deleted})"),
+            Event::ListChat { member, .. } => write!(f, "ListChat(member={member})"),
             Event::ChatRead { .. } => write!(f, "ChatRead"),
             Event::LidMappings(p) => write!(f, "LidMappings(n={})", p.len()),
             Event::SessionUnreadable(_) => write!(f, "SessionUnreadable"),

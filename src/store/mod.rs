@@ -11,12 +11,15 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
-use crate::net::types::{ChatMeta, Content, Message, ReceiptStatus};
+use crate::net::types::{
+    ChatFlag, ChatMeta, Content, ListDef, ListKind, Message, NameSource, ReceiptStatus,
+};
 
 const MIGRATIONS: &[&str] = &[
     include_str!("schema.sql"),
     include_str!("migration_2.sql"),
     include_str!("migration_3.sql"),
+    include_str!("migration_4.sql"),
 ];
 
 /// Longest emoji string accepted as a reaction (bytes). Skin-tone and ZWJ
@@ -377,31 +380,126 @@ impl Store {
         Ok(rows)
     }
 
-    /// Records a contact display name.
-    pub fn set_contact_names(&self, names: &[(String, String)]) -> Result<()> {
+    /// Records contact names `(jid, source, name)`. An empty address-book
+    /// (`Saved`) name removes the saved name; other empty names are ignored.
+    pub fn set_contact_names(&self, names: &[(String, NameSource, String)]) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
         {
-            let mut st = tx.prepare_cached(
-                "INSERT INTO contacts (jid, name) VALUES (?1, ?2)
-                 ON CONFLICT(jid) DO UPDATE SET name = excluded.name",
+            let mut put = tx.prepare_cached(
+                "INSERT INTO contact_names (jid, source, name) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(jid, source) DO UPDATE SET name = excluded.name",
             )?;
-            for (jid, name) in names {
-                st.execute(params![jid, name])?;
+            let mut del =
+                tx.prepare_cached("DELETE FROM contact_names WHERE jid = ?1 AND source = ?2")?;
+            for (jid, source, name) in names {
+                if name.is_empty() {
+                    if *source == NameSource::Saved {
+                        del.execute(params![jid, source.code()])?;
+                    }
+                } else {
+                    put.execute(params![jid, source.code(), name])?;
+                }
             }
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// All known contact names.
-    pub fn contact_names(&self) -> Result<HashMap<String, String>> {
+    /// All known contact names `(jid, source, name)`.
+    pub fn contact_names(&self) -> Result<Vec<(String, NameSource, String)>> {
         let conn = self.lock()?;
-        let mut st = conn.prepare_cached("SELECT jid, name FROM contacts")?;
-        let map = st
+        let mut st = conn.prepare_cached("SELECT jid, source, name FROM contact_names")?;
+        let rows = st
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows
+            .into_iter()
+            .filter_map(|(j, c, n)| Some((j, NameSource::from_code(c)?, n)))
+            .collect())
+    }
+
+    /// Persists an archive / pin / mute change (creating the chat row).
+    pub fn set_chat_flag(&self, chat: &str, flag: ChatFlag) -> Result<()> {
+        let (col, on) = match flag {
+            ChatFlag::Archived(v) => ("archived", v),
+            ChatFlag::Pinned(v) => ("pinned", v),
+            ChatFlag::Muted(v) => ("muted", v),
+        };
+        // `col` is one of three literals above, never user input.
+        let sql = format!(
+            "INSERT INTO chats (id, {col}) VALUES (?1, ?2)
+             ON CONFLICT(id) DO UPDATE SET {col} = excluded.{col}"
+        );
+        self.lock()?.execute(&sql, params![chat, on])?;
+        Ok(())
+    }
+
+    /// Creates or updates a list definition.
+    pub fn save_list(&self, def: &ListDef) -> Result<()> {
+        self.lock()?.execute(
+            "INSERT INTO lists (id, name, color, kind, ord) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET name = excluded.name, color = excluded.color,
+                kind = excluded.kind, ord = excluded.ord",
+            params![def.id, def.name, def.color, def.kind.code(), def.order],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes a list and its members.
+    pub fn delete_list(&self, id: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        tx.execute("DELETE FROM lists WHERE id = ?1", params![id])?;
+        tx.execute("DELETE FROM list_chats WHERE list_id = ?1", params![id])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Adds / removes a chat from a list.
+    pub fn set_list_member(&self, list: &str, chat: &str, member: bool) -> Result<()> {
+        let conn = self.lock()?;
+        if member {
+            conn.execute(
+                "INSERT OR IGNORE INTO list_chats (list_id, chat_id) VALUES (?1, ?2)",
+                params![list, chat],
+            )?;
+        } else {
+            conn.execute(
+                "DELETE FROM list_chats WHERE list_id = ?1 AND chat_id = ?2",
+                params![list, chat],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// All lists and their `(list, chat)` memberships.
+    #[allow(clippy::type_complexity)]
+    pub fn load_lists(&self) -> Result<(Vec<ListDef>, Vec<(String, String)>)> {
+        let conn = self.lock()?;
+        let mut st = conn.prepare_cached("SELECT id, name, color, kind, ord FROM lists")?;
+        let defs = st
+            .query_map([], |r| {
+                Ok(ListDef {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    color: r.get(2)?,
+                    kind: ListKind::from_code(r.get(3)?),
+                    order: r.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let mut st = conn.prepare_cached("SELECT list_id, chat_id FROM list_chats")?;
+        let members = st
             .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
-            .collect::<std::result::Result<_, _>>()?;
-        Ok(map)
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok((defs, members))
     }
 
     /// Non-secret settings (own JID, last open chat).
@@ -462,8 +560,9 @@ impl Store {
     /// Wipes everything (logout).
     pub fn clear(&self) -> Result<()> {
         self.lock()?.execute_batch(
-            "DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM kv;
-             DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts;",
+            "DELETE FROM messages; DELETE FROM chats; DELETE FROM contact_names; DELETE FROM kv;
+             DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts;
+             DELETE FROM lists; DELETE FROM list_chats;",
         )?;
         Ok(())
     }
@@ -765,7 +864,7 @@ pub fn search_text(c: &Content) -> Option<String> {
 /// The text of a message the search matches against, as written.
 pub fn display_text(c: &Content) -> Option<String> {
     let t = match c {
-        Content::Text(t) => t.as_str(),
+        Content::Text(t) | Content::Link { text: t, .. } => t.as_str(),
         Content::Image { caption, .. }
         | Content::Video { caption, .. }
         | Content::Document {
@@ -861,6 +960,7 @@ fn encode_content(c: &Content) -> Result<(String, Option<Vec<u8>>)> {
     let json = serde_json::to_string(c).map_err(|e| Error::Protocol(e.to_string()))?;
     let thumb = match c {
         Content::Image { thumbnail, .. } | Content::Video { thumbnail, .. } => thumbnail.clone(),
+        Content::Link { preview, .. } => preview.thumbnail.clone(),
         _ => None,
     };
     Ok((json, thumb))
@@ -875,8 +975,10 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
     let thumb: Option<Vec<u8>> = r.get(o + 7)?;
     let mut content: Content = serde_json::from_str(&json)
         .unwrap_or_else(|_| Content::Unsupported("unreadable cache entry".into()));
-    if let Content::Image { thumbnail, .. } | Content::Video { thumbnail, .. } = &mut content {
-        *thumbnail = thumb;
+    match &mut content {
+        Content::Image { thumbnail, .. } | Content::Video { thumbnail, .. } => *thumbnail = thumb,
+        Content::Link { preview, .. } => preview.thumbnail = thumb,
+        _ => {}
     }
     Ok(Message {
         chat: r.get(o)?,
@@ -924,7 +1026,7 @@ mod tests {
     #[test]
     fn migrations_set_version() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 3);
+        assert_eq!(s.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -1120,16 +1222,151 @@ mod tests {
     #[test]
     fn contacts_kv_and_clear() {
         let s = Store::open_in_memory().unwrap();
-        s.set_contact_names(&[("a".into(), "Ana".into())]).unwrap();
+        s.set_contact_names(&[("a".into(), NameSource::Push, "Ana".into())])
+            .unwrap();
         s.set_kv("own_jid", "me").unwrap();
         assert_eq!(
-            s.contact_names().unwrap().get("a").map(String::as_str),
-            Some("Ana")
+            s.contact_names().unwrap(),
+            vec![("a".to_string(), NameSource::Push, "Ana".to_string())]
         );
         assert_eq!(s.kv("own_jid").unwrap().as_deref(), Some("me"));
+        s.save_list(&ListDef {
+            id: "1".into(),
+            name: "Family".into(),
+            kind: ListKind::Custom,
+            ..Default::default()
+        })
+        .unwrap();
         s.clear().unwrap();
         assert!(s.contact_names().unwrap().is_empty());
         assert!(s.kv("own_jid").unwrap().is_none());
+        assert!(s.load_lists().unwrap().0.is_empty());
+    }
+
+    #[test]
+    fn contact_names_keep_one_row_per_source() {
+        let s = Store::open_in_memory().unwrap();
+        s.set_contact_names(&[
+            ("a".into(), NameSource::Push, "Anita".into()),
+            ("a".into(), NameSource::Saved, "Ana".into()),
+            ("a".into(), NameSource::Saved, "Ana G".into()),
+            ("a".into(), NameSource::Business, "Ana Shop".into()),
+        ])
+        .unwrap();
+        let mut rows = s.contact_names().unwrap();
+        rows.sort_by_key(|(_, src, _)| *src);
+        assert_eq!(
+            rows,
+            vec![
+                ("a".into(), NameSource::Push, "Anita".into()),
+                ("a".into(), NameSource::Business, "Ana Shop".into()),
+                ("a".into(), NameSource::Saved, "Ana G".into()),
+            ]
+        );
+        // An empty saved name removes it; an empty push name is ignored.
+        s.set_contact_names(&[
+            ("a".into(), NameSource::Saved, String::new()),
+            ("a".into(), NameSource::Push, String::new()),
+        ])
+        .unwrap();
+        assert_eq!(s.contact_names().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn migration_4_keeps_old_contact_names_as_push_names() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(3).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", i as i64 + 1)
+                .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO contacts (jid, name) VALUES ('a', 'Old Name')",
+            [],
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        assert_eq!(
+            s.contact_names().unwrap(),
+            vec![("a".to_string(), NameSource::Push, "Old Name".to_string())]
+        );
+    }
+
+    #[test]
+    fn chat_flags_create_and_update_rows() {
+        let s = Store::open_in_memory().unwrap();
+        s.set_chat_flag("a", ChatFlag::Archived(true)).unwrap();
+        s.set_chat_flag("a", ChatFlag::Pinned(true)).unwrap();
+        s.set_chat_flag("a", ChatFlag::Muted(true)).unwrap();
+        let row = s.chat_rows().unwrap().remove(0);
+        assert!(row.meta.archived && row.meta.pinned && row.meta.muted);
+        s.set_chat_flag("a", ChatFlag::Archived(false)).unwrap();
+        assert!(!s.chat_rows().unwrap()[0].meta.archived);
+        assert!(s.chat_rows().unwrap()[0].meta.pinned);
+    }
+
+    #[test]
+    fn lists_and_members_round_trip() {
+        let s = Store::open_in_memory().unwrap();
+        let def = ListDef {
+            id: "1".into(),
+            name: "Family".into(),
+            color: 3,
+            kind: ListKind::Custom,
+            order: 2,
+        };
+        s.save_list(&def).unwrap();
+        s.set_list_member("1", "a", true).unwrap();
+        s.set_list_member("1", "a", true).unwrap();
+        s.set_list_member("1", "b", true).unwrap();
+        s.set_list_member("1", "b", false).unwrap();
+        let (defs, members) = s.load_lists().unwrap();
+        assert_eq!(defs, vec![def.clone()]);
+        assert_eq!(members, vec![("1".to_string(), "a".to_string())]);
+        // Rename keeps the members; deleting removes both.
+        s.save_list(&ListDef {
+            name: "Fam".into(),
+            ..def
+        })
+        .unwrap();
+        assert_eq!(s.load_lists().unwrap().0[0].name, "Fam");
+        s.delete_list("1").unwrap();
+        let (defs, members) = s.load_lists().unwrap();
+        assert!(defs.is_empty() && members.is_empty());
+    }
+
+    #[test]
+    fn link_preview_thumbnail_is_stored_and_restored() {
+        use crate::net::types::LinkPreview;
+        let s = Store::open_in_memory().unwrap();
+        let m = Message {
+            id: "l1".into(),
+            chat: "c".into(),
+            sender: "x".into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: 10,
+            content: Content::Link {
+                text: "see https://example.com".into(),
+                preview: LinkPreview {
+                    url: "https://example.com".into(),
+                    title: "Example".into(),
+                    description: "d".into(),
+                    thumbnail: Some(vec![9, 8, 7]),
+                },
+            },
+            status: ReceiptStatus::Read,
+            expires_at: None,
+            reply: None,
+            edited: false,
+            reactions: Vec::new(),
+        };
+        s.insert_messages(std::slice::from_ref(&m)).unwrap();
+        let back = s.message("c", "l1").unwrap().unwrap();
+        assert_eq!(back, m);
+        // Links are searchable by their text.
+        assert_eq!(s.search_messages(None, "example", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -1425,7 +1662,7 @@ mod tests {
         )
         .unwrap();
         let s = Store::init(conn).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 3);
+        assert_eq!(s.schema_version().unwrap(), 4);
         assert_eq!(s.search_messages(None, "legacy", 5).unwrap().len(), 1);
         let m = s.message("c", "1").unwrap().unwrap();
         assert!(!m.edited && m.reply.is_none() && m.reactions.is_empty());

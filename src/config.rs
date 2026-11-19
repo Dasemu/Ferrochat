@@ -27,6 +27,24 @@ pub enum ScreenshotTarget {
     Delete,
     /// Settings page (background / tray toggles).
     Settings,
+    /// Chat list showing the archived chats.
+    Archived,
+    /// Chat list with a custom list selected.
+    Lists,
+    /// Chat list with a chat's right-click menu open.
+    ChatMenu,
+    /// The in-app video player.
+    Video,
+}
+
+impl ScreenshotTarget {
+    /// Screens drawn from the chat list alone (no conversation is opened).
+    pub fn list_only(self) -> bool {
+        matches!(
+            self,
+            Self::Login | Self::ChatList | Self::Archived | Self::Lists | Self::ChatMenu
+        )
+    }
 }
 
 impl ScreenshotTarget {
@@ -41,6 +59,10 @@ impl ScreenshotTarget {
             "list-search" => Some(Self::ListSearch),
             "delete" => Some(Self::Delete),
             "settings" => Some(Self::Settings),
+            "archived" => Some(Self::Archived),
+            "lists" => Some(Self::Lists),
+            "chat-menu" => Some(Self::ChatMenu),
+            "video" => Some(Self::Video),
             _ => None,
         }
     }
@@ -99,7 +121,7 @@ pub const USAGE: &str = "\
 ferrochat - unofficial native WhatsApp desktop client
 
 USAGE:
-    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings> <out.png>]
+    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|archived|lists|chat-menu|video> <out.png>]
 
 OPTIONS:
     --mock                      Run with mock data and a fake protocol (no network)

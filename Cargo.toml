@@ -10,6 +10,21 @@ readme = "README.md"
 publish = false
 default-run = "ferrochat"
 
+[features]
+default = ["video"]
+# In-app video playback: the `ferrochat-player` helper process decodes with
+# GStreamer (system libraries). The main binary does not link GStreamer.
+video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+
+[[bin]]
+name = "ferrochat-player"
+path = "src/bin/ferrochat-player.rs"
+required-features = ["video"]
+
+[[test]]
+name = "video_player"
+required-features = ["video"]
+
 [dependencies]
 # UI
 iced = { version = "0.14", features = ["tokio", "image", "advanced", "svg", "canvas"] }
@@ -51,6 +66,10 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 # Opens documents without a shell (ShellExecuteW on Windows, xdg-open/open elsewhere).
 open = { version = "5", features = ["shellexecute-on-windows"] }
 lru = "0.16"
+# Video helper (in `ferrochat-player` only): GStreamer bindings, decoding to RGBA frames.
+gstreamer = { version = "0.25", optional = true }
+gstreamer-app = { version = "0.25", optional = true }
+gstreamer-video = { version = "0.25", optional = true }
 # Renders the app's SVG icon to ARGB32 tray pixmaps / the window icon (already in the tree via iced's svg).
 resvg = { version = "0.45", default-features = false }
 
@@ -59,6 +78,9 @@ resvg = { version = "0.45", default-features = false }
 ksni = "0.3"
 
 [dev-dependencies]
+# Runs `iced::Task`s headlessly so tests can drive the app against the fake client
+# (same crate version iced already uses; dev-only).
+iced_runtime = "0.14"
 # Fake StatusNotifierWatcher for the tray integration test (zbus 5, already in the tree).
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 waproto = { version = "0.7", features = ["serde-deserialize"] }
