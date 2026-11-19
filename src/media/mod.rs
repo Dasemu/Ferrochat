@@ -2,8 +2,10 @@
 //! byte-budgeted media cache. No UI types here.
 
 pub mod audio;
+pub mod avatar;
 pub mod image;
 
+use std::borrow::Borrow;
 use std::hash::Hash;
 
 use crate::error::{Error, Result};
@@ -71,13 +73,29 @@ impl<K: Hash + Eq, V> ByteLru<K, V> {
         self.inner.get(key).map(|(v, _)| v)
     }
 
+    /// Removes an entry.
+    pub fn pop<Q: Hash + Eq + ?Sized>(&mut self, key: &Q) -> Option<V>
+    where
+        K: Borrow<Q>,
+    {
+        let (v, size) = self.inner.pop(key)?;
+        self.bytes -= size;
+        Some(v)
+    }
+
     /// Looks up without touching recency (usable from `&self` views).
-    pub fn peek(&self, key: &K) -> Option<&V> {
+    pub fn peek<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> Option<&V>
+    where
+        K: Borrow<Q>,
+    {
         self.inner.peek(key).map(|(v, _)| v)
     }
 
     /// True if present.
-    pub fn contains(&self, key: &K) -> bool {
+    pub fn contains<Q: Hash + Eq + ?Sized>(&self, key: &Q) -> bool
+    where
+        K: Borrow<Q>,
+    {
         self.inner.contains(key)
     }
 

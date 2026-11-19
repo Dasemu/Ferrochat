@@ -60,7 +60,9 @@ impl Driver {
                     c.merge(messages);
                 }
             }
-            Event::Receipt { chat, ids, status } => {
+            Event::Receipt {
+                chat, ids, status, ..
+            } => {
                 self.store.apply_receipt(&chat, &ids, status).unwrap();
                 self.chats.apply_receipt(&chat, &ids, status);
                 if let Some(c) = &mut self.open {
@@ -159,12 +161,18 @@ async fn sending_text_walks_the_receipt_state_machine() {
         content: Content::Text("hola".into()),
         status: ReceiptStatus::Pending,
         expires_at: None,
+        reply: None,
+        edited: false,
+        reactions: Vec::new(),
     };
     d.apply(Event::Messages {
         messages: vec![local],
         origin: Origin::Live,
     });
-    client.send_text(SHOWCASE_CHAT, &id, "hola").await.unwrap();
+    client
+        .send_text(SHOWCASE_CHAT, &id, "hola", None)
+        .await
+        .unwrap();
 
     let status = |d: &Driver| d.store.message(SHOWCASE_CHAT, &id).unwrap().unwrap().status;
     // Sent is emitted synchronously by the send call.
@@ -205,7 +213,12 @@ async fn failed_send_reports_error() {
         ..Default::default()
     };
     let (client, _stream) = fake::start(opts, data());
-    assert!(client.send_text(SHOWCASE_CHAT, "X", "x").await.is_err());
+    assert!(
+        client
+            .send_text(SHOWCASE_CHAT, "X", "x", None)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -296,6 +309,9 @@ async fn live_incoming_message_bumps_unread() {
         content: Content::Text("¿Estás?".into()),
         status: ReceiptStatus::Read,
         expires_at: None,
+        reply: None,
+        edited: false,
+        reactions: Vec::new(),
     });
     drain(&mut stream, &mut d).await;
     assert_eq!(d.chats.get(SHOWCASE_CHAT).unwrap().meta.unread, before + 1);
@@ -319,6 +335,9 @@ async fn offline_drain_counts_unread_once() {
         content: Content::Text("while you were away".into()),
         status: ReceiptStatus::Read,
         expires_at: None,
+        reply: None,
+        edited: false,
+        reactions: Vec::new(),
     };
     client.simulate_offline_drain(vec![msg("OFF1"), msg("OFF2")]);
     drain(&mut stream, &mut d).await;

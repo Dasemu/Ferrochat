@@ -13,7 +13,45 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{Error, Result};
 use crate::net::types::{ChatMeta, Content, Message, ReceiptStatus};
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("migration_2.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("schema.sql"),
+    include_str!("migration_2.sql"),
+    include_str!("migration_3.sql"),
+];
+
+/// Longest emoji string accepted as a reaction (bytes). Skin-tone and ZWJ
+/// sequences fit comfortably; anything longer is garbage.
+pub const MAX_REACTION_BYTES: usize = 64;
+/// Most search hits returned.
+pub const MAX_SEARCH_HITS: usize = 100;
+
+/// One message found by a search.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SearchHit {
+    /// Chat.
+    pub chat: String,
+    /// Message id.
+    pub id: String,
+    /// Unix seconds.
+    pub ts: i64,
+    /// Sent by us.
+    pub from_me: bool,
+    /// Sender JID.
+    pub sender: String,
+    /// Matching text around the hit.
+    pub snippet: String,
+}
+
+/// A page of messages around an anchor, for "jump to message".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Window {
+    /// Messages, oldest first.
+    pub messages: Vec<Message>,
+    /// Older messages exist.
+    pub has_older: bool,
+    /// Newer messages exist.
+    pub has_newer: bool,
+}
 
 /// Thread-safe handle; clone freely. Heavy calls should run in
 /// `spawn_blocking` (the app does).
@@ -65,6 +103,9 @@ impl Store {
                 conn.execute_batch(sql)?;
                 conn.pragma_update(None, "user_version", target)?;
             }
+        }
+        if version > 0 && version < 3 {
+            backfill_search(&conn)?;
         }
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
@@ -134,13 +175,20 @@ impl Store {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO messages
                     (chat_id, id, sender, sender_name, from_me, ts, kind, content, thumb, status,
-                     expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                     expires_at, reply, edited, search)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            )?;
+            let mut react = tx.prepare_cached(
+                "INSERT INTO reactions (chat_id, msg_id, reactor, emoji, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(chat_id, msg_id, reactor) DO UPDATE SET
+                    emoji = excluded.emoji, ts = excluded.ts
+                 WHERE excluded.ts >= reactions.ts",
             )?;
             let mut update_status = tx
                 .prepare_cached("UPDATE messages SET status = ?3 WHERE chat_id = ?1 AND id = ?2")?;
             let mut update_content = tx.prepare_cached(
-                "UPDATE messages SET kind = ?3, content = ?4, thumb = NULL
+                "UPDATE messages SET kind = ?3, content = ?4, thumb = NULL, search = NULL
                  WHERE chat_id = ?1 AND id = ?2",
             )?;
             let mut chat = tx.prepare_cached(
@@ -172,6 +220,9 @@ impl Store {
                             thumb,
                             m.status.to_i64(),
                             m.expires_at,
+                            m.reply.as_ref().and_then(|q| serde_json::to_string(q).ok()),
+                            m.edited,
+                            search_text(&m.content),
                         ])?;
                         new_ids.push(m.id.clone());
                     }
@@ -191,6 +242,13 @@ impl Store {
                     }
                 }
                 chat.execute(params![m.chat, m.timestamp])?;
+                for r in m
+                    .reactions
+                    .iter()
+                    .filter(|r| valid_reaction(&r.reactor, &r.emoji))
+                {
+                    react.execute(params![m.chat, m.id, r.reactor, r.emoji, r.ts])?;
+                }
             }
         }
         tx.commit()?;
@@ -255,7 +313,8 @@ impl Store {
         let conn = self.lock()?;
         let (ts, id) = before.unwrap_or((i64::MAX, ""));
         let mut st = conn.prepare_cached(
-            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at
+            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
+                    reply, edited
              FROM messages
              WHERE chat_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
              ORDER BY ts DESC, id DESC LIMIT ?4",
@@ -265,6 +324,7 @@ impl Store {
             .query_map(params![chat, ts, id_bound, limit as i64], row_to_message)?
             .collect::<std::result::Result<_, _>>()?;
         rows.reverse();
+        attach_reactions(&conn, chat, &mut rows)?;
         Ok(rows)
     }
 
@@ -272,10 +332,15 @@ impl Store {
     pub fn message(&self, chat: &str, id: &str) -> Result<Option<Message>> {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
-            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at
+            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
+                    reply, edited
              FROM messages WHERE chat_id = ?1 AND id = ?2",
         )?;
-        Ok(st.query_row(params![chat, id], row_to_message).optional()?)
+        let mut m = st.query_row(params![chat, id], row_to_message).optional()?;
+        if let Some(m) = &mut m {
+            attach_reactions(&conn, chat, std::slice::from_mut(m))?;
+        }
+        Ok(m)
     }
 
     /// All chats with their newest message, most recent first (pinned on top).
@@ -284,7 +349,7 @@ impl Store {
         let mut st = conn.prepare_cached(
             "SELECT c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.muted,
                     m.chat_id, m.id, m.sender, m.sender_name, m.from_me, m.ts, m.content,
-                    m.thumb, m.status, m.expires_at
+                    m.thumb, m.status, m.expires_at, m.reply, m.edited
              FROM chats c
              LEFT JOIN messages m ON m.rowid = (
                 SELECT rowid FROM messages WHERE chat_id = c.id ORDER BY ts DESC, id DESC LIMIT 1
@@ -397,10 +462,285 @@ impl Store {
     /// Wipes everything (logout).
     pub fn clear(&self) -> Result<()> {
         self.lock()?.execute_batch(
-            "DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM kv; DELETE FROM lid_map;",
+            "DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM kv;
+             DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts;",
         )?;
         Ok(())
     }
+
+    /// Records, replaces or (empty emoji) removes one reactor's reaction.
+    /// Older reactions never overwrite newer ones. Returns true when the
+    /// stored state changed.
+    pub fn apply_reaction(
+        &self,
+        chat: &str,
+        target: &str,
+        reactor: &str,
+        emoji: &str,
+        ts: i64,
+    ) -> Result<bool> {
+        let conn = self.lock()?;
+        if emoji.is_empty() {
+            let n = conn.execute(
+                "DELETE FROM reactions
+                 WHERE chat_id = ?1 AND msg_id = ?2 AND reactor = ?3 AND ts <= ?4",
+                params![chat, target, reactor, ts],
+            )?;
+            return Ok(n > 0);
+        }
+        if !valid_reaction(reactor, emoji) {
+            return Ok(false);
+        }
+        let n = conn.execute(
+            "INSERT INTO reactions (chat_id, msg_id, reactor, emoji, ts) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(chat_id, msg_id, reactor) DO UPDATE SET emoji = excluded.emoji, ts = excluded.ts
+             WHERE excluded.ts >= reactions.ts",
+            params![chat, target, reactor, emoji, ts],
+        )?;
+        Ok(n > 0)
+    }
+
+    /// Applies an edit from `sender`. Only the original sender may edit
+    /// (same rule as revokes) and deleted messages stay deleted. Returns the
+    /// updated message when the edit was applied.
+    pub fn apply_edit(
+        &self,
+        chat: &str,
+        id: &str,
+        sender: &str,
+        from_me: bool,
+        content: &Content,
+    ) -> Result<Option<Message>> {
+        let Some(orig) = self.message(chat, id)? else {
+            return Ok(None);
+        };
+        if matches!(orig.content, Content::Deleted) {
+            return Ok(None);
+        }
+        let allowed = edit_allowed(orig.from_me, &orig.sender, sender, from_me);
+        let Some(merged) = crate::net::types::merge_edit(&orig.content, content) else {
+            return Ok(None);
+        };
+        if !allowed {
+            return Ok(None);
+        }
+        let (json, _) = encode_content(&merged)?;
+        self.lock()?.execute(
+            "UPDATE messages SET kind = ?3, content = ?4, edited = 1, search = ?5
+             WHERE chat_id = ?1 AND id = ?2",
+            params![chat, id, merged.kind_tag(), json, search_text(&merged)],
+        )?;
+        self.message(chat, id)
+    }
+
+    /// Removes one message locally ("delete for me").
+    pub fn delete_message(&self, chat: &str, id: &str) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        for sql in [
+            "DELETE FROM messages WHERE chat_id = ?1 AND id = ?2",
+            "DELETE FROM reactions WHERE chat_id = ?1 AND msg_id = ?2",
+            "DELETE FROM receipts WHERE chat_id = ?1 AND msg_id = ?2",
+        ] {
+            tx.execute(sql, params![chat, id])?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Case-insensitive substring search over message text, newest first.
+    /// `chat = None` searches every chat.
+    pub fn search_messages(
+        &self,
+        chat: Option<&str>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        let q = query.trim().to_lowercase();
+        if q.chars().count() < 2 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.clamp(1, MAX_SEARCH_HITS) as i64;
+        let conn = self.lock()?;
+        let mut st = conn.prepare_cached(
+            "SELECT chat_id, id, ts, from_me, sender, content FROM messages
+             WHERE search IS NOT NULL AND instr(search, ?1) > 0
+               AND (?2 IS NULL OR chat_id = ?2)
+             ORDER BY ts DESC, id DESC LIMIT ?3",
+        )?;
+        let hits = st
+            .query_map(params![q, chat, limit], |r| {
+                let json: String = r.get(5)?;
+                // Show the text as written, not the lower-cased search copy.
+                let text = serde_json::from_str::<Content>(&json)
+                    .ok()
+                    .and_then(|c| display_text(&c))
+                    .unwrap_or_default();
+                Ok(SearchHit {
+                    chat: r.get(0)?,
+                    id: r.get(1)?,
+                    ts: r.get(2)?,
+                    from_me: r.get(3)?,
+                    sender: r.get(4)?,
+                    snippet: snippet_around(&text, &q),
+                })
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(hits)
+    }
+
+    /// Messages around `(ts, id)`: up to `before` older and `after` newer
+    /// ones plus the anchor itself.
+    pub fn load_around(
+        &self,
+        chat: &str,
+        ts: i64,
+        id: &str,
+        before: usize,
+        after: usize,
+    ) -> Result<Window> {
+        let conn = self.lock()?;
+        let cols = "chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
+                    expires_at, reply, edited";
+        let mut older = conn
+            .prepare_cached(&format!(
+                "SELECT {cols} FROM messages
+                 WHERE chat_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
+                 ORDER BY ts DESC, id DESC LIMIT ?4"
+            ))?
+            .query_map(params![chat, ts, id, before as i64 + 1], row_to_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_older = older.len() > before;
+        older.truncate(before);
+        older.reverse();
+        let newer = conn
+            .prepare_cached(&format!(
+                "SELECT {cols} FROM messages
+                 WHERE chat_id = ?1 AND (ts > ?2 OR (ts = ?2 AND id >= ?3))
+                 ORDER BY ts ASC, id ASC LIMIT ?4"
+            ))?
+            .query_map(params![chat, ts, id, after as i64 + 2], row_to_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_newer = newer.len() > after + 1;
+        let mut messages = older;
+        messages.extend(newer.into_iter().take(after + 1));
+        attach_reactions(&conn, chat, &mut messages)?;
+        Ok(Window {
+            messages,
+            has_older,
+            has_newer,
+        })
+    }
+
+    /// The page of messages after the `(ts, id)` cursor, oldest first.
+    pub fn load_newer(
+        &self,
+        chat: &str,
+        after: (i64, &str),
+        limit: usize,
+    ) -> Result<(Vec<Message>, bool)> {
+        let conn = self.lock()?;
+        let mut rows = conn
+            .prepare_cached(
+                "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
+                        expires_at, reply, edited
+                 FROM messages
+                 WHERE chat_id = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
+                 ORDER BY ts ASC, id ASC LIMIT ?4",
+            )?
+            .query_map(
+                params![chat, after.0, after.1, limit as i64 + 1],
+                row_to_message,
+            )?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let more = rows.len() > limit;
+        rows.truncate(limit);
+        attach_reactions(&conn, chat, &mut rows)?;
+        Ok((rows, more))
+    }
+
+    /// Records one group participant's receipt for each id and re-derives
+    /// the aggregate tick of our messages. `size` is the number of other
+    /// participants; without it nothing is promoted yet. Returns the
+    /// `(id, new_status)` pairs that changed.
+    pub fn apply_group_receipt(
+        &self,
+        chat: &str,
+        ids: &[String],
+        participant: Option<(&str, ReceiptStatus)>,
+        size: Option<usize>,
+    ) -> Result<Vec<(String, ReceiptStatus)>> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        let mut changed = Vec::new();
+        {
+            let mut record = tx.prepare_cached(
+                "INSERT INTO receipts (chat_id, msg_id, participant, status) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(chat_id, msg_id, participant) DO UPDATE SET status = excluded.status
+                 WHERE excluded.status > receipts.status",
+            )?;
+            let mut own = tx.prepare_cached(
+                "SELECT status FROM messages WHERE chat_id = ?1 AND id = ?2 AND from_me = 1",
+            )?;
+            let mut counts = tx.prepare_cached(
+                "SELECT COALESCE(SUM(status >= 2), 0), COALESCE(SUM(status >= 3), 0)
+                 FROM receipts WHERE chat_id = ?1 AND msg_id = ?2",
+            )?;
+            let mut set = tx
+                .prepare_cached("UPDATE messages SET status = ?3 WHERE chat_id = ?1 AND id = ?2")?;
+            for id in ids {
+                let Some(cur) = own
+                    .query_row(params![chat, id], |r| r.get::<_, i64>(0))
+                    .optional()?
+                else {
+                    continue;
+                };
+                if let Some((p, status)) = participant {
+                    record.execute(params![chat, id, p, status.to_i64()])?;
+                }
+                let Some(size) = size else { continue };
+                let (delivered, read): (i64, i64) =
+                    counts.query_row(params![chat, id], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                let cur = ReceiptStatus::from_i64(cur);
+                let Some(agg) =
+                    crate::app::state::group_status(size, delivered as usize, read as usize)
+                else {
+                    continue;
+                };
+                let next = cur.advance(agg);
+                if next != cur {
+                    set.execute(params![chat, id, next.to_i64()])?;
+                    changed.push((id.clone(), next));
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+
+    /// Per-participant receipts of a message: `(participant, status)`.
+    pub fn receipts_of(&self, chat: &str, id: &str) -> Result<Vec<(String, ReceiptStatus)>> {
+        let conn = self.lock()?;
+        let rows = conn
+            .prepare_cached(
+                "SELECT participant, status FROM receipts WHERE chat_id = ?1 AND msg_id = ?2
+                 ORDER BY participant",
+            )?
+            .query_map(params![chat, id], |r| {
+                Ok((r.get(0)?, ReceiptStatus::from_i64(r.get(1)?)))
+            })?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(rows)
+    }
+}
+
+/// An edit only applies when the editor sent the original message: us (from
+/// any of our devices) or the same remote sender.
+pub fn edit_allowed(orig_from_me: bool, orig_sender: &str, sender: &str, from_me: bool) -> bool {
+    if orig_from_me || from_me {
+        return orig_from_me && from_me;
+    }
+    !sender.is_empty() && sender == orig_sender
 }
 
 /// "Delete for everyone" only applies when the revoker sent the original
@@ -413,10 +753,114 @@ pub fn revoke_allowed(orig_from_me: bool, orig_sender: &str, revoke: &Message) -
     !revoke.sender.is_empty() && revoke.sender == orig_sender
 }
 
+fn valid_reaction(reactor: &str, emoji: &str) -> bool {
+    !reactor.is_empty() && !emoji.is_empty() && emoji.len() <= MAX_REACTION_BYTES
+}
+
+/// Lower-cased text the search looks at.
+pub fn search_text(c: &Content) -> Option<String> {
+    display_text(c).map(|t| t.to_lowercase())
+}
+
+/// The text of a message the search matches against, as written.
+pub fn display_text(c: &Content) -> Option<String> {
+    let t = match c {
+        Content::Text(t) => t.as_str(),
+        Content::Image { caption, .. }
+        | Content::Video { caption, .. }
+        | Content::Document {
+            caption: caption @ Some(_),
+            ..
+        } => caption.as_deref()?,
+        Content::Document { file_name, .. } => file_name.as_str(),
+        _ => return None,
+    };
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// A short excerpt of `text` around the first (case-insensitive) occurrence
+/// of `q` (already lower-cased).
+pub fn snippet_around(text: &str, q: &str) -> String {
+    const BEFORE: usize = 24;
+    const TOTAL: usize = 80;
+    let lower = text.to_lowercase();
+    let Some(pos) = lower.find(q) else {
+        return text.chars().take(TOTAL).collect();
+    };
+    // Char index of the match (lower-casing keeps char counts in practice).
+    let chars_before = lower[..pos].chars().count();
+    let skip = chars_before.saturating_sub(BEFORE);
+    let mut out: String = text.chars().skip(skip).take(TOTAL).collect();
+    if skip > 0 {
+        out.insert(0, '…');
+    }
+    if text.chars().count() > skip + TOTAL {
+        out.push('…');
+    }
+    out.replace('\n', " ")
+}
+
+fn backfill_search(conn: &Connection) -> Result<()> {
+    let mut rows = Vec::new();
+    {
+        let mut st =
+            conn.prepare("SELECT chat_id, id, content FROM messages WHERE search IS NULL")?;
+        let mut q = st.query([])?;
+        while let Some(r) = q.next()? {
+            let (chat, id, json): (String, String, String) = (r.get(0)?, r.get(1)?, r.get(2)?);
+            if let Some(t) = serde_json::from_str::<Content>(&json)
+                .ok()
+                .and_then(|c| search_text(&c))
+            {
+                rows.push((chat, id, t));
+            }
+        }
+    }
+    let mut set = conn.prepare("UPDATE messages SET search = ?3 WHERE chat_id = ?1 AND id = ?2")?;
+    for (chat, id, t) in rows {
+        set.execute(params![chat, id, t])?;
+    }
+    Ok(())
+}
+
+/// Fills `reactions` of `msgs` (all in `chat`) with one query.
+fn attach_reactions(conn: &Connection, chat: &str, msgs: &mut [Message]) -> Result<()> {
+    if msgs.is_empty() {
+        return Ok(());
+    }
+    // Fetch by id set through a json array so the statement stays cacheable
+    // whatever the page size.
+    let ids: Vec<&str> = msgs.iter().map(|m| m.id.as_str()).collect();
+    let json = serde_json::to_string(&ids).map_err(|e| Error::Protocol(e.to_string()))?;
+    let mut st = conn.prepare_cached(
+        "SELECT msg_id, reactor, emoji, ts FROM reactions
+         WHERE chat_id = ?1 AND msg_id IN (SELECT value FROM json_each(?2))
+         ORDER BY ts ASC, reactor ASC",
+    )?;
+    let mut by_id: HashMap<String, Vec<crate::net::types::Reaction>> = HashMap::new();
+    let mut rows = st.query(params![chat, json])?;
+    while let Some(r) = rows.next()? {
+        by_id
+            .entry(r.get(0)?)
+            .or_default()
+            .push(crate::net::types::Reaction {
+                reactor: r.get(1)?,
+                emoji: r.get(2)?,
+                ts: r.get(3)?,
+            });
+    }
+    for m in msgs {
+        if let Some(v) = by_id.remove(&m.id) {
+            m.reactions = v;
+        }
+    }
+    Ok(())
+}
+
 fn encode_content(c: &Content) -> Result<(String, Option<Vec<u8>>)> {
     let json = serde_json::to_string(c).map_err(|e| Error::Protocol(e.to_string()))?;
     let thumb = match c {
-        Content::Image { thumbnail, .. } => thumbnail.clone(),
+        Content::Image { thumbnail, .. } | Content::Video { thumbnail, .. } => thumbnail.clone(),
         _ => None,
     };
     Ok((json, thumb))
@@ -431,7 +875,7 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
     let thumb: Option<Vec<u8>> = r.get(o + 7)?;
     let mut content: Content = serde_json::from_str(&json)
         .unwrap_or_else(|_| Content::Unsupported("unreadable cache entry".into()));
-    if let Content::Image { thumbnail, .. } = &mut content {
+    if let Content::Image { thumbnail, .. } | Content::Video { thumbnail, .. } = &mut content {
         *thumbnail = thumb;
     }
     Ok(Message {
@@ -444,6 +888,11 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
         content,
         status: ReceiptStatus::from_i64(r.get(o + 8)?),
         expires_at: r.get(o + 9)?,
+        reply: r
+            .get::<_, Option<String>>(o + 10)?
+            .and_then(|j| serde_json::from_str(&j).ok()),
+        edited: r.get(o + 11)?,
+        reactions: Vec::new(),
     })
 }
 
@@ -466,13 +915,16 @@ mod tests {
                 ReceiptStatus::Read
             },
             expires_at: None,
+            reply: None,
+            edited: false,
+            reactions: Vec::new(),
         }
     }
 
     #[test]
     fn migrations_set_version() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 2);
+        assert_eq!(s.schema_version().unwrap(), 3);
     }
 
     #[test]
@@ -692,5 +1144,381 @@ mod tests {
         let s2 = Store::open(&path).unwrap();
         assert_eq!(s2.kv("k").unwrap().as_deref(), Some("v"));
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // ---- parity features -------------------------------------------------
+
+    use crate::net::types::{Quote, Reaction};
+
+    fn store_with(msgs: &[Message]) -> Store {
+        let s = Store::open_in_memory().unwrap();
+        s.insert_messages(msgs).unwrap();
+        s
+    }
+
+    #[test]
+    fn replies_and_edit_flag_roundtrip() {
+        let mut m = msg("c", "2", 20, false, "answer");
+        m.reply = Some(Quote {
+            id: "1".into(),
+            sender: "c".into(),
+            preview: "question".into(),
+        });
+        let s = store_with(&[msg("c", "1", 10, true, "question"), m.clone()]);
+        let got = s.message("c", "2").unwrap().unwrap();
+        assert_eq!(got.reply, m.reply);
+        assert!(!got.edited);
+        assert_eq!(s.message("c", "1").unwrap().unwrap().reply, None);
+    }
+
+    #[test]
+    fn reactions_replace_remove_and_load_with_messages() {
+        let s = store_with(&[msg("c", "1", 10, true, "hi"), msg("c", "2", 20, true, "yo")]);
+        assert!(s.apply_reaction("c", "1", "ana", "👍", 100).unwrap());
+        assert!(s.apply_reaction("c", "1", "bob", "❤️", 101).unwrap());
+        // Same reactor changes their mind.
+        assert!(s.apply_reaction("c", "1", "ana", "😂", 102).unwrap());
+        // A stale update (older timestamp) never overwrites a newer one.
+        assert!(!s.apply_reaction("c", "1", "ana", "😮", 50).unwrap());
+        let m = s.load_messages("c", None, 10).unwrap();
+        let r = &m[0].reactions;
+        assert_eq!(r.len(), 2);
+        assert!(r.iter().any(|x| x.reactor == "ana" && x.emoji == "😂"));
+        assert!(m[1].reactions.is_empty());
+        // A stale removal is ignored, a fresh one removes.
+        assert!(!s.apply_reaction("c", "1", "ana", "", 10).unwrap());
+        assert!(s.apply_reaction("c", "1", "ana", "", 200).unwrap());
+        assert_eq!(s.message("c", "1").unwrap().unwrap().reactions.len(), 1);
+        // Removing something that is not there changes nothing.
+        assert!(!s.apply_reaction("c", "1", "zed", "", 300).unwrap());
+    }
+
+    #[test]
+    fn hostile_reactions_are_rejected() {
+        let s = store_with(&[msg("c", "1", 10, true, "hi")]);
+        let huge = "x".repeat(MAX_REACTION_BYTES + 1);
+        assert!(!s.apply_reaction("c", "1", "ana", &huge, 1).unwrap());
+        assert!(!s.apply_reaction("c", "1", "", "👍", 1).unwrap());
+        assert!(s.message("c", "1").unwrap().unwrap().reactions.is_empty());
+    }
+
+    #[test]
+    fn reaction_may_arrive_before_its_message() {
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.apply_reaction("c", "late", "ana", "👍", 5).unwrap());
+        s.insert_messages(&[msg("c", "late", 1, false, "hi")])
+            .unwrap();
+        assert_eq!(s.message("c", "late").unwrap().unwrap().reactions.len(), 1);
+    }
+
+    #[test]
+    fn history_reactions_are_persisted_with_the_message() {
+        let mut m = msg("c", "1", 10, false, "hi");
+        m.reactions = vec![
+            Reaction {
+                reactor: "ana".into(),
+                emoji: "👍".into(),
+                ts: 5,
+            },
+            Reaction {
+                reactor: String::new(),
+                emoji: "x".into(),
+                ts: 5,
+            },
+        ];
+        let s = store_with(&[m]);
+        let got = s.message("c", "1").unwrap().unwrap();
+        assert_eq!(got.reactions.len(), 1, "anonymous reaction dropped");
+    }
+
+    #[test]
+    fn edits_apply_only_from_the_original_sender() {
+        let s = store_with(&[
+            msg("c", "mine", 10, true, "teh"),
+            msg("c", "theirs", 11, false, "orig"),
+        ]);
+        // Someone else cannot edit my message.
+        assert!(
+            s.apply_edit("c", "mine", "c", false, &Content::Text("x".into()))
+                .unwrap()
+                .is_none()
+        );
+        let e = s
+            .apply_edit("c", "mine", "me", true, &Content::Text("the".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.content, Content::Text("the".into()));
+        assert!(e.edited);
+        // Not even I can edit someone else's message.
+        assert!(
+            s.apply_edit("c", "theirs", "me", true, &Content::Text("x".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            s.apply_edit("c", "theirs", "other", false, &Content::Text("x".into()))
+                .unwrap()
+                .is_none()
+        );
+        // The real sender can.
+        assert!(
+            s.apply_edit("c", "theirs", "c", false, &Content::Text("new".into()))
+                .unwrap()
+                .is_some()
+        );
+        // Unknown ids are ignored.
+        assert!(
+            s.apply_edit("c", "nope", "c", false, &Content::Text("x".into()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn deleted_messages_cannot_be_edited_back() {
+        let s = store_with(&[msg("c", "1", 10, true, "secret")]);
+        let mut del = msg("c", "1", 10, true, "");
+        del.content = Content::Deleted;
+        s.insert_messages(&[del]).unwrap();
+        assert!(
+            s.apply_edit("c", "1", "me", true, &Content::Text("back".into()))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            s.message("c", "1").unwrap().unwrap().content,
+            Content::Deleted
+        );
+    }
+
+    #[test]
+    fn caption_edit_keeps_the_media_reference() {
+        let img = Content::Image {
+            caption: Some("old".into()),
+            width: 1,
+            height: 1,
+            thumbnail: Some(vec![1]),
+            media: Some(crate::net::types::MediaRef {
+                direct_path: "/p".into(),
+                media_key: vec![1; 32],
+                file_sha256: vec![],
+                file_enc_sha256: vec![],
+                file_length: 1,
+                kind: crate::net::types::MediaKind::Image,
+                mimetype: "image/jpeg".into(),
+            }),
+        };
+        let mut m = msg("c", "1", 10, true, "");
+        m.content = img;
+        let s = store_with(&[m]);
+        let e = s
+            .apply_edit("c", "1", "me", true, &Content::Text("new caption".into()))
+            .unwrap()
+            .unwrap();
+        match e.content {
+            Content::Image { caption, media, .. } => {
+                assert_eq!(caption.as_deref(), Some("new caption"));
+                assert!(media.is_some());
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn delete_message_removes_row_reactions_and_receipts() {
+        let s = store_with(&[
+            msg("c", "1", 10, true, "bye"),
+            msg("c", "2", 20, true, "stay"),
+        ]);
+        s.apply_reaction("c", "1", "ana", "👍", 1).unwrap();
+        s.apply_group_receipt("c", &["1".into()], Some(("p", ReceiptStatus::Read)), None)
+            .unwrap();
+        s.delete_message("c", "1").unwrap();
+        assert!(s.message("c", "1").unwrap().is_none());
+        assert!(s.receipts_of("c", "1").unwrap().is_empty());
+        assert!(s.message("c", "2").unwrap().is_some());
+        // The chat keeps working.
+        assert_eq!(s.load_messages("c", None, 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_is_case_insensitive_scoped_and_bounded() {
+        let mut caption = msg("b", "4", 40, false, "");
+        caption.content = Content::Document {
+            file_name: "Tax Return.PDF".into(),
+            mimetype: "application/pdf".into(),
+            size: 1,
+            pages: None,
+            caption: None,
+            media: None,
+        };
+        let s = store_with(&[
+            msg("a", "1", 10, false, "Hola Mundo"),
+            msg("a", "2", 20, true, "otro HOLA aquí"),
+            msg("b", "3", 30, false, "hola desde b"),
+            caption,
+            msg("a", "5", 50, false, "x"),
+        ]);
+        let all = s.search_messages(None, "HOLA", 10).unwrap();
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[0].id, "3", "newest first");
+        let a = s.search_messages(Some("a"), "hola", 10).unwrap();
+        assert_eq!(
+            a.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+            ["2", "1"]
+        );
+        assert!(a[0].from_me);
+        assert_eq!(s.search_messages(None, "tax return", 10).unwrap().len(), 1);
+        assert!(
+            s.search_messages(None, "h", 10).unwrap().is_empty(),
+            "too short"
+        );
+        assert!(s.search_messages(None, "   ", 10).unwrap().is_empty());
+        assert_eq!(s.search_messages(None, "hola", 1).unwrap().len(), 1);
+        // SQL metacharacters are data.
+        assert!(
+            s.search_messages(None, "%'; drop table messages;--", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(s.load_messages("a", None, 10).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn search_sees_edits_and_ignores_deleted_text() {
+        let s = store_with(&[msg("a", "1", 10, true, "typo here")]);
+        s.apply_edit("a", "1", "me", true, &Content::Text("fixed text".into()))
+            .unwrap();
+        assert!(s.search_messages(None, "typo", 10).unwrap().is_empty());
+        assert_eq!(s.search_messages(None, "fixed", 10).unwrap().len(), 1);
+        let mut del = msg("a", "1", 10, true, "");
+        del.content = Content::Deleted;
+        s.insert_messages(&[del]).unwrap();
+        assert!(s.search_messages(None, "fixed", 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn snippets_are_centered_and_single_line() {
+        let text = format!("{} needle {}", "a".repeat(100), "b".repeat(100));
+        let sn = snippet_around(&text, "needle");
+        assert!(sn.contains("needle"));
+        assert!(sn.starts_with('…') && sn.ends_with('…'));
+        assert!(sn.chars().count() <= 82);
+        assert_eq!(snippet_around("short needle", "needle"), "short needle");
+        assert!(!snippet_around("a\nneedle\nb", "needle").contains('\n'));
+        assert_eq!(snippet_around("héllo wörld", "wörld"), "héllo wörld");
+        // Case is preserved in what is shown.
+        assert_eq!(snippet_around("Hola Mundo", "mundo"), "Hola Mundo");
+    }
+
+    #[test]
+    fn search_backfills_rows_written_before_v3() {
+        // A v2 database with one text row and no `search` column.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!("schema.sql")).unwrap();
+        conn.execute_batch(include_str!("migration_2.sql")).unwrap();
+        conn.pragma_update(None, "user_version", 2).unwrap();
+        conn.execute(
+            "INSERT INTO messages (chat_id, id, sender, from_me, ts, kind, content, status)
+             VALUES ('c', '1', 's', 0, 5, 'text', ?1, 3)",
+            params![serde_json::to_string(&Content::Text("Legacy Body".into())).unwrap()],
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        assert_eq!(s.schema_version().unwrap(), 3);
+        assert_eq!(s.search_messages(None, "legacy", 5).unwrap().len(), 1);
+        let m = s.message("c", "1").unwrap().unwrap();
+        assert!(!m.edited && m.reply.is_none() && m.reactions.is_empty());
+    }
+
+    #[test]
+    fn load_around_and_newer_page_through_history() {
+        let msgs: Vec<Message> = (1..=100)
+            .map(|i| msg("c", &format!("{i:03}"), i, false, &format!("m{i}")))
+            .collect();
+        let s = store_with(&msgs);
+        let w = s.load_around("c", 50, "050", 5, 5).unwrap();
+        let ids: Vec<_> = w.messages.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids.first(), Some(&"045"));
+        assert_eq!(ids.last(), Some(&"055"));
+        assert_eq!(ids.len(), 11);
+        assert!(w.has_older && w.has_newer);
+        // At the very end nothing is newer; at the start nothing is older.
+        let end = s.load_around("c", 100, "100", 5, 5).unwrap();
+        assert!(!end.has_newer && end.has_older);
+        let start = s.load_around("c", 1, "001", 5, 5).unwrap();
+        assert!(!start.has_older && start.has_newer);
+        let (page, more) = s.load_newer("c", (55, "055"), 20).unwrap();
+        assert_eq!(page.len(), 20);
+        assert_eq!(page[0].id, "056");
+        assert!(more);
+        let (tail, more) = s.load_newer("c", (95, "095"), 20).unwrap();
+        assert_eq!(tail.len(), 5);
+        assert!(!more);
+    }
+
+    #[test]
+    fn group_ticks_turn_blue_only_when_everyone_read() {
+        let s = store_with(&[msg("g@g.us", "m", 10, true, "hi")]);
+        let ids = vec!["m".to_string()];
+        let apply = |p: &str, st: ReceiptStatus, size: Option<usize>| {
+            s.apply_group_receipt("g@g.us", &ids, Some((p, st)), size)
+                .unwrap()
+        };
+        // 3 other participants. One delivery: still a single tick.
+        assert!(apply("a", ReceiptStatus::Delivered, Some(3)).is_empty());
+        assert!(apply("b", ReceiptStatus::Delivered, Some(3)).is_empty());
+        // Everyone received it: two grey ticks.
+        assert_eq!(
+            apply("c", ReceiptStatus::Delivered, Some(3)),
+            vec![("m".to_string(), ReceiptStatus::Delivered)]
+        );
+        // Two readers: still grey.
+        assert!(apply("a", ReceiptStatus::Read, Some(3)).is_empty());
+        assert!(apply("b", ReceiptStatus::Read, Some(3)).is_empty());
+        // The last one reads: blue.
+        assert_eq!(
+            apply("c", ReceiptStatus::Read, Some(3)),
+            vec![("m".to_string(), ReceiptStatus::Read)]
+        );
+        // A late duplicate delivery never downgrades.
+        assert!(apply("a", ReceiptStatus::Delivered, Some(3)).is_empty());
+        assert_eq!(
+            s.message("g@g.us", "m").unwrap().unwrap().status,
+            ReceiptStatus::Read
+        );
+        assert_eq!(s.receipts_of("g@g.us", "m").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn group_ticks_wait_for_a_known_group_size() {
+        let s = store_with(&[msg("g@g.us", "m", 10, true, "hi")]);
+        let ids = vec!["m".to_string()];
+        assert!(
+            s.apply_group_receipt("g@g.us", &ids, Some(("a", ReceiptStatus::Read)), None)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            s.message("g@g.us", "m").unwrap().unwrap().status,
+            ReceiptStatus::Sent
+        );
+        // Once the size is known, the stored receipts are reconciled.
+        let changed = s
+            .apply_group_receipt("g@g.us", &ids, None, Some(1))
+            .unwrap();
+        assert_eq!(changed, vec![("m".to_string(), ReceiptStatus::Read)]);
+    }
+
+    #[test]
+    fn group_receipts_for_other_peoples_messages_are_ignored() {
+        let s = store_with(&[msg("g@g.us", "in", 10, false, "hi")]);
+        let ids = vec!["in".to_string()];
+        assert!(
+            s.apply_group_receipt("g@g.us", &ids, Some(("a", ReceiptStatus::Read)), Some(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(s.receipts_of("g@g.us", "in").unwrap().is_empty());
     }
 }

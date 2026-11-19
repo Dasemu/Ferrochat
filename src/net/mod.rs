@@ -26,12 +26,13 @@ pub type ClientHandle = Arc<dyn WaClient>;
 
 /// Operations the app can ask of the protocol layer.
 pub trait WaClient: Send + Sync {
-    /// Sends a text message with a caller-chosen id.
+    /// Sends a text message with a caller-chosen id, optionally as a reply.
     fn send_text<'a>(
         &'a self,
         chat: &'a str,
         id: &'a str,
         text: &'a str,
+        reply: Option<&'a Quote>,
     ) -> BoxFuture<'a, Result<()>>;
     /// Uploads media and sends it. Returns the content as sent (with the CDN
     /// reference filled in).
@@ -57,6 +58,28 @@ pub trait WaClient: Send + Sync {
         sender: Option<&'a str>,
         ids: &'a [String],
     ) -> BoxFuture<'a, Result<()>>;
+    /// Fetches a profile picture preview (JPEG bytes). `Ok(None)` when the
+    /// contact or group has none or hides it.
+    fn profile_picture<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<Option<Vec<u8>>>>;
+    /// Reacts to a message; an empty `emoji` removes our reaction.
+    fn send_reaction<'a>(&'a self, key: &'a MsgKey, emoji: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Edits the text of one of our messages.
+    fn edit_text<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        text: &'a str,
+    ) -> BoxFuture<'a, Result<()>>;
+    /// "Delete for everyone" for one of our messages.
+    fn revoke<'a>(&'a self, chat: &'a str, id: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// "Delete for me": syncs the deletion to our other devices.
+    fn delete_for_me<'a>(&'a self, key: &'a MsgKey, timestamp: i64) -> BoxFuture<'a, Result<()>>;
+    /// Tells `chat` that we are typing / recording / stopped.
+    fn send_chat_state<'a>(&'a self, chat: &'a str, state: ChatState) -> BoxFuture<'a, Result<()>>;
+    /// Subscribes to a contact's online / last-seen updates.
+    fn subscribe_presence<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Number of other participants of a group (everyone but us).
+    fn group_size<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<usize>>;
     /// Unlinks this device, disconnects and deletes the session store.
     fn logout(&self) -> BoxFuture<'_, Result<()>>;
     /// `--mock` only: pretend the phone scanned the QR code. The live client
@@ -142,7 +165,8 @@ pub enum Event {
         /// Sync progress 0..=100 if known.
         progress: Option<u32>,
     },
-    /// Delivery / read receipt for outgoing messages.
+    /// Delivery / read receipt for outgoing messages. In groups every
+    /// participant sends its own (`participant` set); the app aggregates them.
     Receipt {
         /// Chat.
         chat: ChatId,
@@ -150,6 +174,64 @@ pub enum Event {
         ids: Vec<String>,
         /// New status.
         status: ReceiptStatus,
+        /// Who the receipt is from (groups only).
+        participant: Option<String>,
+    },
+    /// A reaction was added, changed or removed (`emoji` empty).
+    Reaction {
+        /// Chat.
+        chat: ChatId,
+        /// Reacted-to message id.
+        target: String,
+        /// Who reacted (bare JID).
+        reactor: String,
+        /// The emoji; empty removes the reaction.
+        emoji: String,
+        /// Unix seconds.
+        ts: i64,
+    },
+    /// The sender edited a message.
+    Edited {
+        /// Chat.
+        chat: ChatId,
+        /// Edited message id.
+        id: String,
+        /// Who sent the edit (must be the original sender).
+        sender: String,
+        /// Sent by us (from another device)?
+        from_me: bool,
+        /// New content.
+        content: Box<Content>,
+    },
+    /// A message was deleted for us on another device.
+    DeletedForMe {
+        /// Chat.
+        chat: ChatId,
+        /// Message id.
+        id: String,
+    },
+    /// Typing / recording indicator.
+    ChatState {
+        /// Chat.
+        chat: ChatId,
+        /// The participant in a group.
+        participant: Option<String>,
+        /// State.
+        state: ChatState,
+    },
+    /// Online / last seen of a contact.
+    Presence {
+        /// Contact.
+        jid: String,
+        /// Currently online.
+        online: bool,
+        /// Last seen, unix seconds, if the contact shares it.
+        last_seen: Option<i64>,
+    },
+    /// A profile picture was set, changed or removed.
+    PictureChanged {
+        /// Contact or group.
+        jid: String,
     },
     /// A contact's display name changed / became known.
     ContactName {
@@ -202,6 +284,12 @@ impl fmt::Debug for Event {
             Event::Receipt { ids, status, .. } => {
                 write!(f, "Receipt(n={}, {status:?})", ids.len())
             }
+            Event::Reaction { .. } => write!(f, "Reaction"),
+            Event::Edited { .. } => write!(f, "Edited"),
+            Event::DeletedForMe { .. } => write!(f, "DeletedForMe"),
+            Event::ChatState { state, .. } => write!(f, "ChatState({state:?})"),
+            Event::Presence { online, .. } => write!(f, "Presence(online={online})"),
+            Event::PictureChanged { .. } => write!(f, "PictureChanged"),
             Event::ContactName { .. } => write!(f, "ContactName"),
             Event::ChatRead { .. } => write!(f, "ChatRead"),
             Event::LidMappings(p) => write!(f, "LidMappings(n={})", p.len()),

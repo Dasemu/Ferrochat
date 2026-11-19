@@ -7,7 +7,8 @@ use whatsapp_rust::wacore::types::presence::ReceiptType;
 use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::types::{
-    ChatMeta, Content, MediaKind, MediaRef, Message, OutgoingKind, OutgoingMedia, ReceiptStatus,
+    ChatMeta, Content, MediaKind, MediaRef, Message, OutgoingKind, OutgoingMedia,
+    QUOTE_PREVIEW_MAX, Quote, Reaction, ReceiptStatus,
 };
 
 /// Unwraps ephemeral / view-once / edited / caption wrappers (up to a few
@@ -167,11 +168,28 @@ pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
             _ => None,
         };
     }
-    if m.video_message.is_set() || m.ptv_message.is_set() {
-        return Some(Content::Unsupported("video".into()));
+    if let Some(v) = m.video_message.as_option() {
+        return Some(video_content(v));
     }
-    if m.sticker_message.is_set() {
-        return Some(Content::Unsupported("sticker".into()));
+    if let Some(v) = m.ptv_message.as_option() {
+        // Round "video notes" travel as a video message.
+        return Some(video_content(v));
+    }
+    if let Some(st) = m.sticker_message.as_option() {
+        return Some(Content::Sticker {
+            width: st.width.unwrap_or_default(),
+            height: st.height.unwrap_or_default(),
+            animated: st.is_animated.unwrap_or(false),
+            media: media_ref(
+                MediaKind::Sticker,
+                st.direct_path.as_ref(),
+                st.media_key.as_ref(),
+                st.file_sha256.as_ref(),
+                st.file_enc_sha256.as_ref(),
+                st.file_length,
+                st.mimetype.as_ref(),
+            ),
+        });
     }
     if m.location_message.is_set() || m.live_location_message.is_set() {
         return Some(Content::Unsupported("location".into()));
@@ -183,6 +201,101 @@ pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
         return Some(Content::Unsupported("poll".into()));
     }
     None
+}
+
+fn video_content(v: &wa::message::VideoMessage) -> Content {
+    Content::Video {
+        caption: non_empty(v.caption.as_ref()),
+        seconds: v.seconds.unwrap_or_default(),
+        width: v.width.unwrap_or_default(),
+        height: v.height.unwrap_or_default(),
+        thumbnail: v.jpeg_thumbnail.clone().filter(|t| !t.is_empty()),
+        media: media_ref(
+            MediaKind::Video,
+            v.direct_path.as_ref(),
+            v.media_key.as_ref(),
+            v.file_sha256.as_ref(),
+            v.file_enc_sha256.as_ref(),
+            v.file_length,
+            v.mimetype.as_ref(),
+        ),
+    }
+}
+
+/// The `contextInfo` of whichever body the message carries.
+pub fn context_info(msg: &wa::Message) -> Option<&wa::ContextInfo> {
+    let m = base_message(msg);
+    m.extended_text_message
+        .as_option()
+        .and_then(|x| x.context_info.as_option())
+        .or_else(|| {
+            m.image_message
+                .as_option()
+                .and_then(|x| x.context_info.as_option())
+        })
+        .or_else(|| {
+            m.video_message
+                .as_option()
+                .and_then(|x| x.context_info.as_option())
+        })
+        .or_else(|| {
+            m.document_message
+                .as_option()
+                .and_then(|x| x.context_info.as_option())
+        })
+        .or_else(|| {
+            m.audio_message
+                .as_option()
+                .and_then(|x| x.context_info.as_option())
+        })
+        .or_else(|| {
+            m.sticker_message
+                .as_option()
+                .and_then(|x| x.context_info.as_option())
+        })
+}
+
+/// The quoted message of a reply, if the message is one.
+pub fn quote_from_wa(msg: &wa::Message) -> Option<Quote> {
+    let ci = context_info(msg)?;
+    let id = non_empty(ci.stanza_id.as_ref())?;
+    let preview = ci
+        .quoted_message
+        .as_option()
+        .and_then(content_from_wa)
+        .map(|c| c.preview())
+        .unwrap_or_default();
+    Some(Quote {
+        id,
+        sender: bare_jid(ci.participant.as_deref().unwrap_or_default()),
+        preview: preview.chars().take(QUOTE_PREVIEW_MAX).collect(),
+    })
+}
+
+/// A reaction message: `(target message id, emoji)`; an empty emoji means
+/// "reaction removed".
+pub fn reaction_from_wa(msg: &wa::Message) -> Option<(String, String)> {
+    let r = base_message(msg).reaction_message.as_option()?;
+    let target = r.key.as_option()?.id.clone().filter(|i| !i.is_empty())?;
+    Some((target, r.text.clone().unwrap_or_default()))
+}
+
+/// An edit of an earlier message: `(target id, new content)`. Only text and
+/// caption edits are meaningful; anything else yields `None`.
+pub fn edit_from_wa(msg: &wa::Message) -> Option<(String, Content)> {
+    let p = base_message(msg).protocol_message.as_option()?;
+    if p.r#type != Some(wa::message::protocol_message::Type::MESSAGE_EDIT) {
+        return None;
+    }
+    let target = p.key.as_option()?.id.clone().filter(|i| !i.is_empty())?;
+    let content = content_from_wa(p.edited_message.as_option()?)?;
+    match content {
+        Content::Text(_)
+        | Content::Image { .. }
+        | Content::Video { .. }
+        | Content::Document { .. } => Some((target, content)),
+        _ => None,
+    }
 }
 
 /// The id of the message a "delete for everyone" refers to.
@@ -278,7 +391,65 @@ pub fn message_from_envelope(env: &Envelope, msg: &wa::Message) -> Option<Messag
             .ephemeral_secs
             .filter(|s| *s > 0)
             .map(|s| env.timestamp + s as i64),
+        reply: quote_from_wa(msg).map(|mut q| {
+            q.sender = bare_jid(&q.sender);
+            q
+        }),
+        edited: false,
+        reactions: Vec::new(),
     })
+}
+
+/// What an incoming decrypted message turned out to be.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Parsed {
+    /// A bubble (a revoke is a `Content::Deleted` message with the target id).
+    Message(Box<Message>),
+    /// A reaction added / changed / removed (empty emoji).
+    Reaction {
+        /// Reacted-to message.
+        target: String,
+        /// Emoji, empty when removed.
+        emoji: String,
+    },
+    /// A text / caption edit.
+    Edit {
+        /// Edited message.
+        target: String,
+        /// New content.
+        content: Content,
+    },
+}
+
+/// Classifies one incoming message. Returns `None` for protocol chatter.
+pub fn parse_incoming(env: &Envelope, msg: &wa::Message) -> Option<Parsed> {
+    if let Some(target) = revoked_target(msg) {
+        let mut m = message_from_envelope(env, msg)?;
+        m.id = target;
+        m.content = Content::Deleted;
+        return Some(Parsed::Message(Box::new(m)));
+    }
+    if let Some((target, content)) = edit_from_wa(msg) {
+        return Some(Parsed::Edit { target, content });
+    }
+    if let Some((target, emoji)) = reaction_from_wa(msg) {
+        return Some(Parsed::Reaction { target, emoji });
+    }
+    message_from_envelope(env, msg).map(|m| Parsed::Message(Box::new(m)))
+}
+
+/// Typing indicator from the library's presence types.
+pub fn chat_state(
+    state: whatsapp_rust::wacore::types::presence::ChatPresence,
+    media: whatsapp_rust::wacore::types::presence::ChatPresenceMedia,
+) -> super::types::ChatState {
+    use super::types::ChatState;
+    use whatsapp_rust::wacore::types::presence::{ChatPresence, ChatPresenceMedia};
+    match (state, media) {
+        (ChatPresence::Composing, ChatPresenceMedia::Audio) => ChatState::Recording,
+        (ChatPresence::Composing, _) => ChatState::Composing,
+        (ChatPresence::Paused, _) => ChatState::Paused,
+    }
 }
 
 /// History-sync status → receipt status.
@@ -330,6 +501,34 @@ pub fn message_from_web_info(
         expires_at: ephemeral_secs
             .filter(|s| *s > 0)
             .map(|s| timestamp + s as i64),
+        reply: wmi.message.as_option().and_then(quote_from_wa),
+        edited: false,
+        reactions: wmi
+            .reactions
+            .iter()
+            .filter_map(|r| reaction_from_web(chat, r))
+            .collect(),
+    })
+}
+
+/// A reaction stored in a history-synced message.
+fn reaction_from_web(chat: &str, r: &wa::Reaction) -> Option<Reaction> {
+    let key = r.key.as_option()?;
+    let emoji = non_empty(r.text.as_ref())?;
+    let reactor = if key.from_me.unwrap_or(false) {
+        String::new() // filled with our own JID when stored (unknown here)
+    } else {
+        bare_jid(
+            key.participant
+                .as_deref()
+                .or(key.remote_jid.as_deref())
+                .unwrap_or(chat),
+        )
+    };
+    Some(Reaction {
+        reactor,
+        emoji,
+        ts: r.sender_timestamp_ms.unwrap_or_default() / 1000,
     })
 }
 
@@ -422,6 +621,40 @@ pub fn build_text(text: &str) -> wa::Message {
     wa::Message {
         conversation: Some(text.to_string()),
         ..Default::default()
+    }
+}
+
+/// Builds a text message that replies to `quote`.
+pub fn build_reply(text: &str, quote: &Quote) -> wa::Message {
+    wa::Message {
+        extended_text_message: buffa_some(wa::message::ExtendedTextMessage {
+            text: Some(text.to_string()),
+            context_info: buffa_some(wa::ContextInfo {
+                stanza_id: Some(quote.id.clone()),
+                participant: Some(quote.sender.clone()),
+                quoted_message: buffa_some(build_text(&quote.preview)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+/// Reaction target key for a message.
+pub fn reaction_key(
+    chat: &str,
+    id: &str,
+    from_me: bool,
+    sender: &str,
+    group: bool,
+) -> wa::MessageKey {
+    wa::MessageKey {
+        remote_jid: Some(chat.to_string()),
+        from_me: Some(from_me),
+        id: Some(id.to_string()),
+        // Groups attribute the reaction through the original author.
+        participant: (group && !from_me).then(|| sender.to_string()),
     }
 }
 
@@ -746,5 +979,354 @@ mod tests {
         assert_eq!(bare_jid("1.0:2@s.whatsapp.net"), "1@s.whatsapp.net");
         assert_eq!(bare_jid("123@g.us"), "123@g.us");
         assert_eq!(bare_jid("weird"), "weird");
+    }
+}
+
+#[cfg(test)]
+mod parity_tests {
+    use super::*;
+    use whatsapp_rust::wacore::types::presence::{ChatPresence, ChatPresenceMedia};
+
+    fn env() -> Envelope {
+        Envelope {
+            id: "M1".into(),
+            chat: "34600111222@s.whatsapp.net".into(),
+            sender: "34600111222:3@s.whatsapp.net".into(),
+            from_me: false,
+            push_name: "Ana".into(),
+            timestamp: 1_700_000_000,
+            sender_alt: None,
+            recipient_alt: None,
+            ephemeral_secs: None,
+        }
+    }
+
+    fn quote() -> Quote {
+        Quote {
+            id: "ORIG".into(),
+            sender: "34699000111@s.whatsapp.net".into(),
+            preview: "where are you?".into(),
+        }
+    }
+
+    #[test]
+    fn reply_roundtrips_through_the_wire_format() {
+        let msg = build_reply("on my way", &quote());
+        let m = message_from_envelope(&env(), &msg).unwrap();
+        assert_eq!(m.content, Content::Text("on my way".into()));
+        let q = m.reply.unwrap();
+        assert_eq!(q.id, "ORIG");
+        assert_eq!(q.sender, "34699000111@s.whatsapp.net");
+        assert_eq!(q.preview, "where are you?");
+    }
+
+    #[test]
+    fn quote_of_media_uses_the_media_preview() {
+        let msg = wa::Message {
+            extended_text_message: buffa_some(wa::message::ExtendedTextMessage {
+                text: Some("nice".into()),
+                context_info: buffa_some(wa::ContextInfo {
+                    stanza_id: Some("IMG".into()),
+                    participant: Some("1:5@s.whatsapp.net".into()),
+                    quoted_message: buffa_some(wa::Message {
+                        image_message: buffa_some(wa::message::ImageMessage {
+                            caption: Some("sunset".into()),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let q = quote_from_wa(&msg).unwrap();
+        assert_eq!(q.preview, "📷 sunset");
+        assert_eq!(q.sender, "1@s.whatsapp.net", "device part stripped");
+    }
+
+    #[test]
+    fn quote_preview_is_capped_and_missing_id_is_no_reply() {
+        let long = "x".repeat(5000);
+        let msg = build_reply(
+            "r",
+            &Quote {
+                preview: long,
+                ..quote()
+            },
+        );
+        assert!(quote_from_wa(&msg).unwrap().preview.chars().count() <= QUOTE_PREVIEW_MAX);
+        let no_id = wa::Message {
+            extended_text_message: buffa_some(wa::message::ExtendedTextMessage {
+                text: Some("t".into()),
+                context_info: buffa_some(wa::ContextInfo::default()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(quote_from_wa(&no_id), None);
+        assert_eq!(quote_from_wa(&build_text("plain")), None);
+    }
+
+    fn reaction(target: Option<&str>, text: Option<&str>) -> wa::Message {
+        wa::Message {
+            reaction_message: buffa_some(wa::message::ReactionMessage {
+                key: buffa_some(wa::MessageKey {
+                    id: target.map(Into::into),
+                    ..Default::default()
+                }),
+                text: text.map(Into::into),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn reactions_are_parsed_and_removal_is_an_empty_emoji() {
+        assert_eq!(
+            reaction_from_wa(&reaction(Some("T"), Some("👍"))),
+            Some(("T".into(), "👍".into()))
+        );
+        assert_eq!(
+            reaction_from_wa(&reaction(Some("T"), Some(""))),
+            Some(("T".into(), String::new()))
+        );
+        assert_eq!(
+            reaction_from_wa(&reaction(Some("T"), None)),
+            Some(("T".into(), String::new()))
+        );
+        assert_eq!(reaction_from_wa(&reaction(None, Some("👍"))), None);
+        assert_eq!(reaction_from_wa(&build_text("x")), None);
+    }
+
+    fn edit(target: &str, new: wa::Message) -> wa::Message {
+        wa::Message {
+            protocol_message: buffa_some(wa::message::ProtocolMessage {
+                key: buffa_some(wa::MessageKey {
+                    id: Some(target.into()),
+                    ..Default::default()
+                }),
+                r#type: Some(wa::message::protocol_message::Type::MESSAGE_EDIT),
+                edited_message: buffa_some(new),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn edits_are_parsed() {
+        let m = edit("T", build_text("fixed"));
+        assert_eq!(
+            edit_from_wa(&m),
+            Some(("T".into(), Content::Text("fixed".into())))
+        );
+        // An edit to something that is not text / caption is ignored.
+        let sticker = wa::Message {
+            sticker_message: buffa_some(wa::message::StickerMessage::default()),
+            ..Default::default()
+        };
+        assert_eq!(edit_from_wa(&edit("T", sticker)), None);
+        // Edits never become bubbles.
+        assert_eq!(content_from_wa(&m), None);
+    }
+
+    #[test]
+    fn incoming_messages_are_classified() {
+        let e = env();
+        assert!(matches!(
+            parse_incoming(&e, &build_text("hi")),
+            Some(Parsed::Message(_))
+        ));
+        assert!(matches!(
+            parse_incoming(&e, &reaction(Some("T"), Some("❤️"))),
+            Some(Parsed::Reaction { .. })
+        ));
+        assert!(matches!(
+            parse_incoming(&e, &edit("T", build_text("x"))),
+            Some(Parsed::Edit { .. })
+        ));
+        let revoke = wa::Message {
+            protocol_message: buffa_some(wa::message::ProtocolMessage {
+                key: buffa_some(wa::MessageKey {
+                    id: Some("GONE".into()),
+                    ..Default::default()
+                }),
+                r#type: Some(wa::message::protocol_message::Type::REVOKE),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match parse_incoming(&e, &revoke) {
+            Some(Parsed::Message(m)) => {
+                assert_eq!(m.id, "GONE");
+                assert_eq!(m.content, Content::Deleted);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(parse_incoming(&e, &wa::Message::default()), None);
+    }
+
+    #[test]
+    fn video_and_sticker_are_rendered_content() {
+        let video = wa::Message {
+            video_message: buffa_some(wa::message::VideoMessage {
+                seconds: Some(14),
+                width: Some(640),
+                height: Some(360),
+                caption: Some("trip".into()),
+                jpeg_thumbnail: Some(vec![1, 2, 3]),
+                direct_path: Some("/v/vid".into()),
+                media_key: Some(vec![9; 32]),
+                mimetype: Some("video/mp4".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match content_from_wa(&video) {
+            Some(Content::Video {
+                caption,
+                seconds,
+                thumbnail,
+                media,
+                ..
+            }) => {
+                assert_eq!(caption.as_deref(), Some("trip"));
+                assert_eq!(seconds, 14);
+                assert_eq!(thumbnail, Some(vec![1, 2, 3]));
+                let m = media.unwrap();
+                assert_eq!(m.kind, MediaKind::Video);
+                assert_eq!(m.direct_path, "/v/vid");
+            }
+            other => panic!("{other:?}"),
+        }
+        let sticker = wa::Message {
+            sticker_message: buffa_some(wa::message::StickerMessage {
+                is_animated: Some(true),
+                width: Some(512),
+                height: Some(512),
+                direct_path: Some("/v/st".into()),
+                media_key: Some(vec![1; 32]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match content_from_wa(&sticker) {
+            Some(Content::Sticker {
+                animated, media, ..
+            }) => {
+                assert!(animated);
+                assert_eq!(media.unwrap().kind, MediaKind::Sticker);
+            }
+            other => panic!("{other:?}"),
+        }
+        // A video without a CDN reference still renders (thumbnail only).
+        let bare = wa::Message {
+            video_message: buffa_some(wa::message::VideoMessage::default()),
+            ..Default::default()
+        };
+        assert!(matches!(
+            content_from_wa(&bare),
+            Some(Content::Video { media: None, .. })
+        ));
+    }
+
+    #[test]
+    fn view_once_video_is_still_hidden() {
+        let m = wa::Message {
+            video_message: buffa_some(wa::message::VideoMessage {
+                view_once: Some(true),
+                direct_path: Some("/secret".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert_eq!(content_from_wa(&m), Some(Content::ViewOnce));
+    }
+
+    #[test]
+    fn history_reactions_and_replies_are_converted() {
+        let wmi = wa::WebMessageInfo {
+            key: buffa_some(wa::MessageKey {
+                id: Some("H1".into()),
+                from_me: Some(false),
+                remote_jid: Some("120363@g.us".into()),
+                participant: Some("34600@s.whatsapp.net".into()),
+            }),
+            message: buffa_some(build_reply("hello", &quote())),
+            message_timestamp: Some(1_700_000_000),
+            reactions: vec![
+                wa::Reaction {
+                    key: buffa_some(wa::MessageKey {
+                        participant: Some("34611:2@s.whatsapp.net".into()),
+                        from_me: Some(false),
+                        ..Default::default()
+                    }),
+                    text: Some("😂".into()),
+                    sender_timestamp_ms: Some(1_700_000_005_000),
+                    ..Default::default()
+                },
+                wa::Reaction {
+                    key: buffa_some(wa::MessageKey {
+                        from_me: Some(true),
+                        ..Default::default()
+                    }),
+                    text: Some("👍".into()),
+                    ..Default::default()
+                },
+                // Empty text = no reaction.
+                wa::Reaction {
+                    text: Some(String::new()),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let m = message_from_web_info("120363@g.us", &wmi, None).unwrap();
+        assert_eq!(m.reply.unwrap().id, "ORIG");
+        assert_eq!(m.reactions.len(), 2);
+        assert_eq!(m.reactions[0].reactor, "34611@s.whatsapp.net");
+        assert_eq!(m.reactions[0].ts, 1_700_000_005);
+        assert_eq!(
+            m.reactions[1].reactor, "",
+            "own reactions are filled in later"
+        );
+    }
+
+    #[test]
+    fn chat_state_mapping() {
+        use crate::net::types::ChatState::*;
+        assert_eq!(
+            chat_state(ChatPresence::Composing, ChatPresenceMedia::Text),
+            Composing
+        );
+        assert_eq!(
+            chat_state(ChatPresence::Composing, ChatPresenceMedia::Audio),
+            Recording
+        );
+        assert_eq!(
+            chat_state(ChatPresence::Paused, ChatPresenceMedia::Audio),
+            Paused
+        );
+    }
+
+    #[test]
+    fn reaction_keys_name_the_author_in_groups_only() {
+        let g = reaction_key("g@g.us", "ID", false, "34600@s.whatsapp.net", true);
+        assert_eq!(g.participant.as_deref(), Some("34600@s.whatsapp.net"));
+        assert_eq!(g.from_me, Some(false));
+        let dm = reaction_key(
+            "34600@s.whatsapp.net",
+            "ID",
+            false,
+            "34600@s.whatsapp.net",
+            false,
+        );
+        assert_eq!(dm.participant, None);
+        let mine = reaction_key("g@g.us", "ID", true, "me@s.whatsapp.net", true);
+        assert_eq!(mine.participant, None);
+        assert_eq!(mine.from_me, Some(true));
     }
 }
