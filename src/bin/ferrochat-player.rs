@@ -237,9 +237,12 @@ mod player {
             let no_video = !ready_sent && size == 0 && started.elapsed() > Duration::from_secs(4);
             if !ready_sent && (size != 0 || no_video) {
                 ready_sent = true;
-                let dur = playbin
-                    .query_duration::<gst::ClockTime>()
-                    .map_or(0, gst::ClockTime::mseconds);
+                let dur_q = playbin.query_duration::<gst::ClockTime>();
+                if no_video && dur_q.is_none() {
+                    // Nothing decodable and no known length: not a media file.
+                    return Err(fail("the file has no playable video or audio"));
+                }
+                let dur = dur_q.map_or(0, gst::ClockTime::mseconds);
                 send(
                     out,
                     &Msg::Ready {

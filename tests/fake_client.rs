@@ -98,7 +98,8 @@ async fn paired_session_syncs_history_into_store() {
     // Pinned showcase chat first, with its newest message as preview.
     assert_eq!(rows[0].meta.id, SHOWCASE_CHAT);
     assert!(rows[0].last.is_some());
-    assert_eq!(d.chats.display_name(SHOWCASE_CHAT), "Lucía Fernández");
+    // This driver only applies history (push names); saved names arrive as app-state events.
+    assert_eq!(d.chats.display_name(SHOWCASE_CHAT), "~ Lu");
     let msgs = d.store.load_messages(SHOWCASE_CHAT, None, 100).unwrap();
     assert!(
         msgs.iter()
