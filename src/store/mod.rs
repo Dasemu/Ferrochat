@@ -13,7 +13,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::error::{Error, Result};
 use crate::net::types::{ChatMeta, Content, Message, ReceiptStatus};
 
-const MIGRATIONS: &[&str] = &[include_str!("schema.sql")];
+const MIGRATIONS: &[&str] = &[include_str!("schema.sql"), include_str!("migration_2.sql")];
 
 /// Thread-safe handle; clone freely. Heavy calls should run in
 /// `spawn_blocking` (the app does).
@@ -128,12 +128,14 @@ impl Store {
         let tx = conn.transaction()?;
         let mut new_ids = Vec::new();
         {
-            let mut existing =
-                tx.prepare_cached("SELECT status FROM messages WHERE chat_id = ?1 AND id = ?2")?;
+            let mut existing = tx.prepare_cached(
+                "SELECT status, sender, from_me FROM messages WHERE chat_id = ?1 AND id = ?2",
+            )?;
             let mut insert = tx.prepare_cached(
                 "INSERT INTO messages
-                    (chat_id, id, sender, sender_name, from_me, ts, kind, content, thumb, status)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                    (chat_id, id, sender, sender_name, from_me, ts, kind, content, thumb, status,
+                     expires_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             )?;
             let mut update_status = tx
                 .prepare_cached("UPDATE messages SET status = ?3 WHERE chat_id = ?1 AND id = ?2")?;
@@ -146,11 +148,17 @@ impl Store {
                  ON CONFLICT(id) DO UPDATE SET last_ts = MAX(chats.last_ts, excluded.last_ts)",
             )?;
             for m in msgs {
-                let prev: Option<i64> = existing
-                    .query_row(params![m.chat, m.id], |r| r.get(0))
+                let prev: Option<(i64, String, bool)> = existing
+                    .query_row(params![m.chat, m.id], |r| {
+                        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+                    })
                     .optional()?;
                 let (json, thumb) = encode_content(&m.content)?;
                 match prev {
+                    None if matches!(m.content, Content::Deleted) => {
+                        // A revoke for a message we never saw: nothing to delete.
+                        continue;
+                    }
                     None => {
                         insert.execute(params![
                             m.chat,
@@ -163,13 +171,16 @@ impl Store {
                             json,
                             thumb,
                             m.status.to_i64(),
+                            m.expires_at,
                         ])?;
                         new_ids.push(m.id.clone());
                     }
-                    Some(s) => {
+                    Some((s, sender, from_me)) => {
                         let merged = ReceiptStatus::from_i64(s).advance(m.status);
                         update_status.execute(params![m.chat, m.id, merged.to_i64()])?;
-                        if matches!(m.content, Content::Deleted) {
+                        if matches!(m.content, Content::Deleted)
+                            && revoke_allowed(from_me, &sender, m)
+                        {
                             update_content.execute(params![
                                 m.chat,
                                 m.id,
@@ -244,7 +255,7 @@ impl Store {
         let conn = self.lock()?;
         let (ts, id) = before.unwrap_or((i64::MAX, ""));
         let mut st = conn.prepare_cached(
-            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status
+            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at
              FROM messages
              WHERE chat_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
              ORDER BY ts DESC, id DESC LIMIT ?4",
@@ -261,7 +272,7 @@ impl Store {
     pub fn message(&self, chat: &str, id: &str) -> Result<Option<Message>> {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
-            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status
+            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at
              FROM messages WHERE chat_id = ?1 AND id = ?2",
         )?;
         Ok(st.query_row(params![chat, id], row_to_message).optional()?)
@@ -273,7 +284,7 @@ impl Store {
         let mut st = conn.prepare_cached(
             "SELECT c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.muted,
                     m.chat_id, m.id, m.sender, m.sender_name, m.from_me, m.ts, m.content,
-                    m.thumb, m.status
+                    m.thumb, m.status, m.expires_at
              FROM chats c
              LEFT JOIN messages m ON m.rowid = (
                 SELECT rowid FROM messages WHERE chat_id = c.id ORDER BY ts DESC, id DESC LIMIT 1
@@ -348,13 +359,58 @@ impl Store {
             .optional()?)
     }
 
+    /// Deletes disappearing messages whose timer ran out. Returns the count.
+    pub fn prune_expired(&self, now: i64) -> Result<usize> {
+        Ok(self.lock()?.execute(
+            "DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= ?1",
+            params![now],
+        )?)
+    }
+
+    /// Persists LID → phone-number pairs.
+    pub fn set_lid_pairs(&self, pairs: &[(String, String)]) -> Result<()> {
+        let mut conn = self.lock()?;
+        let tx = conn.transaction()?;
+        {
+            let mut st = tx.prepare_cached(
+                "INSERT INTO lid_map (lid, pn) VALUES (?1, ?2)
+                 ON CONFLICT(lid) DO UPDATE SET pn = excluded.pn",
+            )?;
+            for (lid, pn) in pairs {
+                st.execute(params![lid, pn])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// All known LID → phone-number pairs.
+    pub fn lid_pairs(&self) -> Result<Vec<(String, String)>> {
+        let conn = self.lock()?;
+        let mut st = conn.prepare_cached("SELECT lid, pn FROM lid_map")?;
+        let v = st
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(v)
+    }
+
     /// Wipes everything (logout).
     pub fn clear(&self) -> Result<()> {
         self.lock()?.execute_batch(
-            "DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM kv;",
+            "DELETE FROM messages; DELETE FROM chats; DELETE FROM contacts; DELETE FROM kv; DELETE FROM lid_map;",
         )?;
         Ok(())
     }
+}
+
+/// "Delete for everyone" only applies when the revoker sent the original
+/// message: our own (from any of our devices) or the same remote sender.
+/// Group-admin revokes cannot be verified here and are ignored.
+pub fn revoke_allowed(orig_from_me: bool, orig_sender: &str, revoke: &Message) -> bool {
+    if orig_from_me || revoke.from_me {
+        return orig_from_me && revoke.from_me;
+    }
+    !revoke.sender.is_empty() && revoke.sender == orig_sender
 }
 
 fn encode_content(c: &Content) -> Result<(String, Option<Vec<u8>>)> {
@@ -387,6 +443,7 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
         timestamp: r.get(o + 5)?,
         content,
         status: ReceiptStatus::from_i64(r.get(o + 8)?),
+        expires_at: r.get(o + 9)?,
     })
 }
 
@@ -408,13 +465,14 @@ mod tests {
             } else {
                 ReceiptStatus::Read
             },
+            expires_at: None,
         }
     }
 
     #[test]
     fn migrations_set_version() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 1);
+        assert_eq!(s.schema_version().unwrap(), 2);
     }
 
     #[test]
@@ -491,6 +549,71 @@ mod tests {
             s.message("c", "1").unwrap().unwrap().content,
             Content::Deleted
         );
+    }
+
+    #[test]
+    fn revokes_only_apply_to_the_revokers_own_messages() {
+        let s = Store::open_in_memory().unwrap();
+        let mut orig = msg("g@g.us", "1", 1, false, "hello");
+        orig.sender = "alice@s.whatsapp.net".into();
+        s.insert_messages(&[orig]).unwrap();
+        // Bob (e.g. a group admin) cannot delete Alice's message.
+        let mut bob = msg("g@g.us", "1", 2, false, "");
+        bob.sender = "bob@s.whatsapp.net".into();
+        bob.content = Content::Deleted;
+        s.insert_messages(&[bob]).unwrap();
+        assert_eq!(
+            s.message("g@g.us", "1").unwrap().unwrap().content,
+            Content::Text("hello".into())
+        );
+        // A revoke claiming to be ours cannot delete someone else's message.
+        let mut me = msg("g@g.us", "1", 2, true, "");
+        me.content = Content::Deleted;
+        s.insert_messages(&[me]).unwrap();
+        assert_eq!(
+            s.message("g@g.us", "1").unwrap().unwrap().content,
+            Content::Text("hello".into())
+        );
+        // Alice can.
+        let mut alice = msg("g@g.us", "1", 2, false, "");
+        alice.sender = "alice@s.whatsapp.net".into();
+        alice.content = Content::Deleted;
+        s.insert_messages(&[alice]).unwrap();
+        assert_eq!(
+            s.message("g@g.us", "1").unwrap().unwrap().content,
+            Content::Deleted
+        );
+        // Our own message deleted from another of our devices.
+        s.insert_messages(&[msg("c", "m", 1, true, "oops")])
+            .unwrap();
+        let mut del = msg("c", "m", 2, true, "");
+        del.content = Content::Deleted;
+        s.insert_messages(&[del.clone()]).unwrap();
+        assert_eq!(
+            s.message("c", "m").unwrap().unwrap().content,
+            Content::Deleted
+        );
+        // Unknown target: nothing inserted.
+        del.id = "never-seen".into();
+        assert!(s.insert_messages(&[del]).unwrap().is_empty());
+        assert!(s.message("c", "never-seen").unwrap().is_none());
+    }
+
+    #[test]
+    fn expired_messages_are_pruned_and_lid_map_persists() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = msg("c", "e", 10, false, "self-destruct");
+        m.expires_at = Some(100);
+        s.insert_messages(&[m, msg("c", "k", 11, false, "keep")])
+            .unwrap();
+        assert_eq!(s.message("c", "e").unwrap().unwrap().expires_at, Some(100));
+        assert_eq!(s.prune_expired(99).unwrap(), 0);
+        assert_eq!(s.prune_expired(100).unwrap(), 1);
+        assert!(s.message("c", "e").unwrap().is_none());
+        assert!(s.message("c", "k").unwrap().is_some());
+        s.set_lid_pairs(&[("1@lid".into(), "34600@s.whatsapp.net".into())])
+            .unwrap();
+        assert_eq!(s.lid_pairs().unwrap().len(), 1);
     }
 
     #[test]
