@@ -110,4 +110,53 @@ next change.
 ## Release automation
 
 - Bot pushes made with `GITHUB_TOKEN` never trigger `push` workflows, so the release workflow chains off the version workflow with `workflow_run` (conclusion `success`, branch `main`, checkout `ref: main` for the bump commit).
+
+
+## Round 3: flicker, names, lists, video
+
+* **Hover flicker was a reflow, not a redraw.** The hover buttons (smiley,
+  chevron) were inserted into the bubble's row only while the pointer was
+  over it. They took about 70 px from the row, so a bubble that was already
+  near the pane width re-wrapped its text, the row grew by a line or two, the
+  content moved under the pointer and `on_exit` / `on_enter` fired again: the
+  message "blinked" while the mouse crossed it. Image and SVG handles were
+  *not* the cause here (handles are cached in the app state and icon handles
+  are content-hashed). Fix: the buttons' slot is always laid out (same size
+  hovered or not) and only its content appears. Rule: **hover must never
+  change layout; reserve the space.**
+* **A layout regression test without a window.** `iced::Renderer` implements
+  `renderer::Headless` (backend `"tiny-skia"`), so a unit test can lay out a
+  widget with `Widget::layout` and compare sizes. `ui::chat::layout_tests`
+  lays out the same message with and without hover at three pane widths and
+  fails on the old code (371.6 px vs 409.3 px high for a long bubble at
+  700 px).
+* **Run `Task`s headlessly to test the whole app.** `iced_runtime::task::
+  into_stream` (dev-dependency, same version iced uses) lets a test run a
+  `Task`, collect its `Action::Output` messages and feed them back to
+  `App::update`: `app::test_support::Harness` drives the real `App` and
+  `Store` against `FakeClient`.
+* **One name map was the whole "wrong names" bug.** Push names, history names
+  and the address-book name shared one `HashMap`, so the last writer won and
+  message push names beat saved names. Names now carry their source and the
+  display order is a pure function (`ChatList::resolve`).
+* **Address-book names only come through app-state sync** (`contact`
+  mutations), and a session that was already synced never replays them: a
+  one-time full snapshot request (`MajorSyncTask::AppStateSync { full_sync:
+  true }`, marker `appstate_resync` in the cache) is needed for existing
+  users.
+* **Keep GStreamer out of the main binary.** A hard link against
+  `libgstreamer` makes a machine without it fail at load time with a loader
+  error instead of a message. A helper process (`ferrochat-player`) isolates
+  the dependency, gives a precise failure ("GStreamer missing" vs "codec
+  missing"), and freeing memory on close is just ending the process. The
+  release workflow asserts with `ldd` that `ferrochat` has no `gst` link.
+* `iced_video_player` renders through a wgpu shader only, so nothing shows on
+  the tiny-skia fallback; one more reason for the helper design.
+* `mouse_area` gives no window position for right clicks: track the cursor in
+  an atomic from `listen_with` (returning `None`, so no message per move) and
+  read it when the click arrives.
+* `Task::perform` + `spawn_blocking` work on a plain tokio test runtime, which
+  is all the harness needs.
+
 - `keyring` 4 opens a *blocking* zbus connection: if any dependency turns on zbus `tokio` (ksni default features, `rfd`/`ashpd` `tokio`, a `zbus` dev-dep) it panics ("Cannot start a runtime from within a runtime") when called on a runtime worker. Keep zbus on `async-io` (`ksni` with `default-features = false, features = ["async-io"]`, `rfd` with `async-std`); `tests/real_keyring.rs` guards it against a real Secret Service.
+

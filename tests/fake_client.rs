@@ -41,7 +41,9 @@ impl Driver {
             Event::LoggedOut { .. } => self.logged_out = true,
             Event::History { chats, names, .. } => {
                 self.store.upsert_chats(&chats).unwrap();
-                self.store.set_contact_names(&names).unwrap();
+                self.store
+                    .set_contact_names(&ferrochat::net::push_names(&names))
+                    .unwrap();
                 self.chats.apply_history(&chats, &names);
             }
             Event::Messages { messages, origin } => {
@@ -92,11 +94,12 @@ async fn paired_session_syncs_history_into_store() {
     drain(&mut stream, &mut d).await;
     assert!(d.connected);
     let rows = d.store.chat_rows().unwrap();
-    assert_eq!(rows.len(), 10);
+    assert_eq!(rows.len(), 12);
     // Pinned showcase chat first, with its newest message as preview.
     assert_eq!(rows[0].meta.id, SHOWCASE_CHAT);
     assert!(rows[0].last.is_some());
-    assert_eq!(d.chats.display_name(SHOWCASE_CHAT), "Lucía Fernández");
+    // This driver only applies history (push names); saved names arrive as app-state events.
+    assert_eq!(d.chats.display_name(SHOWCASE_CHAT), "~ Lu");
     let msgs = d.store.load_messages(SHOWCASE_CHAT, None, 100).unwrap();
     assert!(
         msgs.iter()
@@ -131,7 +134,7 @@ async fn qr_codes_rotate_then_exhaust_and_scan_links() {
     client.scan();
     drain(&mut stream, &mut d).await;
     assert!(d.connected);
-    assert_eq!(d.store.chat_rows().unwrap().len(), 10);
+    assert_eq!(d.store.chat_rows().unwrap().len(), 12);
 }
 
 #[tokio::test(start_paused = true)]

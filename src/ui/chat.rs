@@ -83,7 +83,7 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         .typing
         .in_chat(&conv.chat)
         .into_iter()
-        .map(|(p, st)| (app.chats.display_name(&p), st))
+        .map(|(p, st)| (app.chats.plain_name(&p), st))
         .collect();
     let typing = typing_label(&typing_names, group);
     let now = chrono::Utc::now().timestamp();
@@ -92,10 +92,10 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
     } else if group {
         let mut senders: Vec<String> = Vec::new();
         for msg in conv.messages.iter().rev().filter(|m| !m.from_me) {
-            let n = msg
-                .sender_name
-                .clone()
-                .unwrap_or_else(|| app.chats.display_name(&msg.sender));
+            let n = app
+                .chats
+                .resolve(&msg.sender, msg.sender_name.as_deref())
+                .plain();
             if !senders.contains(&n) {
                 senders.push(n);
             }
@@ -284,7 +284,9 @@ fn popup_layer<'a>(
     let (card, card_h) = match which {
         Popup::Reactions => (reaction_picker(app, msg), 52.0),
         Popup::Menu => {
-            let items = 4 + usize::from(msg.can_edit(now));
+            let items = 4
+                + usize::from(msg.can_edit(now))
+                + usize::from(matches!(msg.content, Content::Video { .. }));
             (message_menu(app, msg), 12.0 + 38.0 * items as f32)
         }
     };
@@ -370,10 +372,11 @@ fn reply_bar<'a>(app: &'a App, conv: &'a Conversation) -> Option<El<'a>> {
     let p = t.palette;
     let (label, label_color, preview, close, lead): (String, Color, String, Ui, Option<El<'a>>) =
         if let Some(id) = &app.editing {
-            let text = match conv.get(id).map(|m| &m.content) {
-                Some(Content::Text(s)) => s.clone(),
-                _ => String::new(),
-            };
+            let text = conv
+                .get(id)
+                .and_then(|m| m.content.text())
+                .map(str::to_string)
+                .unwrap_or_default();
             (
                 "Edit message".into(),
                 p.accent,
@@ -601,10 +604,9 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
 
     let mut col = column![].spacing(3);
     if group && !out && first {
-        let who = msg
-            .sender_name
-            .clone()
-            .unwrap_or_else(|| app.chats.display_name(&msg.sender));
+        let who = app
+            .chats
+            .sender_name(&msg.sender, msg.sender_name.as_deref());
         col = col.push(
             text(who)
                 .size(12.5)
@@ -643,6 +645,61 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             column![txt, container(meta_row(t, msg)).align_right(Length::Fill)]
                 .spacing(1)
                 .into()
+        }
+        Content::Link { text: body_text, preview } => {
+            let inset = if out { p.inset_out } else { p.inset_in };
+            let sub = if out { p.bubble_out_meta } else { p.text_secondary };
+            let mut card = column![].spacing(2);
+            if let Some(h) = app.thumbs.get(&msg.id) {
+                card = card.push(
+                    image(h.clone())
+                        .width(Length::Fill)
+                        .height(150)
+                        .content_fit(ContentFit::Cover)
+                        .border_radius(6.0),
+                );
+            }
+            let mut info = column![
+                text(super::ellipsize(&preview.title, 90))
+                    .size(m.text)
+                    .font(INTER_MEDIUM)
+                    .color(fg)
+                    .shaping(text::Shaping::Advanced)
+            ]
+            .spacing(2)
+            .padding([6, 8]);
+            if !preview.description.is_empty() {
+                info = info.push(
+                    text(super::ellipsize(&preview.description, 110))
+                        .size(m.text_small)
+                        .color(sub)
+                        .shaping(text::Shaping::Advanced),
+                );
+            }
+            info = info.push(
+                text(link_host(&preview.url))
+                    .size(m.text_small)
+                    .color(sub)
+                    .wrapping(Wrapping::None),
+            );
+            card = card.push(info);
+            let card = button(card)
+                .padding(0)
+                .width(300)
+                .style(move |th, st| {
+                    let mut s = theme::flat_button(fg)(th, st);
+                    s.background = Some(iced::Background::Color(inset));
+                    s.border.radius = 6.0.into();
+                    s
+                })
+                .on_press(Message::Ui(Ui::OpenLink(preview.url.clone())));
+            col = col.push(card);
+            column![
+                message_text(app, body_text, fg),
+                container(meta_row(t, msg)).align_right(Length::Fill)
+            ]
+            .spacing(1)
+            .into()
         }
         Content::Image {
             caption,
@@ -922,11 +979,7 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
         .map(|(_, w)| *w);
     let show_actions =
         !deleted && (app.hovered.as_deref() == Some(msg.id.as_str()) || popup.is_some());
-    let actions: El<'a> = if show_actions {
-        hover_actions(app, msg)
-    } else {
-        gap(0.0)
-    };
+    let actions = action_slot(app, msg, show_actions, deleted);
     let line = if out {
         row![fill(), actions, bubble, tail_or_gap]
     } else {
@@ -962,13 +1015,38 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
         .into()
 }
 
+/// Width of the slot reserved next to every bubble for the hover buttons.
+pub const ACTION_SLOT_W: f32 = 2.0 * ACTION_BTN + 2.0 + 8.0;
+/// Side of one hover button (icon plus padding).
+pub const ACTION_BTN: f32 = 17.0 + 2.0 * 5.0;
+
+/// The hover buttons' place beside a bubble. The slot has the same size
+/// whether the buttons are shown or not: showing them on hover must never
+/// change the row's layout, otherwise the row reflows under the pointer,
+/// the pointer "leaves" and "re-enters" and the whole list flickers.
+fn action_slot<'a>(app: &'a App, msg: &'a ChatMessage, show: bool, deleted: bool) -> El<'a> {
+    if deleted {
+        return gap(0.0);
+    }
+    let inner: El<'a> = if show {
+        hover_actions(app, msg)
+    } else {
+        Space::new().into()
+    };
+    container(inner)
+        .width(ACTION_SLOT_W)
+        .height(ACTION_BTN)
+        .align_y(Alignment::Center)
+        .into()
+}
+
 /// Smiley and chevron buttons that appear next to a hovered bubble.
 fn hover_actions<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     let t = &app.theme;
     let p = t.palette;
     let btn = |i: Icon, on: Message| -> El<'a> {
         button(icon(i, 17.0, p.text_secondary))
-            .padding(6)
+            .padding(5)
             .style(theme::icon_button(t, false))
             .on_press(on)
             .into()
@@ -1055,6 +1133,13 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
         Ui::ToggleReactionPicker(id.clone()),
     ));
     col = col.push(item(Icon::Copy, "Copy", Ui::CopyText(id.clone())));
+    if matches!(msg.content, Content::Video { .. }) {
+        col = col.push(item(
+            Icon::ExternalLink,
+            "Open externally",
+            Ui::OpenVideoExternal(id.clone()),
+        ));
+    }
     if msg.can_edit(now) {
         col = col.push(item(Icon::Pencil, "Edit", Ui::StartEdit(id.clone())));
     }
@@ -1144,27 +1229,62 @@ fn quote_block<'a>(app: &'a App, msg: &'a ChatMessage, q: &'a Quote) -> El<'a> {
         .into()
 }
 
-/// Message text; the active in-chat search term is highlighted.
+/// `https://www.example.com/a/b` -> `example.com`.
+fn link_host(url: &str) -> String {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let host = rest.split(['/', '?', '#', ':']).next().unwrap_or(rest);
+    host.strip_prefix("www.").unwrap_or(host).to_string()
+}
+
+/// Message text: links are clickable, mentions show names and the active
+/// in-chat search term is highlighted.
 fn message_text<'a>(app: &'a App, s: &'a str, fg: Color) -> El<'a> {
+    use crate::app::linkify::{self, Token};
+    use iced::widget::span;
     let m = app.theme.metrics;
+    let p = app.theme.palette;
     let term = app
         .chat_search
         .as_ref()
         .map(|c| c.query.trim().to_lowercase())
         .filter(|q| q.chars().count() >= 2);
-    if let Some(term) = term {
-        let spans = highlight_spans(s, &term, app.theme.palette.notice_text);
-        if spans.len() > 1 {
-            return iced::widget::rich_text::<(), Message, iced::Theme, iced::Renderer>(spans)
-                .size(m.text)
-                .color(fg)
-                .into();
+    let tokens = linkify::tokenize(s);
+    if tokens.iter().all(|t| matches!(t, Token::Text(_))) {
+        if let Some(term) = term {
+            let spans = highlight_spans(s, &term, p.notice_text);
+            if spans.len() > 1 {
+                return iced::widget::rich_text::<(), Message, iced::Theme, iced::Renderer>(spans)
+                    .size(m.text)
+                    .color(fg)
+                    .into();
+            }
+        }
+        return text(s)
+            .size(m.text)
+            .color(fg)
+            .shaping(text::Shaping::Advanced)
+            .into();
+    }
+    let mut spans: Vec<iced::widget::text::Span<'a, String, iced::Font>> = Vec::new();
+    for tok in tokens {
+        match tok {
+            Token::Text(x) => match &term {
+                Some(term) => spans.extend(highlight_generic(x, term, p.notice_text)),
+                None => spans.push(span(x)),
+            },
+            Token::Url { text, href } | Token::Email { text, href } => {
+                spans.push(span(text).color(p.link).underline(true).link(href));
+            }
+            Token::Mention { text, user } => match app.mention_name(user) {
+                Some(name) => spans.push(span(format!("@{name}")).color(p.link)),
+                None => spans.push(span(text)),
+            },
         }
     }
-    text(s)
+    iced::widget::rich_text::<String, Message, iced::Theme, iced::Renderer>(spans)
+        .on_link_click(|href| Message::Ui(Ui::OpenLink(href)))
         .size(m.text)
         .color(fg)
-        .shaping(text::Shaping::Advanced)
         .into()
 }
 
@@ -1175,6 +1295,14 @@ pub fn highlight_spans<'a>(
     term: &str,
     bg: Color,
 ) -> Vec<iced::widget::text::Span<'a, (), iced::Font>> {
+    highlight_generic(s, term, bg)
+}
+
+fn highlight_generic<'a, L>(
+    s: &'a str,
+    term: &str,
+    bg: Color,
+) -> Vec<iced::widget::text::Span<'a, L, iced::Font>> {
     use iced::widget::span;
     let lower = s.to_lowercase();
     // Lower-casing can change byte lengths; only highlight when it did not.
@@ -1499,6 +1627,176 @@ pub fn viewer<'a>(app: &'a App, id: &'a str) -> El<'a> {
     )
 }
 
+/// The in-app video player: picture, play / pause, seek bar with times,
+/// volume, full screen, "Open externally" and close.
+pub fn video_viewer<'a>(app: &'a App, v: &'a crate::app::video::VideoView) -> El<'a> {
+    use crate::app::video::VideoPhase;
+    use crate::media::video::format_clock;
+    use crate::media::video_proto::PlayState;
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let white = Color::WHITE;
+    let dim = Color::from_rgba(1.0, 1.0, 1.0, 0.75);
+
+    let ctl = |i: Icon, size: f32, on: Message| -> El<'a> {
+        button(icon(i, size, white))
+            .padding(8)
+            .style(theme::icon_button(t, false))
+            .on_press(on)
+            .into()
+    };
+
+    let top = row![
+        ctl(Icon::X, 22.0, Message::Ui(Ui::CloseVideo)),
+        text("Video").size(16).color(white),
+        fill(),
+        button(
+            row![
+                icon(Icon::ExternalLink, 16.0, white),
+                text("Open externally").size(13.5).color(white),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+        )
+        .padding([7, 12])
+        .style(theme::icon_button(t, false))
+        .on_press(Message::Ui(Ui::OpenVideoExternal(v.id.clone()))),
+        ctl(
+            if app.video_fullscreen {
+                Icon::Minimize
+            } else {
+                Icon::Maximize
+            },
+            20.0,
+            Message::Ui(Ui::VideoFullscreen)
+        ),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .padding([8, 14]);
+
+    let thumb = app.thumbs.get(&v.id).cloned();
+    let picture: El<'a> = match (&v.frame, &v.phase) {
+        (Some(h), _) => mouse_area(
+            image(h.clone())
+                .content_fit(ContentFit::Contain)
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .on_press(Message::Ui(Ui::VideoToggle))
+        .into(),
+        (None, VideoPhase::Failed(msg)) => center(
+            column![
+                icon(Icon::CircleAlert, 40.0, p.notice_text),
+                text(msg.as_str())
+                    .size(15)
+                    .color(white)
+                    .align_x(Alignment::Center)
+                    .width(480),
+                row![
+                    button(text("Open externally").size(14.5).font(INTER_MEDIUM))
+                        .padding([9, 16])
+                        .style(theme::chip(t, true))
+                        .on_press(Message::Ui(Ui::OpenVideoExternal(v.id.clone()))),
+                    button(text("Close").size(14.5).font(INTER_MEDIUM))
+                        .padding([9, 16])
+                        .style(theme::chip(t, false))
+                        .on_press(Message::Ui(Ui::CloseVideo)),
+                ]
+                .spacing(10),
+            ]
+            .spacing(16)
+            .align_x(Alignment::Center),
+        )
+        .into(),
+        (None, phase) => {
+            let label = if *phase == VideoPhase::Downloading {
+                "Downloading video…"
+            } else {
+                "Starting playback…"
+            };
+            let backdrop: El<'a> = match thumb {
+                Some(h) => image(h)
+                    .content_fit(ContentFit::Contain)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .opacity(0.45_f32)
+                    .into(),
+                None => Space::new().into(),
+            };
+            iced::widget::stack![backdrop, center(text(label).size(16).color(white))].into()
+        }
+    };
+
+    let playing = v.is_playing();
+    let ready = v.phase == VideoPhase::Playing;
+    let play_icon = if v.state == PlayState::Ended {
+        Icon::RotateCcw
+    } else if playing {
+        Icon::Pause
+    } else {
+        Icon::Play
+    };
+    let mut play = button(icon(play_icon, 22.0, white))
+        .padding(8)
+        .style(theme::icon_button(t, false));
+    if ready {
+        play = play.on_press(Message::Ui(Ui::VideoToggle));
+    }
+    let mut seek = iced::widget::slider(0.0..=1.0, v.progress(), |f| Message::Ui(Ui::VideoSeek(f)))
+        .step(0.001_f32)
+        .on_release(Message::Ui(Ui::VideoSeekRelease));
+    if !ready || v.duration_ms == 0 {
+        seek = iced::widget::slider(0.0..=1.0, 0.0, |_| Message::Ui(Ui::VideoSeek(0.0)));
+    }
+    let shown_ms = v.seeking.map_or(v.position_ms, |f| {
+        crate::media::video::seek_target(f, v.duration_ms)
+    });
+    let vol_icon = if v.muted || v.volume == 0 {
+        Icon::VolumeX
+    } else {
+        Icon::Volume2
+    };
+    let controls = container(
+        row![
+            play,
+            text(format_clock(shown_ms)).size(13).color(dim),
+            seek.width(Length::Fill),
+            text(if v.duration_ms > 0 {
+                format_clock(v.duration_ms)
+            } else {
+                "--:--".into()
+            })
+            .size(13)
+            .color(dim),
+            ctl(vol_icon, 20.0, Message::Ui(Ui::VideoMute)),
+            iced::widget::slider(0..=100u8, if v.muted { 0 } else { v.volume }, |x| {
+                Message::Ui(Ui::VideoVolume(x))
+            })
+            .width(90),
+        ]
+        .spacing(12)
+        .align_y(Alignment::Center),
+    )
+    .padding([8, 18]);
+
+    let _ = m;
+    opaque(
+        container(column![
+            top,
+            container(picture)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .padding([0, 24]),
+            controls,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::solid(Color::from_rgb(0.04, 0.05, 0.06))),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1527,5 +1825,112 @@ mod tests {
         let (w, _) = fit(10, 10, 330.0, 330.0);
         assert_eq!(w, 120.0);
         assert_eq!(fit(0, 0, 300.0, 300.0).0, 300.0);
+    }
+}
+
+/// Layout regression tests: hovering a message must not change the size of
+/// its row. A row that grows when the hover buttons appear reflows under the
+/// pointer, which fires "pointer left" and "pointer entered" in a loop: that
+/// was the flicker reported on the message list.
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+    use crate::config::Config;
+    use iced::advanced::layout::Limits;
+    use iced::advanced::renderer::Headless;
+    use iced::advanced::widget::Tree;
+    use iced::{Pixels, Size};
+
+    fn app() -> App {
+        let mut cfg = Config::defaults();
+        cfg.mock = true;
+        App::boot(cfg).0
+    }
+
+    fn size_of(mut el: El<'_>, width: f32) -> Size {
+        let renderer = futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("tiny-skia renderer");
+        let mut tree = Tree::new(el.as_widget());
+        el.as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &Limits::new(Size::ZERO, Size::new(width, 5000.0)),
+            )
+            .size()
+    }
+
+    fn msg(id: &str, from_me: bool, text: &str) -> ChatMessage {
+        ChatMessage {
+            id: id.into(),
+            chat: "34611111111@s.whatsapp.net".into(),
+            sender: "34611111111@s.whatsapp.net".into(),
+            sender_name: None,
+            from_me,
+            timestamp: 1_700_000_000,
+            content: Content::Text(text.into()),
+            status: ReceiptStatus::Read,
+            expires_at: None,
+            reply: None,
+            edited: false,
+            reactions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn hover_buttons_never_change_the_row_size() {
+        let mut app = app();
+        let long = "una frase larga que ocupa varias líneas del globo de mensaje ".repeat(12);
+        let cases = [
+            msg("short-in", false, "ok"),
+            msg("short-out", true, "ok"),
+            msg("long-in", false, &long),
+            msg("long-out", true, &long),
+        ];
+        // Wide, typical and squeezed panes: the squeezed one is where the
+        // buttons used to steal width from a full-width bubble.
+        for width in [1000.0, 700.0, 460.0] {
+            for m in &cases {
+                app.hovered = None;
+                let idle = size_of(bubble(&app, m, true, false), width);
+                app.hovered = Some(m.id.clone());
+                let hovered = size_of(bubble(&app, m, true, false), width);
+                assert_eq!(
+                    idle, hovered,
+                    "row {} reflowed on hover at width {width}",
+                    m.id
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_open_popup_does_not_change_the_row_size_either() {
+        let mut app = app();
+        let m = msg("p", true, "ok");
+        app.popup = None;
+        let idle = size_of(bubble(&app, &m, true, false), 800.0);
+        app.popup = Some(("p".into(), Popup::Menu));
+        let open = size_of(bubble(&app, &m, true, false), 800.0);
+        assert_eq!(idle, open);
+    }
+
+    #[test]
+    fn action_slot_fits_its_buttons() {
+        // Two buttons, the gap between them and the container padding.
+        const { assert!(ACTION_SLOT_W >= 2.0 * ACTION_BTN + 2.0 + 8.0) };
+    }
+
+    #[test]
+    fn icon_handles_are_created_once() {
+        // A handle built on every `view` call would be re-hashed (and, with a
+        // unique id, re-uploaded) on every redraw.
+        let a = Icon::Play.handle();
+        let b = Icon::Play.handle();
+        assert_eq!(a.id(), b.id());
     }
 }

@@ -252,6 +252,8 @@ widgets or `ui`:
 |---|---|
 | `src/media/` | Ogg/Opus voice notes (decode, encode, waveform), `rodio` playback thread, `cpal` microphone capture, JPEG thumbnails, profile-picture tiles and their disk cache, the byte-budgeted `ByteLru`. |
 | `src/app/actions.rs`, `src/app/live.rs` | User actions (reply, react, edit, delete, search, jump, avatars, group receipts) and the pure typing / presence state machines. |
+| `src/app/lists.rs`, `src/app/linkify.rs`, `src/app/input.rs` | Archive / pin / favourites / custom lists, link and mention detection (pure, tested), pointer position for context menus. |
+| `src/app/video.rs`, `src/media/video.rs`, `src/media/video_proto.rs`, `src/bin/ferrochat-player.rs` | In-app video: viewer state, the helper process wrapper, the wire format and the GStreamer helper (`video` feature). |
 | `src/notify.rs` | Desktop notifications (`notify-rust`), opening files with `xdg-open`, file-name sanitising. |
 
 `src/net/` contains `types.rs` (domain types), `convert.rs` (pure protobuf ↔

@@ -14,7 +14,8 @@ use futures::stream::Stream;
 use tokio::sync::mpsc;
 
 use super::types::{
-    ChatState, Content, MediaRef, Message, MsgKey, Origin, OutgoingMedia, Quote, ReceiptStatus,
+    ChatFlag, ChatState, Content, ListDef, MediaRef, Message, MsgKey, NameSource, Origin,
+    OutgoingMedia, Quote, ReceiptStatus,
 };
 use super::{Connection, Event, WaClient};
 use crate::error::{Error, Result};
@@ -135,6 +136,35 @@ pub enum Sent {
     },
     /// Logout.
     Logout,
+    /// Archive / unarchive.
+    Archive {
+        /// Chat.
+        chat: String,
+        /// New state.
+        archived: bool,
+    },
+    /// Pin / unpin.
+    Pin {
+        /// Chat.
+        chat: String,
+        /// New state.
+        pinned: bool,
+    },
+    /// List created or edited.
+    SaveList(ListDef),
+    /// List deleted.
+    DeleteList(String),
+    /// List membership changed.
+    ListMember {
+        /// List id.
+        list: String,
+        /// Chat.
+        chat: String,
+        /// Now a member.
+        member: bool,
+    },
+    /// Full app-state resync requested.
+    Resync,
 }
 
 /// The fake client.
@@ -234,6 +264,37 @@ impl FakeClient {
             reactor: reactor.into(),
             emoji: emoji.into(),
             ts: chrono::Utc::now().timestamp(),
+        });
+    }
+
+    /// Simulates a contact name arriving from app-state sync / push names.
+    pub fn simulate_contact_name(&self, jid: &str, name: &str, source: NameSource) {
+        let _ = self.tx.send(Event::ContactName {
+            jid: jid.into(),
+            name: name.into(),
+            source,
+        });
+    }
+
+    /// Simulates archive / pin / mute changing on the phone.
+    pub fn simulate_chat_flag(&self, chat: &str, flag: ChatFlag) {
+        let _ = self.tx.send(Event::ChatFlag {
+            chat: chat.into(),
+            flag,
+        });
+    }
+
+    /// Simulates a list being created / renamed / deleted on the phone.
+    pub fn simulate_list_edit(&self, def: ListDef, deleted: bool) {
+        let _ = self.tx.send(Event::ListEdit { def, deleted });
+    }
+
+    /// Simulates a chat joining or leaving a list on the phone.
+    pub fn simulate_list_chat(&self, list: &str, chat: &str, member: bool) {
+        let _ = self.tx.send(Event::ListChat {
+            list: list.into(),
+            chat: chat.into(),
+            member,
         });
     }
 
@@ -503,6 +564,69 @@ impl WaClient for FakeClient {
         Box::pin(async move { Ok(self.opts.group_size) })
     }
 
+    fn set_archived<'a>(&'a self, chat: &'a str, archived: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::Archive {
+                chat: chat.into(),
+                archived,
+            });
+            Ok(())
+        })
+    }
+
+    fn set_pinned<'a>(&'a self, chat: &'a str, pinned: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::Pin {
+                chat: chat.into(),
+                pinned,
+            });
+            Ok(())
+        })
+    }
+
+    fn save_list<'a>(&'a self, list: &'a ListDef) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::SaveList(list.clone()));
+            Ok(())
+        })
+    }
+
+    fn delete_list<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::DeleteList(id.into()));
+            Ok(())
+        })
+    }
+
+    fn set_list_member<'a>(
+        &'a self,
+        list: &'a str,
+        chat: &'a str,
+        member: bool,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::ListMember {
+                list: list.into(),
+                chat: chat.into(),
+                member,
+            });
+            Ok(())
+        })
+    }
+
+    fn resync_app_state(&self) -> BoxFuture<'_, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::Resync);
+            Ok(())
+        })
+    }
+
     fn simulate_scan(&self) {
         self.scan();
     }
@@ -525,11 +649,39 @@ pub fn start(
     data: MockData,
 ) -> (Arc<FakeClient>, impl Stream<Item = Event> + Send + 'static) {
     let (tx, rx) = mpsc::unbounded_channel();
-    let history = vec![Event::History {
+    let mut history = vec![Event::History {
         chats: data.chats.clone(),
         names: data.names.clone(),
         progress: Some(100),
     }];
+    // App-state sync: address-book names, business names and lists.
+    for (jid, name) in &data.saved {
+        history.push(Event::ContactName {
+            jid: jid.clone(),
+            name: name.clone(),
+            source: NameSource::Saved,
+        });
+    }
+    for (jid, name) in &data.business {
+        history.push(Event::ContactName {
+            jid: jid.clone(),
+            name: name.clone(),
+            source: NameSource::Business,
+        });
+    }
+    for def in &data.lists {
+        history.push(Event::ListEdit {
+            def: def.clone(),
+            deleted: false,
+        });
+    }
+    for (list, chat) in &data.list_members {
+        history.push(Event::ListChat {
+            list: list.clone(),
+            chat: chat.clone(),
+            member: true,
+        });
+    }
     let client = Arc::new(FakeClient {
         tx: tx.clone(),
         opts: opts.clone(),

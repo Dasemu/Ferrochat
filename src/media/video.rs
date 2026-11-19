@@ -1,0 +1,362 @@
+//! In-app video playback through the `ferrochat-player` helper process.
+//!
+//! The helper (GStreamer) decodes one file and streams RGBA frames; this
+//! module spawns it, parses its output on a reader thread and forwards
+//! [`Event`]s over a channel. One [`Player`] exists at a time (the app keeps
+//! it in the open viewer); dropping it ends the process, which releases the
+//! decoder, its buffers and the audio stream.
+
+use std::io::{BufReader, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::Mutex;
+
+use tokio::sync::mpsc;
+
+use super::video_proto::{self as proto, Cmd, Msg, PlayState};
+
+/// Name of the helper executable.
+pub const HELPER_NAME: &str = "ferrochat-player";
+
+/// What went wrong, in terms the user can act on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failure {
+    /// The helper is missing or GStreamer cannot be loaded.
+    Unavailable(String),
+    /// A decoder plug-in is missing (the video codec is not installed).
+    MissingCodec(String),
+    /// The file could not be played.
+    Broken(String),
+}
+
+impl Failure {
+    /// The text shown in the viewer (never a crash, never silent).
+    pub fn user_message(&self) -> String {
+        match self {
+            Failure::Unavailable(_) => "Video playback needs GStreamer, which is not \
+                installed or cannot be loaded. Install gstreamer1.0-plugins-good and \
+                gstreamer1.0-libav (Debian/Ubuntu), gst-plugins-good and gst-libav (Fedora, \
+                Arch), or choose \u{201c}Open externally\u{201d}."
+                .into(),
+            Failure::MissingCodec(what) => format!(
+                "This video cannot be played because {what} is not installed. Install \
+                 gstreamer1.0-libav and gstreamer1.0-plugins-good (or your distribution's \
+                 equivalent), or choose \u{201c}Open externally\u{201d}."
+            ),
+            Failure::Broken(_) => "This video could not be played. It may be damaged or \
+                use a format GStreamer does not support. Choose \u{201c}Open externally\u{201d} \
+                to try another player."
+                .into(),
+        }
+    }
+}
+
+/// What the helper reports.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// Playback started; size and duration are known.
+    Ready {
+        /// Frame width (0 for audio-only files).
+        width: u32,
+        /// Frame height.
+        height: u32,
+        /// Duration in ms, 0 when unknown.
+        duration_ms: u64,
+    },
+    /// A decoded frame (RGBA).
+    Frame {
+        /// Width.
+        width: u32,
+        /// Height.
+        height: u32,
+        /// Pixels.
+        rgba: Vec<u8>,
+    },
+    /// Playback position and state.
+    Time {
+        /// Position in ms.
+        position_ms: u64,
+        /// Duration in ms (0 = unknown).
+        duration_ms: u64,
+        /// State.
+        state: PlayState,
+    },
+    /// Playback failed; no more events follow.
+    Failed(Failure),
+}
+
+/// The helper inside `dir`, if it is there.
+pub fn helper_in(dir: &Path) -> Option<PathBuf> {
+    let p = dir.join(HELPER_NAME);
+    p.is_file().then_some(p)
+}
+
+/// The helper executable: next to this binary, else on `PATH`.
+pub fn helper_path() -> Option<PathBuf> {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        if let Some(p) = helper_in(dir) {
+            return Some(p);
+        }
+        // `cargo test` runs from target/debug/deps.
+        if let Some(p) = dir.parent().and_then(helper_in) {
+            return Some(p);
+        }
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(HELPER_NAME))
+        .find(|p| p.is_file())
+}
+
+/// A running helper. Dropping it stops playback and frees the decoder.
+pub struct Player {
+    child: Mutex<Option<Child>>,
+    stdin: Mutex<Option<ChildStdin>>,
+}
+
+impl std::fmt::Debug for Player {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Player")
+    }
+}
+
+/// Starts `helper` on `file`. Events arrive on the returned channel; the
+/// channel closes after the last event.
+pub fn spawn_with(
+    helper: &Path,
+    file: &Path,
+) -> Result<(Player, mpsc::UnboundedReceiver<Event>), Failure> {
+    let mut child = Command::new(helper)
+        .arg(file)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| Failure::Unavailable(format!("cannot start the video helper: {e}")))?;
+    let (Some(stdout), Some(stderr), stdin) =
+        (child.stdout.take(), child.stderr.take(), child.stdin.take())
+    else {
+        let _ = child.kill();
+        return Err(Failure::Unavailable("no pipes to the video helper".into()));
+    };
+    let (tx, rx) = mpsc::unbounded_channel();
+    // stderr must be drained: GStreamer can be chatty, and a full pipe would
+    // stall the helper. Only the last line is kept (for load failures).
+    let last_err = std::sync::Arc::new(Mutex::new(String::new()));
+    {
+        let last_err = last_err.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in BufReader::new(stderr.take(1 << 20)).lines() {
+                let Ok(line) = line else { break };
+                if let Ok(mut g) = last_err.lock() {
+                    *g = line.chars().take(300).collect();
+                }
+            }
+        });
+    }
+    std::thread::spawn(move || {
+        let mut reader = BufReader::with_capacity(1 << 16, stdout);
+        let mut announced = false;
+        #[allow(clippy::while_let_loop)]
+        loop {
+            match proto::read_msg(&mut reader) {
+                Ok(Some(msg)) => {
+                    let ev = match msg {
+                        Msg::Ready {
+                            width,
+                            height,
+                            duration_ms,
+                        } => {
+                            announced = true;
+                            Event::Ready {
+                                width,
+                                height,
+                                duration_ms,
+                            }
+                        }
+                        Msg::Frame {
+                            width,
+                            height,
+                            rgba,
+                        } => Event::Frame {
+                            width,
+                            height,
+                            rgba,
+                        },
+                        Msg::Time {
+                            position_ms,
+                            duration_ms,
+                            state,
+                        } => Event::Time {
+                            position_ms,
+                            duration_ms,
+                            state,
+                        },
+                        Msg::Failed { missing, text } => {
+                            announced = true;
+                            Event::Failed(if missing {
+                                Failure::MissingCodec(text)
+                            } else {
+                                Failure::Broken(text)
+                            })
+                        }
+                    };
+                    if tx.send(ev).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) | Err(_) => break,
+            }
+        }
+        if !announced {
+            // The helper died before saying anything: the dynamic loader
+            // could not find GStreamer, or it crashed on start.
+            // Give the stderr thread a moment to see the loader's message.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let line = last_err
+                .lock()
+                .map(|g| g.clone())
+                .ok()
+                .filter(|l| !l.is_empty())
+                .unwrap_or_else(|| "the helper exited".into());
+            let _ = tx.send(Event::Failed(Failure::Unavailable(line)));
+        }
+    });
+    Ok((
+        Player {
+            child: Mutex::new(Some(child)),
+            stdin: Mutex::new(stdin),
+        },
+        rx,
+    ))
+}
+
+/// Starts the helper found by [`helper_path`].
+pub fn spawn(file: &Path) -> Result<(Player, mpsc::UnboundedReceiver<Event>), Failure> {
+    let helper = helper_path().ok_or_else(|| {
+        Failure::Unavailable(format!(
+            "the {HELPER_NAME} helper was not found next to Ferrochat"
+        ))
+    })?;
+    spawn_with(&helper, file)
+}
+
+impl Player {
+    /// Sends a command; errors (the helper already exited) are ignored.
+    pub fn send(&self, cmd: Cmd) {
+        if let Ok(mut g) = self.stdin.lock()
+            && let Some(s) = g.as_mut()
+            && (s.write_all(cmd.to_line().as_bytes()).is_err() || s.flush().is_err())
+        {
+            *g = None;
+        }
+    }
+}
+
+impl Drop for Player {
+    fn drop(&mut self) {
+        self.send(Cmd::Quit);
+        if let Ok(mut g) = self.stdin.lock() {
+            *g = None;
+        }
+        let child = self.child.lock().ok().and_then(|mut c| c.take());
+        if let Some(mut child) = child {
+            // Give it a moment to exit cleanly, then make sure it is gone;
+            // reaping happens off the UI thread.
+            std::thread::spawn(move || {
+                for _ in 0..20 {
+                    if matches!(child.try_wait(), Ok(Some(_))) {
+                        return;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+            });
+        }
+    }
+}
+
+/// `65_000` ms -> `1:05`; `3_725_000` -> `1:02:05`.
+pub fn format_clock(ms: u64) -> String {
+    let s = ms / 1000;
+    let (h, m, sec) = (s / 3600, (s / 60) % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{sec:02}")
+    } else {
+        format!("{m}:{sec:02}")
+    }
+}
+
+/// Seek target for a slider fraction in `0.0..=1.0`.
+pub fn seek_target(fraction: f32, duration_ms: u64) -> u64 {
+    (f64::from(fraction.clamp(0.0, 1.0)) * duration_ms as f64) as u64
+}
+
+/// The largest rectangle of aspect `w:h` inside `avail_w x avail_h`.
+pub fn fit_inside(w: u32, h: u32, avail_w: f32, avail_h: f32) -> (f32, f32) {
+    if w == 0 || h == 0 || avail_w <= 0.0 || avail_h <= 0.0 {
+        return (avail_w.max(0.0), avail_h.max(0.0));
+    }
+    let scale = (avail_w / w as f32).min(avail_h / h as f32);
+    (w as f32 * scale, h as f32 * scale)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clock_formats() {
+        assert_eq!(format_clock(0), "0:00");
+        assert_eq!(format_clock(65_000), "1:05");
+        assert_eq!(format_clock(3_725_000), "1:02:05");
+        assert_eq!(format_clock(999), "0:00");
+    }
+
+    #[test]
+    fn seek_fraction_is_clamped() {
+        assert_eq!(seek_target(0.5, 10_000), 5_000);
+        assert_eq!(seek_target(-1.0, 10_000), 0);
+        assert_eq!(seek_target(7.0, 10_000), 10_000);
+        assert_eq!(seek_target(0.5, 0), 0);
+    }
+
+    #[test]
+    fn fit_keeps_the_aspect_ratio() {
+        assert_eq!(fit_inside(1920, 1080, 960.0, 960.0), (960.0, 540.0));
+        assert_eq!(fit_inside(1080, 1920, 960.0, 540.0), (303.75, 540.0));
+        assert_eq!(fit_inside(0, 0, 100.0, 50.0), (100.0, 50.0));
+    }
+
+    #[test]
+    fn failures_have_actionable_messages() {
+        let m = Failure::Unavailable("x".into()).user_message();
+        assert!(m.contains("GStreamer") && m.contains("Open externally"));
+        let m = Failure::MissingCodec("an H.264 decoder".into()).user_message();
+        assert!(m.contains("H.264") && m.contains("gstreamer1.0-libav"));
+        assert!(
+            Failure::Broken("x".into())
+                .user_message()
+                .contains("could not be played")
+        );
+        // The raw error text (which may name files) is never shown.
+        assert!(
+            !Failure::Broken("/secret/path".into())
+                .user_message()
+                .contains("secret")
+        );
+    }
+
+    #[test]
+    fn a_missing_helper_is_a_clear_failure_not_a_crash() {
+        let r = spawn_with(
+            Path::new("/nonexistent/ferrochat-player"),
+            Path::new("/tmp/x"),
+        );
+        assert!(matches!(r, Err(Failure::Unavailable(_))));
+    }
+}

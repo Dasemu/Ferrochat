@@ -7,6 +7,7 @@
 # The same command installs and updates: it downloads the latest GitHub
 # Release, verifies its SHA-256 checksum and installs into the user's home:
 #   binary        ${XDG_BIN_HOME:-$HOME/.local/bin}/ferrochat
+#   video helper  ${XDG_BIN_HOME:-$HOME/.local/bin}/ferrochat-player (in-app video, uses GStreamer)
 #   desktop entry ${XDG_DATA_HOME:-$HOME/.local/share}/applications/dev.ferro.ferrochat.desktop
 #   icon          ${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/dev.ferro.ferrochat.svg
 #   version file  ${XDG_DATA_HOME:-$HOME/.local/share}/ferrochat/installed-version
@@ -42,6 +43,8 @@ ICON_DIR="$DATA_DIR/icons/hicolor/scalable/apps"
 STATE_DIR="$DATA_DIR/$CRATE"
 VERSION_FILE="$STATE_DIR/installed-version"
 BIN_PATH="$BIN_DIR/$CRATE"
+PLAYER_NAME="ferrochat-player"
+PLAYER_PATH="$BIN_DIR/$PLAYER_NAME"
 DESKTOP_PATH="$APPS_DIR/$APP_ID.desktop"
 ICON_PATH="$ICON_DIR/$APP_ID.svg"
 
@@ -60,11 +63,11 @@ refresh_caches() {
 }
 
 uninstall() {
-    rm -f "$BIN_PATH" "$DESKTOP_PATH" "$ICON_PATH" "$VERSION_FILE"
+    rm -f "$BIN_PATH" "$PLAYER_PATH" "$DESKTOP_PATH" "$ICON_PATH" "$VERSION_FILE"
     # The directory may also hold the app's own data: remove it only if empty.
     rmdir "$STATE_DIR" >/dev/null 2>&1 || true
     refresh_caches
-    say "$APP_NAME removed (binary, desktop entry, icon)."
+    say "$APP_NAME removed (binaries, desktop entry, icon)."
     say "Your account data and keyring entries were left untouched."
 }
 
@@ -147,6 +150,14 @@ cp "$SRC/$CRATE" "$BIN_DIR/.$CRATE.new.$$"
 chmod 755 "$BIN_DIR/.$CRATE.new.$$"
 mv -f "$BIN_DIR/.$CRATE.new.$$" "$BIN_PATH"
 
+# The video helper ships from v0.6; older tarballs have none (videos then
+# offer "Open externally" only).
+if [ -f "$SRC/$PLAYER_NAME" ]; then
+    cp "$SRC/$PLAYER_NAME" "$BIN_DIR/.$PLAYER_NAME.new.$$"
+    chmod 755 "$BIN_DIR/.$PLAYER_NAME.new.$$"
+    mv -f "$BIN_DIR/.$PLAYER_NAME.new.$$" "$PLAYER_PATH"
+fi
+
 # Desktop entry: keep the field code of the shipped Exec=, use the absolute path.
 exec_args="$(sed -n 's/^Exec=[^ ]*//p' "$SRC/packaging/$APP_ID.desktop" | head -n 1)"
 case "$BIN_PATH" in
@@ -178,4 +189,5 @@ esac
 
 say "Runtime libraries (usually already present on a desktop install):"
 say "  Linux: libssl3 (OpenSSL 3, for the SQLCipher store), libasound2 (libasound2t64 on newer distros), libxkbcommon0, libwayland-client0, libfontconfig1, libx11-6 and a GPU driver (Mesa/Vulkan; set ICED_BACKEND=tiny-skia if you have none); a Secret Service provider such as gnome-keyring or KWallet for the keyring. libopus is linked statically."
+say "  Video: playing videos inside the app needs GStreamer: gstreamer1.0-plugins-base, gstreamer1.0-plugins-good and gstreamer1.0-libav on Debian/Ubuntu (gst-plugins-base, gst-plugins-good, gst-libav on Fedora/Arch). KDE desktops usually have it. Without it Ferrochat still runs and shows a message when you open a video; 'Open externally' always works."
 say "Run it from your app menu or with: $CRATE"

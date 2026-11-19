@@ -18,6 +18,8 @@ pub enum Message {
     Net(net::Event),
     /// A `Task` finished (boxed: some results are large).
     Done(Box<Done>),
+    /// A frame or status of the video helper (boxed: frames are large).
+    Video(Box<crate::app::video::VideoMsg>),
     /// Fast tick while a voice note plays / records.
     Tick,
     /// One-second tick while typing indicators, our own composing state or
@@ -158,8 +160,24 @@ pub enum Ui {
     CopyText(String),
     /// Show who reacted to a message.
     ShowReactions(String),
-    /// Download a video and open it in the system player.
+    /// Play a video message in the in-app viewer.
     OpenVideo(String),
+    /// "Open externally": download the video and hand it to the system player.
+    OpenVideoExternal(String),
+    /// Close the video viewer (stops playback).
+    CloseVideo,
+    /// Play / pause (also a click on the picture or Space).
+    VideoToggle,
+    /// Seek slider moved to this fraction (0..=1).
+    VideoSeek(f32),
+    /// Seek slider released: seek.
+    VideoSeekRelease,
+    /// Volume slider (0..=100).
+    VideoVolume(u8),
+    /// Mute / unmute.
+    VideoMute,
+    /// Toggle full screen.
+    VideoFullscreen,
     /// The chat list scrolled (avatars load for what is visible).
     SidebarScrolled {
         /// Pixels from the top.
@@ -184,6 +202,45 @@ pub enum Ui {
     CloseSettings,
     /// Flip a background / notification setting.
     Toggle(Setting),
+    /// "Archived" row: show the archived chats.
+    OpenArchived,
+    /// Back from the archived chats.
+    CloseArchived,
+    /// Right click on a chat row.
+    ChatMenu(ChatId),
+    /// Right click on a custom list chip (list id).
+    ChipMenu(String),
+    /// Dismiss the chat list context menu.
+    CloseSidebarMenu,
+    /// Archive / unarchive a chat.
+    ToggleArchive(ChatId),
+    /// Pin / unpin a chat.
+    TogglePin(ChatId),
+    /// Add to / remove from Favourites.
+    ToggleFavourite(ChatId),
+    /// Add to / remove from a custom list.
+    ToggleInList {
+        /// Chat.
+        chat: ChatId,
+        /// List id.
+        list: String,
+    },
+    /// "+" chip: create a list.
+    NewList,
+    /// Rename a list (id).
+    RenameList(String),
+    /// List name edited in the dialog.
+    ListName(String),
+    /// Save the list dialog.
+    SaveList,
+    /// Ask before deleting a list (id).
+    AskDeleteList(String),
+    /// Delete a list (id).
+    ConfirmDeleteList(String),
+    /// Close the list dialog.
+    CloseListDialog,
+    /// Open a link from a message in the default browser.
+    OpenLink(String),
     /// Open a message found by the chat list search.
     OpenHit {
         /// Chat.
@@ -374,6 +431,13 @@ pub enum Done {
     },
     /// A video was saved and handed to the system player.
     VideoOpened(Result<PathBuf, String>),
+    /// The video file for the in-app viewer is on disk (or failed).
+    VideoFile {
+        /// Message id.
+        id: String,
+        /// Path or error text.
+        result: Result<PathBuf, String>,
+    },
     /// Voice note downloaded and decoded.
     VoiceReady {
         /// Message id.
@@ -409,6 +473,26 @@ pub enum Done {
     Screenshot(Box<iced::window::Screenshot>),
     /// Screenshot written.
     ScreenshotSaved(Result<PathBuf, String>),
+    /// Syncing an archive / pin change failed: restore `undo`.
+    FlagFailed {
+        /// Chat.
+        chat: ChatId,
+        /// The previous value.
+        undo: net::ChatFlag,
+        /// Error text.
+        error: String,
+    },
+    /// Syncing a list membership failed: restore `undo`.
+    MemberFailed {
+        /// List id.
+        list: String,
+        /// Chat.
+        chat: ChatId,
+        /// Previous membership.
+        undo: bool,
+        /// Error text.
+        error: String,
+    },
     /// Nothing to do.
     Nothing,
 }

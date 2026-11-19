@@ -1,14 +1,17 @@
 //! Navigation rail and chat list column.
 
 use iced::widget::text::Wrapping;
-use iced::widget::{Space, button, column, container, row, scrollable, stack, text, text_input};
+use iced::widget::{
+    Space, button, column, container, mouse_area, opaque, row, scrollable, stack, text, text_input,
+};
 use iced::{Alignment, Length};
 
 use super::icons::Icon;
 use super::theme::{self, INTER_MEDIUM, INTER_SEMIBOLD};
 use super::{El, avatar_for, badge, ellipsize, fill, gap, icon, list_time, ticks};
+use crate::app::lists::{LIST_NAME_ID, MAX_LIST_NAME};
 use crate::app::state::{ChatEntry, Filter};
-use crate::app::{App, Message, Ui};
+use crate::app::{App, ListDialog, MenuTarget, Message, Ui};
 use crate::net::Connection;
 
 /// Rows rendered at most (the list is not virtualised; search reaches the rest).
@@ -94,28 +97,50 @@ pub fn view(app: &App) -> El<'_> {
     let p = t.palette;
     let m = t.metrics;
 
-    let header = row![
-        text("Chats")
-            .size(m.text_title)
-            .font(INTER_SEMIBOLD)
-            .color(p.text_primary),
-        fill(),
-        button(icon(Icon::MessageSquarePlus, m.icon, p.text_secondary))
-            .padding(8)
-            .style(theme::icon_button(t, false)),
-        button(icon(Icon::EllipsisVertical, m.icon, p.text_secondary))
-            .padding(8)
-            .style(theme::icon_button(t, app.menu_open))
-            .on_press(Message::Ui(Ui::ToggleMenu)),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
-    .padding(iced::Padding {
-        top: 10.0,
-        right: 10.0,
-        bottom: 6.0,
-        left: 20.0,
-    });
+    let header = if app.archived_view {
+        row![
+            button(icon(Icon::ArrowLeft, m.icon, p.text_secondary))
+                .padding(8)
+                .style(theme::icon_button(t, false))
+                .on_press(Message::Ui(Ui::CloseArchived)),
+            text("Archived")
+                .size(m.text_title)
+                .font(INTER_SEMIBOLD)
+                .color(p.text_primary),
+            fill(),
+        ]
+        .spacing(10)
+        .align_y(Alignment::Center)
+        .padding(iced::Padding {
+            top: 10.0,
+            right: 10.0,
+            bottom: 6.0,
+            left: 12.0,
+        })
+    } else {
+        row![
+            text("Chats")
+                .size(m.text_title)
+                .font(INTER_SEMIBOLD)
+                .color(p.text_primary),
+            fill(),
+            button(icon(Icon::MessageSquarePlus, m.icon, p.text_secondary))
+                .padding(8)
+                .style(theme::icon_button(t, false)),
+            button(icon(Icon::EllipsisVertical, m.icon, p.text_secondary))
+                .padding(8)
+                .style(theme::icon_button(t, app.menu_open))
+                .on_press(Message::Ui(Ui::ToggleMenu)),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .padding(iced::Padding {
+            top: 10.0,
+            right: 10.0,
+            bottom: 6.0,
+            left: 20.0,
+        })
+    };
 
     let search = container(
         row![
@@ -132,20 +157,10 @@ pub fn view(app: &App) -> El<'_> {
     .padding([3, 16])
     .style(theme::rounded(p.bg_input, 20.0));
 
-    let chips = row(Filter::ALL.iter().map(|f| {
-        button(text(f.label()).size(14).font(INTER_MEDIUM))
-            .padding([6, 12])
-            .style(theme::chip(t, app.filter == *f))
-            .on_press(Message::Ui(Ui::Filter(*f)))
-            .into()
-    }))
-    .spacing(8);
-
-    let mut top = column![
-        header,
-        container(search).padding([4, 14]),
-        container(chips).padding([10, 16])
-    ];
+    let mut top = column![header, container(search).padding([4, 14])];
+    if !app.archived_view {
+        top = top.push(container(chips(app)).padding([10, 16]));
+    }
 
     if app.connection != Connection::Connected {
         let (label, action) = match &app.connection {
@@ -176,7 +191,9 @@ pub fn view(app: &App) -> El<'_> {
     }
 
     let now = chrono::Utc::now().timestamp();
-    let entries = app.chats.filtered(&app.search, app.filter);
+    let entries = app
+        .chats
+        .filtered_view(&app.search, &app.filter, app.archived_view);
     let searching = !app.search.trim().is_empty();
     let hits = if searching {
         &app.message_hits[..]
@@ -185,7 +202,11 @@ pub fn view(app: &App) -> El<'_> {
     };
     let list: El<'_> = if entries.is_empty() && hits.is_empty() {
         container(
-            text(if app.search.is_empty() {
+            text(if app.archived_view && app.search.is_empty() {
+                "No archived chats"
+            } else if app.search.is_empty() && app.filter != Filter::All {
+                "No chats in this list"
+            } else if app.search.is_empty() {
                 "No chats yet"
             } else {
                 "No chats, contacts or messages found"
@@ -199,22 +220,9 @@ pub fn view(app: &App) -> El<'_> {
     } else {
         let mut col = column![];
         let archived = app.chats.archived_count();
-        if archived > 0 && app.filter == Filter::All && app.search.is_empty() {
-            col = col.push(
-                container(
-                    row![
-                        container(icon(Icon::Archive, 20.0, p.accent))
-                            .width(49)
-                            .center_x(49),
-                        text("Archived").size(16).color(p.text_primary),
-                        fill(),
-                        text(archived.to_string()).size(12).color(p.accent),
-                    ]
-                    .spacing(15)
-                    .align_y(Alignment::Center),
-                )
-                .padding([14, 16]),
-            );
+        if archived > 0 && !app.archived_view && app.filter == Filter::All && app.search.is_empty()
+        {
+            col = col.push(archived_row(app, archived));
         }
         let total = entries.len();
         for e in entries.into_iter().take(MAX_ROWS) {
@@ -438,7 +446,7 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
             .typing
             .in_chat(&e.meta.id)
             .into_iter()
-            .map(|(p, st)| (app.chats.display_name(&p), st))
+            .map(|(p, st)| (app.chats.plain_name(&p), st))
             .collect();
         crate::app::live::typing_label(&names, e.is_group())
     };
@@ -454,10 +462,7 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
         if l.from_me {
             preview_row = preview_row.push(ticks(t, l.status, 16.0));
         } else if e.is_group() {
-            let who = l
-                .sender_name
-                .clone()
-                .unwrap_or_else(|| app.chats.display_name(&l.sender));
+            let who = app.chats.sender_name(&l.sender, l.sender_name.as_deref());
             preview_row = preview_row.push(
                 text(format!("{}: ", ellipsize(&who, 14)))
                     .size(m.text_small + 0.5)
@@ -531,11 +536,315 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
     ]
     .align_y(Alignment::Center);
 
-    button(inner)
-        .padding(0)
+    mouse_area(
+        button(inner)
+            .padding(0)
+            .width(Length::Fill)
+            .height(m.row_height)
+            .style(theme::chat_row(t, selected))
+            .on_press(Message::Ui(Ui::OpenChat(e.meta.id.clone()))),
+    )
+    .on_right_press(Message::Ui(Ui::ChatMenu(e.meta.id.clone())))
+    .into()
+}
+
+/// The "Archived" row at the top of the chat list.
+fn archived_row(app: &App, count: usize) -> El<'_> {
+    let t = &app.theme;
+    let p = t.palette;
+    let unread = app.chats.archived_unread();
+    let mut r = row![
+        container(icon(Icon::Archive, 20.0, p.accent))
+            .width(49)
+            .center_x(49),
+        text("Archived").size(16).color(p.text_primary),
+        fill(),
+    ]
+    .spacing(15)
+    .align_y(Alignment::Center);
+    if unread > 0 {
+        r = r.push(badge(t, unread as u32, true));
+    }
+    r = r.push(text(count.to_string()).size(12).color(p.accent));
+    button(r)
+        .padding([14, 16])
         .width(Length::Fill)
-        .height(m.row_height)
-        .style(theme::chat_row(t, selected))
-        .on_press(Message::Ui(Ui::OpenChat(e.meta.id.clone())))
+        .style(theme::chat_row(t, false))
+        .on_press(Message::Ui(Ui::OpenArchived))
         .into()
+}
+
+/// Filter chips: the built-in ones, the user's lists and "+".
+fn chips(app: &App) -> El<'_> {
+    let t = &app.theme;
+    let p = t.palette;
+    let mut r = row![].spacing(8).align_y(Alignment::Center);
+    for f in Filter::BUILTIN {
+        let active = app.filter == f;
+        r = r.push(
+            button(text(f.label()).size(14).font(INTER_MEDIUM))
+                .padding([6, 12])
+                .style(theme::chip(t, active))
+                .on_press(Message::Ui(Ui::Filter(f))),
+        );
+    }
+    for l in app.chats.custom_lists() {
+        let f = Filter::List(l.id.clone());
+        let active = app.filter == f;
+        r = r.push(
+            mouse_area(
+                button(
+                    text(ellipsize(&l.name, 18))
+                        .size(14)
+                        .font(INTER_MEDIUM)
+                        .shaping(text::Shaping::Advanced),
+                )
+                .padding([6, 12])
+                .style(theme::chip(t, active))
+                .on_press(Message::Ui(Ui::Filter(f))),
+            )
+            .on_right_press(Message::Ui(Ui::ChipMenu(l.id.clone()))),
+        );
+    }
+    r = r.push(
+        button(icon(Icon::Plus, 16.0, p.text_secondary))
+            .padding([7, 10])
+            .style(theme::chip(t, false))
+            .on_press(Message::Ui(Ui::NewList)),
+    );
+    scrollable(r)
+        .direction(scrollable::Direction::Horizontal(
+            scrollable::Scrollbar::new().width(0).scroller_width(0),
+        ))
+        .into()
+}
+
+/// Right-click menu of a chat row or a list chip, floating at the pointer.
+pub fn context_menu(app: &App) -> Option<El<'_>> {
+    let menu = app.sidebar_menu.as_ref()?;
+    let t = &app.theme;
+    let p = t.palette;
+    let item = |label: String, i: Icon, on: Ui, danger: bool| -> El<'_> {
+        button(
+            row![
+                icon(i, 17.0, if danger { p.danger } else { p.text_secondary }),
+                text(label)
+                    .size(14.5)
+                    .color(if danger { p.danger } else { p.text_primary })
+                    .shaping(text::Shaping::Advanced)
+            ]
+            .spacing(14)
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([9, 18])
+        .style(theme::chat_row(t, false))
+        .on_press(Message::Ui(on))
+        .into()
+    };
+    let mut col = column![];
+    let mut rows = 0;
+    match &menu.target {
+        MenuTarget::Chat(chat) => {
+            let e = app.chats.get(chat)?;
+            let archived = e.meta.archived;
+            col = col.push(item(
+                if archived {
+                    "Unarchive chat"
+                } else {
+                    "Archive chat"
+                }
+                .into(),
+                Icon::Archive,
+                Ui::ToggleArchive(chat.clone()),
+                false,
+            ));
+            col = col.push(item(
+                if e.meta.pinned {
+                    "Unpin chat"
+                } else {
+                    "Pin chat"
+                }
+                .into(),
+                Icon::Pin,
+                Ui::TogglePin(chat.clone()),
+                false,
+            ));
+            col = col.push(item(
+                if app.chats.is_favourite(chat) {
+                    "Remove from Favourites"
+                } else {
+                    "Add to Favourites"
+                }
+                .into(),
+                Icon::Star,
+                Ui::ToggleFavourite(chat.clone()),
+                false,
+            ));
+            rows += 3;
+            for l in app.chats.custom_lists().take(8) {
+                let member = app.chats.in_list(&l.id, chat);
+                col = col.push(item(
+                    if member {
+                        format!("Remove from {}", ellipsize(&l.name, 20))
+                    } else {
+                        format!("Add to {}", ellipsize(&l.name, 20))
+                    },
+                    if member { Icon::X } else { Icon::Plus },
+                    Ui::ToggleInList {
+                        chat: chat.clone(),
+                        list: l.id.clone(),
+                    },
+                    false,
+                ));
+                rows += 1;
+            }
+        }
+        MenuTarget::Chip(id) => {
+            col = col.push(item(
+                "Rename list".into(),
+                Icon::Pencil,
+                Ui::RenameList(id.clone()),
+                false,
+            ));
+            col = col.push(item(
+                "Delete list".into(),
+                Icon::Trash2,
+                Ui::AskDeleteList(id.clone()),
+                true,
+            ));
+            rows += 2;
+        }
+    }
+    let (w, h) = (MENU_W, 12.0 + 38.0 * rows as f32);
+    let win = app.window_size();
+    let x = menu.at.x.min(win.width - w - 8.0).max(8.0);
+    let y = menu.at.y.min(win.height - h - 8.0).max(8.0);
+    let card = container(col.width(w))
+        .padding([6, 0])
+        .style(move |th: &iced::Theme| {
+            let mut s = theme::rounded(p.bg_elevated, 8.0)(th);
+            s.shadow = iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
+                offset: iced::Vector::new(0.0, 2.0),
+                blur_radius: 10.0,
+            };
+            s
+        });
+    let dismiss = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
+        .on_press(Message::Ui(Ui::CloseSidebarMenu))
+        .on_right_press(Message::Ui(Ui::CloseSidebarMenu));
+    Some(
+        stack![
+            dismiss,
+            container(card).padding(iced::Padding {
+                top: y,
+                left: x,
+                right: 0.0,
+                bottom: 0.0,
+            })
+        ]
+        .into(),
+    )
+}
+
+/// Width of the context menu card.
+const MENU_W: f32 = 240.0;
+
+/// The create / rename / delete list dialog.
+pub fn list_dialog(app: &App) -> Option<El<'_>> {
+    let d = app.list_dialog.as_ref()?;
+    let t = &app.theme;
+    let p = t.palette;
+    let btn = |label: &'static str, on: Option<Message>, danger: bool| -> El<'_> {
+        let b = button(text(label).size(14.5).font(INTER_MEDIUM).color(if danger {
+            p.danger
+        } else {
+            p.accent
+        }))
+        .padding([9, 16])
+        .style(theme::link_button(t));
+        match on {
+            Some(m) => b.on_press(m).into(),
+            None => b.into(),
+        }
+    };
+    let body: El<'_> = match d {
+        ListDialog::Edit { id, name } => {
+            let valid = !name.trim().is_empty();
+            column![
+                text(if id.is_some() {
+                    "Rename list"
+                } else {
+                    "New list"
+                })
+                .size(18)
+                .color(p.text_primary),
+                container(
+                    text_input("List name", name)
+                        .id(LIST_NAME_ID)
+                        .on_input(|s| Message::Ui(Ui::ListName(s)))
+                        .on_submit(Message::Ui(Ui::SaveList))
+                        .size(t.metrics.text)
+                        .padding([8, 12])
+                        .style(theme::input(t)),
+                )
+                .style(theme::rounded(p.bg_input, 8.0)),
+                text(format!("{} / {MAX_LIST_NAME}", name.chars().count()))
+                    .size(12)
+                    .color(p.text_secondary),
+                row![
+                    fill(),
+                    btn("Cancel", Some(Message::Ui(Ui::CloseListDialog)), false),
+                    btn("Save", valid.then(|| Message::Ui(Ui::SaveList)), false),
+                ]
+                .spacing(4),
+            ]
+            .spacing(12)
+            .into()
+        }
+        ListDialog::Delete(id) => {
+            let name = app
+                .chats
+                .list(id)
+                .map(|l| l.name.as_str())
+                .unwrap_or_default();
+            column![
+                text(format!("Delete \"{}\"?", ellipsize(name, 28)))
+                    .size(18)
+                    .color(p.text_primary)
+                    .shaping(text::Shaping::Advanced),
+                text("The chats stay where they are; only the list is removed.")
+                    .size(14)
+                    .color(p.text_secondary),
+                row![
+                    fill(),
+                    btn("Cancel", Some(Message::Ui(Ui::CloseListDialog)), false),
+                    btn(
+                        "Delete",
+                        Some(Message::Ui(Ui::ConfirmDeleteList(id.clone()))),
+                        true
+                    ),
+                ]
+                .spacing(4),
+            ]
+            .spacing(10)
+            .into()
+        }
+    };
+    let card = container(body)
+        .padding(24)
+        .width(380)
+        .style(move |th: &iced::Theme| {
+            let mut s = theme::rounded(p.bg_elevated, 12.0)(th);
+            s.shadow = iced::Shadow {
+                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
+                offset: iced::Vector::new(0.0, 4.0),
+                blur_radius: 24.0,
+            };
+            s
+        });
+    Some(opaque(container(card).center(Length::Fill).style(
+        theme::solid(iced::Color::from_rgba(0.0, 0.0, 0.0, 0.55)),
+    )))
 }
