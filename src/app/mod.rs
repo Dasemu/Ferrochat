@@ -861,14 +861,21 @@ impl App {
                     self.popup = None;
                 }
                 self.scroll_y = offset_y;
-                if relative_y < 0.02 && self.open.as_ref().is_some_and(|c| c.has_newer) {
+                if relative_y < 0.02
+                    && self
+                        .open
+                        .as_ref()
+                        .is_some_and(|c| c.has_newer && !c.loading)
+                {
                     return self.load_newer_page();
                 }
                 if relative_y > 0.98
-                    && let Some(c) = &self.open
+                    && let Some(c) = &mut self.open
                     && c.has_more
+                    && !c.loading
                     && let Some((ts, id)) = c.oldest_cursor()
                 {
+                    c.loading = true;
                     let chat = c.chat.clone();
                     let s = self.store.clone();
                     return blocking(

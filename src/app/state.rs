@@ -701,6 +701,9 @@ pub struct Conversation {
     /// The window was opened around an old message (search hit, reply jump):
     /// newer messages exist in the cache but are not loaded.
     pub has_newer: bool,
+    /// A page load (older or newer) is in flight: scroll events that would
+    /// ask again are ignored until it lands.
+    pub loading: bool,
 }
 
 impl Conversation {
@@ -711,6 +714,7 @@ impl Conversation {
             messages: VecDeque::new(),
             has_more,
             has_newer: false,
+            loading: false,
         };
         c.merge(msgs);
         c
@@ -769,8 +773,11 @@ impl Conversation {
         }
         while self.messages.len() > WINDOW {
             self.messages.pop_back();
+            // The newest left the window: scrolling back down reloads them.
+            self.has_newer = true;
         }
         self.has_more = has_more;
+        self.loading = false;
     }
 
     /// Applies a receipt to outgoing messages.
@@ -848,6 +855,7 @@ impl Conversation {
             self.has_more = true;
         }
         self.has_newer = has_newer;
+        self.loading = false;
     }
 
     /// Replaces the window with one around an anchor.

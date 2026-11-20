@@ -14,9 +14,10 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
 - Video: `target/debug/ferrochat-player` must exist next to `ferrochat`
-  (`cargo build` builds both). Needs `libgstreamer1.0-dev
-  libgstreamer-plugins-base1.0-dev` to build and `gstreamer1.0-plugins-good`
-  to run the tests. `--no-default-features` builds without the helper.
+  (`cargo build` builds both; OpenH264 compiles from source, needs a C++
+  compiler). No system codec packages. `--no-default-features` builds
+  without the helper. Release links libstdc++ statically
+  (`CXXSTDLIB=static=stdc++`); `.github/scripts/check-helper-libs.sh` checks it.
 
 ## Architecture
 See `docs/architecture.md` (shared Ferro* skeleton + §11 app specifics) and
@@ -67,14 +68,23 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   window and no tray (`app/window.rs` invariant). `ksni` must stay on zbus 5 (shared with ashpd).
 - Keep iced default features on (x11/wayland backends).
 - No Secret Service in CI: tests use `MemoryStore`.
+- Bubbles (`chat::finish`) are explicitly `width(Shrink)`: iced 0.14 makes a
+  container with a Fill child Fill, and the bubble then split the row 50/50
+  with the spacer. Columns inside a bubble that hold Fill children need
+  `.width(Shrink)` too, or the compressed layout squeezes text to one glyph.
+  `ui::chat::layout_tests` checks natural width and containment.
+- Contact-name resync must reset the collection version first: wacore drops
+  a snapshot that is not newer than the stored version. Library app-state
+  logs use targets `Client/AppState` and `AppState`, not `whatsapp_rust`.
 - Hover must never change layout: the message hover buttons live in a slot
   that is always laid out (`chat::action_slot`); `ui::chat::layout_tests`
   fails if a hovered row changes size.
 - Names have sources (saved > business > push "~ Name" > number): never write
   names into one map; use `ChatList::resolve` / `set_name`. Display names of
   senders must not prefer `Message::sender_name` (a push name).
-- `ferrochat` must not link GStreamer: only `src/bin/ferrochat-player.rs` may
-  `use gstreamer`. Video frames are `image::Handle`s made in `update`, never
+- `ferrochat` must not link a codec: only `src/bin/ferrochat-player/` may use
+  `openh264` / `mp4` / `symphonia`. OpenH264 needs `Flush::NoFlush` or
+  B-frames (Main/High) fail to decode. Video frames are `image::Handle`s made in `update`, never
   in `view`; the video viewer replaces the whole view while open.
 - Chat flags / lists are optimistic: apply, persist, send, revert on failure
   (`app/lists.rs`). Never send the `favorites` app-state action (it carries
