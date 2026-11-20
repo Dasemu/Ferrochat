@@ -7,7 +7,7 @@
 
 use iced::border::Radius;
 use iced::widget::{button, container, scrollable, text_input};
-use iced::{Background, Border, Color, Font, Shadow, Theme, Vector, font};
+use iced::{Background, Border, Color, Font, Shadow, Theme, font};
 
 /// Colour palette.
 #[derive(Debug, Clone, Copy)]
@@ -328,12 +328,42 @@ pub fn bubble(
                 width: 0.0,
                 color: Color::TRANSPARENT,
             },
-            shadow: Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.13),
-                offset: Vector::new(0.0, 1.0),
-                blur_radius: 0.5,
-            },
+            // No `Shadow`: the tiny-skia renderer (the default backend)
+            // computes a shadow by evaluating a rounded-box SDF for every
+            // pixel of the shadow box into a fresh pixmap, for every bubble on
+            // every frame. While scrolling that was most of the frame time.
+            // `bubble_shadow` draws the same 1 px drop as a plain quad.
+            shadow: Shadow::default(),
             snap: false,
+        }
+    }
+}
+
+/// The bubble's 1 px drop shadow as a second quad behind it (cheap on every
+/// renderer), like the official `0 1px 0.5px rgba(11,20,26,.13)`.
+pub fn bubble_shadow(
+    t: &FerroTheme,
+    outgoing: bool,
+    tail: bool,
+) -> impl Fn(&Theme) -> container::Style + use<> {
+    let r = t.metrics.bubble_radius;
+    move |_| {
+        let mut radius = Radius::from(r);
+        if tail {
+            if outgoing {
+                radius.top_right = 0.0;
+            } else {
+                radius.top_left = 0.0;
+            }
+        }
+        container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.13))),
+            border: Border {
+                radius,
+                width: 0.0,
+                color: Color::TRANSPARENT,
+            },
+            ..container::Style::default()
         }
     }
 }
@@ -550,5 +580,21 @@ mod tests {
             sender_color("a@s.whatsapp.net"),
             sender_color("a@s.whatsapp.net")
         );
+    }
+
+    /// tiny-skia renders a `Shadow` with a per-pixel SDF into a new pixmap
+    /// for every quad on every frame: bubbles must not use one (a third of
+    /// the scroll frame time before; see `app::perf`).
+    #[test]
+    fn bubbles_have_no_renderer_shadow() {
+        let t = FerroTheme::new(true);
+        for out in [false, true] {
+            for tail in [false, true] {
+                let s = bubble(&t, out, tail)(&Theme::Dark);
+                assert_eq!(s.shadow.color.a, 0.0);
+                let sh = bubble_shadow(&t, out, tail)(&Theme::Dark);
+                assert_eq!(sh.shadow.color.a, 0.0);
+            }
+        }
     }
 }

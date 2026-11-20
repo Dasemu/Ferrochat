@@ -620,7 +620,9 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
     if let Some(q) = &msg.reply
         && !matches!(msg.content, Content::Deleted)
     {
-        col = col.push(quote_block(app, msg, q));
+        // Fill-width quote: the bubble column is compressed by the bubble
+        // (see `finish`), so it gets the widest non-Fill child's width.
+        col = col.push(quote_block(app, msg, q)).push(quote_sizer(app, q));
     }
 
     let body: El<'a> = match &msg.content {
@@ -645,6 +647,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             }
             column![txt, container(meta_row(t, msg)).align_right(Length::Fill)]
                 .spacing(1)
+                .width(Length::Shrink)
                 .into()
         }
         Content::Link { text: body_text, preview } => {
@@ -652,13 +655,13 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             let sub = if out { p.bubble_out_meta } else { p.text_secondary };
             let mut card = column![].spacing(2);
             if let Some(h) = app.thumbs.get(&msg.id) {
-                card = card.push(
+                card = card.push(cover(
                     image(h.clone())
                         .width(Length::Fill)
                         .height(150)
-                        .content_fit(ContentFit::Cover)
+                        .content_fit(ContentFit::Contain)
                         .border_radius(6.0),
-                );
+                ));
             }
             let mut info = column![
                 text(super::ellipsize(&preview.title, 90))
@@ -678,15 +681,16 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                 );
             }
             info = info.push(
-                text(link_host(&preview.url))
+                text(super::ellipsize(&link_host(&preview.url), 40))
                     .size(m.text_small)
                     .color(sub)
-                    .wrapping(Wrapping::None),
+                    .wrapping(Wrapping::WordOrGlyph),
             );
             card = card.push(info);
+            // Full bubble width like the official app, at least 300 px.
             let card = button(card)
                 .padding(0)
-                .width(300)
+                .width(Length::Fill)
                 .style(move |th, st| {
                     let mut s = theme::flat_button(fg)(th, st);
                     s.background = Some(iced::Background::Color(inset));
@@ -694,12 +698,13 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                     s
                 })
                 .on_press(Message::Ui(Ui::OpenLink(preview.url.clone())));
-            col = col.push(card);
+            col = col.push(card).push(Space::new().width(300));
             column![
                 message_text(app, body_text, fg),
                 container(meta_row(t, msg)).align_right(Length::Fill)
             ]
             .spacing(1)
+            .width(Length::Shrink)
             .into()
         }
         Content::Image {
@@ -716,12 +721,13 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                 .or_else(|| app.thumbs.get(&msg.id))
                 .cloned();
             let pic: El<'a> = match handle {
-                Some(handle) => image(handle)
-                    .width(w)
-                    .height(h)
-                    .content_fit(ContentFit::Cover)
-                    .border_radius(6.0)
-                    .into(),
+                Some(handle) => cover(
+                    image(handle)
+                        .width(w)
+                        .height(h)
+                        .content_fit(ContentFit::Contain)
+                        .border_radius(6.0),
+                ),
                 None => container(icon(Icon::Image, 40.0, p.text_secondary))
                     .width(w)
                     .height(h)
@@ -740,6 +746,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                     text(cap.as_str())
                         .size(m.text)
                         .color(fg)
+                        .wrapping(Wrapping::WordOrGlyph)
                         .shaping(text::Shaping::Advanced),
                 );
             }
@@ -775,10 +782,10 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                     .padding([6, 6])
                     .style(theme::rounded(doc_color(&ext), 4.0)),
                     column![
-                        text(super::ellipsize(file_name, 34))
+                        text(super::ellipsize(file_name, 60))
                             .size(m.text)
                             .color(fg)
-                            .wrapping(Wrapping::None),
+                            .wrapping(Wrapping::WordOrGlyph),
                         text(info.join(" • ")).size(12).color(if out {
                             p.bubble_out_meta
                         } else {
@@ -809,9 +816,16 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             .on_press(Message::Ui(Ui::OpenDocument(msg.id.clone())));
             let mut c = column![card].spacing(4);
             if let Some(cap) = caption {
-                c = c.push(text(cap.as_str()).size(m.text).color(fg));
+                c = c.push(
+                    text(cap.as_str())
+                        .size(m.text)
+                        .color(fg)
+                        .wrapping(Wrapping::WordOrGlyph),
+                );
             }
-            c.push(container(meta_row(t, msg)).align_right(Length::Fill)).into()
+            c.push(container(meta_row(t, msg)).align_right(Length::Fill))
+                .width(Length::Shrink)
+                .into()
         }
         Content::Video {
             caption,
@@ -822,12 +836,13 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
         } => {
             let (w, h) = fit(*width, *height, 330.0, 330.0);
             let pic: El<'a> = match app.thumbs.get(&msg.id) {
-                Some(handle) => image(handle.clone())
-                    .width(w)
-                    .height(h)
-                    .content_fit(ContentFit::Cover)
-                    .border_radius(6.0)
-                    .into(),
+                Some(handle) => cover(
+                    image(handle.clone())
+                        .width(w)
+                        .height(h)
+                        .content_fit(ContentFit::Contain)
+                        .border_radius(6.0),
+                ),
                 None => container(icon(Icon::Video, 40.0, p.text_secondary))
                     .width(w)
                     .height(h)
@@ -910,6 +925,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                 .color(p.text_secondary),
             container(meta_row(t, msg)).align_right(Length::Fill)
         ]
+        .width(Length::Shrink)
         .into(),
         Content::ViewOnce => row![
             icon(Icon::CircleDashed, 16.0, p.text_secondary),
@@ -952,6 +968,13 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
             bottom: 5.0,
             left: 9.0,
         })
+        // Explicit Shrink: the content holds Fill children (right-aligned
+        // time, full-width quote), and iced 0.14 makes a container with a
+        // Fill child Fill itself. The bubble then shared the row 50/50 with
+        // the spacer beside it: every bubble was capped at half the pane
+        // (minus the hover slot), wrapped early and pushed the time into the
+        // text. Shrink compresses the content to its natural width instead.
+        .width(Length::Shrink)
         .max_width(t.metrics.bubble_max)
         .style(theme::bubble(t, out, first && !sticker));
     if matches!(msg.content, Content::Image { .. } | Content::Video { .. }) {
@@ -960,6 +983,17 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
     if sticker {
         b = b.padding(2).style(theme::solid(Color::TRANSPARENT));
     }
+    // The drop shadow: one plain quad 1 px lower (see `theme::bubble`).
+    let b = if sticker {
+        container(b)
+    } else {
+        container(b)
+            .padding(iced::Padding {
+                bottom: 1.0,
+                ..Default::default()
+            })
+            .style(theme::bubble_shadow(t, out, first))
+    };
     let bubble: El<'a> = if msg.status == ReceiptStatus::Failed && out {
         mouse_area(b)
             .on_press(Message::Ui(Ui::Retry(msg.id.clone())))
@@ -1209,21 +1243,21 @@ fn quote_block<'a>(app: &'a App, msg: &'a ChatMessage, q: &'a Quote) -> El<'a> {
                 .font(INTER_MEDIUM)
                 .color(bar)
                 .shaping(text::Shaping::Advanced),
-            text(super::ellipsize(&q.preview, 90))
+            text(super::ellipsize(&q.preview, QUOTE_CHARS))
                 .size(13.5)
                 .color(if msg.from_me {
                     p.bubble_out_meta
                 } else {
                     p.text_secondary
                 })
-                .wrapping(Wrapping::None)
+                .wrapping(Wrapping::WordOrGlyph)
                 .shaping(text::Shaping::Advanced),
         ]
         .spacing(2)
         .padding([6, 8]),
     ]
     .height(Length::Shrink);
-    button(inner)
+    let block = button(inner)
         .padding(0)
         .width(Length::Fill)
         .style(move |th, st| {
@@ -1232,9 +1266,49 @@ fn quote_block<'a>(app: &'a App, msg: &'a ChatMessage, q: &'a Quote) -> El<'a> {
             s.border.radius = 6.0.into();
             s
         })
-        .on_press(Message::Ui(Ui::JumpTo(q.id.clone())))
-        .into()
+        .on_press(Message::Ui(Ui::JumpTo(q.id.clone())));
+    block.into()
 }
+
+/// The quote fills the bubble's width; this invisible, zero-height copy of
+/// its one-line width (a direct child of the bubble column) makes the bubble
+/// at least that wide, up to its maximum, so a short reply to a long message
+/// does not squeeze the quote into a narrow column. Nothing is drawn outside
+/// the bubble: the preview wraps instead of running past its edge.
+fn quote_sizer<'a>(app: &'a App, q: &'a Quote) -> El<'a> {
+    super::measure::width_of(
+        column![
+            text(quote_author(app, q))
+                .size(13)
+                .font(INTER_MEDIUM)
+                .wrapping(Wrapping::None)
+                .shaping(text::Shaping::Advanced),
+            text(super::ellipsize(&q.preview, QUOTE_CHARS))
+                .size(13.5)
+                .wrapping(Wrapping::None)
+                .shaping(text::Shaping::Advanced),
+        ]
+        .padding(iced::Padding {
+            left: 4.0 + 8.0,
+            right: 8.0 + 2.0,
+            ..Default::default()
+        }),
+    )
+}
+
+/// A bubble picture. Pictures are drawn with `ContentFit::Contain`, never
+/// `Cover`: iced draws a covering picture at its scaled size, and the
+/// tiny-skia renderer does not clip images (its image path uses the clip
+/// mask without fitting it to the clip bounds), so a thumbnail whose aspect
+/// differed from its box (link previews, WhatsApp thumbnails) was painted
+/// over the neighbouring bubbles: the dark rectangle over the previous
+/// message's text and time. The clip stays for the wgpu renderer.
+fn cover<'a>(img: impl Into<El<'a>>) -> El<'a> {
+    container(img).clip(true).into()
+}
+
+/// Characters of a quoted message shown in a reply bubble (it wraps).
+const QUOTE_CHARS: usize = 140;
 
 /// `https://www.example.com/a/b` -> `example.com`.
 fn link_host(url: &str) -> String {
@@ -1262,12 +1336,14 @@ fn message_text<'a>(app: &'a App, s: &'a str, fg: Color) -> El<'a> {
             if spans.len() > 1 {
                 return iced::widget::rich_text::<(), Message, iced::Theme, iced::Renderer>(spans)
                     .size(m.text)
+                    .wrapping(Wrapping::WordOrGlyph)
                     .color(fg)
                     .into();
             }
         }
         return text(s)
             .size(m.text)
+            .wrapping(Wrapping::WordOrGlyph)
             .color(fg)
             .shaping(text::Shaping::Advanced)
             .into();
@@ -1291,6 +1367,7 @@ fn message_text<'a>(app: &'a App, s: &'a str, fg: Color) -> El<'a> {
     iced::widget::rich_text::<String, Message, iced::Theme, iced::Renderer>(spans)
         .on_link_click(|href| Message::Ui(Ui::OpenLink(href)))
         .size(m.text)
+        .wrapping(Wrapping::WordOrGlyph)
         .color(fg)
         .into()
 }
@@ -1924,6 +2001,96 @@ mod layout_tests {
         app.popup = Some(("p".into(), Popup::Menu));
         let open = size_of(bubble(&app, &m, true, false), 800.0);
         assert_eq!(idle, open);
+    }
+
+    fn layout_of(el: &mut El<'_>, width: f32) -> iced::advanced::layout::Node {
+        let renderer = futures::executor::block_on(<iced::Renderer as Headless>::new(
+            iced::Font::DEFAULT,
+            Pixels(16.0),
+            Some("tiny-skia"),
+        ))
+        .expect("tiny-skia renderer");
+        let mut tree = Tree::new(el.as_widget());
+        el.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &Limits::new(Size::ZERO, Size::new(width, 5000.0)),
+        )
+    }
+
+    /// The bubble node inside a row laid out by `finish` (row -> column ->
+    /// line row -> [tail, bubble, slot, spacer] for incoming messages).
+    fn bubble_width(node: &iced::advanced::layout::Node, out: bool) -> f32 {
+        let line = &node.children()[0].children()[0];
+        let kids = line.children();
+        // Outgoing: [spacer, slot, bubble, tail].
+        let i = if out { 2 } else { 1 };
+        kids[i].bounds().width
+    }
+
+    /// Every descendant stays inside its parent: nothing is drawn over the
+    /// bubble edge or the time.
+    fn assert_contained(n: &iced::advanced::layout::Node, depth: usize) {
+        let b = n.bounds();
+        for c in n.children() {
+            let cb = c.bounds();
+            assert!(
+                cb.x >= -0.5 && cb.y >= -0.5 && cb.x + cb.width <= b.width + 0.5,
+                "child {cb:?} escapes parent {b:?} at depth {depth}"
+            );
+            assert_contained(c, depth + 1);
+        }
+    }
+
+    /// Round-4 regression: a Fill child (the right-aligned time) made the
+    /// bubble Fill too, so it shared the row 50/50 with the spacer and every
+    /// bubble was capped at half the pane.
+    #[test]
+    fn bubbles_take_their_natural_width_not_half_the_pane() {
+        let app = app();
+        let long = "Mira esto que es un texto bastante largo y también otra cosa más para ver";
+        for (out, width) in [
+            (false, 684.0),
+            (true, 684.0),
+            (false, 900.0),
+            (true, 1200.0),
+        ] {
+            let m = msg("w", out, long);
+            let mut el = bubble(&app, &m, true, false);
+            let node = layout_of(&mut el, width);
+            let w = bubble_width(&node, out);
+            // Natural one/two-line width up to the 520 px maximum, never
+            // half of the row.
+            assert!(w > 470.0 && w <= 520.0, "bubble {w} px at pane {width}");
+            assert_contained(&node, 0);
+        }
+        // Short text stays short.
+        let m = msg("s", false, "ok");
+        let mut el = bubble(&app, &m, true, false);
+        let w = bubble_width(&layout_of(&mut el, 900.0), false);
+        assert!(w < 120.0, "short bubble {w}");
+    }
+
+    #[test]
+    fn a_short_reply_is_as_wide_as_its_quote_and_nothing_overflows() {
+        let app = app();
+        let mut m = msg("r", false, "vale");
+        m.reply = Some(Quote {
+            id: "q".into(),
+            sender: "34611111111@s.whatsapp.net".into(),
+            preview: "Nos vemos mañana en la estación, llevo yo el café y los bollos".into(),
+        });
+        let mut el = bubble(&app, &m, true, false);
+        let node = layout_of(&mut el, 900.0);
+        let w = bubble_width(&node, false);
+        assert!(w > 300.0, "the quote widened the bubble to {w}");
+        assert_contained(&node, 0);
+        // A very long unbreakable word wraps inside the bubble.
+        let m = msg("u", true, &"x".repeat(400));
+        let mut el = bubble(&app, &m, true, false);
+        let node = layout_of(&mut el, 700.0);
+        assert!(bubble_width(&node, true) <= 520.0);
+        assert_contained(&node, 0);
     }
 
     #[test]

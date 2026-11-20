@@ -100,10 +100,15 @@ pub trait WaClient: Send + Sync {
         chat: &'a str,
         member: bool,
     ) -> BoxFuture<'a, Result<()>>;
-    /// Asks the server for a full app-state snapshot (contacts, archive,
-    /// pins, lists) so names saved on the phone arrive even when the
-    /// collections were synced before this client used them.
-    fn resync_app_state(&self) -> BoxFuture<'_, Result<()>>;
+    /// Forces a full app-state snapshot (contacts, archive, pins, lists) so
+    /// names saved on the phone arrive even when the collections were synced
+    /// before this client used them. Reports what was applied.
+    fn resync_app_state(&self) -> BoxFuture<'_, Result<ResyncReport>>;
+    /// LID ↔ phone-number pairs the protocol library already knows
+    /// (`(lid, pn)` JIDs), so names keyed by either id meet.
+    fn known_lid_pairs(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Tells `author` that we viewed these statuses. Returns `Ok(false)` when
     /// nothing was sent because our "read receipts" privacy setting is off
     /// (or could not be read): statuses are then only marked seen locally.
@@ -328,6 +333,12 @@ pub enum Event {
         /// Now a member.
         member: bool,
     },
+    /// Chat marked unread on another device (app-state `markChatAsRead`
+    /// with `read = false`).
+    ChatMarkedUnread {
+        /// Chat.
+        chat: ChatId,
+    },
     /// Chat marked read on another device.
     ChatRead {
         /// Chat.
@@ -394,6 +405,7 @@ impl fmt::Debug for Event {
             Event::ListEdit { deleted, .. } => write!(f, "ListEdit(deleted={deleted})"),
             Event::ListChat { member, .. } => write!(f, "ListChat(member={member})"),
             Event::ChatRead { .. } => write!(f, "ChatRead"),
+            Event::ChatMarkedUnread { .. } => write!(f, "ChatMarkedUnread"),
             Event::Status(v) => write!(f, "Status(n={})", v.len()),
             Event::StatusRevoked { .. } => write!(f, "StatusRevoked"),
             Event::Star(c) => write!(f, "Star({})", c.starred),

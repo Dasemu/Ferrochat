@@ -535,6 +535,11 @@ pub enum Parsed {
 
 /// Classifies one incoming message. Returns `None` for protocol chatter.
 pub fn parse_incoming(env: &Envelope, msg: &wa::Message) -> Option<Parsed> {
+    // Status updates arrive as messages in `status@broadcast`; they are not
+    // a chat (they made a hidden "chat" whose unread count reached 99+).
+    if super::types::is_pseudo_chat(&bare_jid(&env.chat)) {
+        return None;
+    }
     if let Some(target) = revoked_target(msg) {
         let mut m = message_from_envelope(env, msg)?;
         m.id = target;
@@ -652,8 +657,12 @@ pub fn chat_from_conversation(conv: &wa::Conversation, now: i64) -> ChatMeta {
         .unwrap_or_default() as i64;
     ChatMeta {
         id: bare_jid(&conv.id),
-        name: non_empty(conv.name.as_ref()),
-        unread: conv.unread_count.unwrap_or_default(),
+        name: non_empty(conv.name.as_ref()).or_else(|| non_empty(conv.display_name.as_ref())),
+        // "Mark as unread" on the phone shows as one unread, like the dot.
+        unread: match conv.unread_count.unwrap_or_default() {
+            0 if conv.marked_as_unread == Some(true) => 1,
+            n => n,
+        },
         last_ts,
         pinned: conv.pinned.unwrap_or_default() > 0,
         archived: conv.archived.unwrap_or(false),
@@ -890,6 +899,19 @@ mod tests {
             recipient_alt: None,
             ephemeral_secs: None,
         }
+    }
+
+    #[test]
+    fn status_updates_are_not_chat_messages() {
+        let mut e = env(false);
+        e.chat = "status@broadcast".into();
+        let msg = wa::Message {
+            conversation: Some("my status".into()),
+            ..Default::default()
+        };
+        assert!(parse_incoming(&e, &msg).is_none());
+        e.chat = "34600111222@s.whatsapp.net".into();
+        assert!(parse_incoming(&e, &msg).is_some());
     }
 
     #[test]
@@ -1495,6 +1517,47 @@ mod name_and_list_tests {
         assert!(
             matches!(&evs[0], Event::LidMappings(p) if p == &[("999@lid".to_string(), "34600111222@s.whatsapp.net".to_string())])
         );
+    }
+
+    /// The shape seen on current accounts: the mutation index is the LID and
+    /// `pnJid` carries the phone number.
+    #[test]
+    fn a_lid_indexed_contact_action_names_the_phone_number_too() {
+        let a = ContactAction {
+            full_name: Some("Lucía Fernández".into()),
+            first_name: Some("Lucía".into()),
+            pn_jid: Some("34611111111@s.whatsapp.net".into()),
+            save_on_primary_addressbook: Some(true),
+            ..Default::default()
+        };
+        let evs = contact_events("205000111222333@lid", &a);
+        assert!(evs.iter().any(|e| matches!(e, Event::ContactName { jid, name, source: NameSource::Saved } if jid == "34611111111@s.whatsapp.net" && name == "Lucía Fernández")));
+        assert!(
+            evs.iter().any(
+                |e| matches!(e, Event::ContactName { jid, .. } if jid == "205000111222333@lid")
+            )
+        );
+    }
+
+    #[test]
+    fn history_conversation_unread_and_display_name() {
+        let conv = wa::Conversation {
+            id: "34600111222@s.whatsapp.net".into(),
+            display_name: Some("Ana (agenda)".into()),
+            marked_as_unread: Some(true),
+            unread_count: Some(0),
+            ..Default::default()
+        };
+        let c = chat_from_conversation(&conv, 0);
+        assert_eq!(c.unread, 1, "marked as unread shows one");
+        assert_eq!(c.name.as_deref(), Some("Ana (agenda)"));
+        let conv = wa::Conversation {
+            id: "x@s.whatsapp.net".into(),
+            unread_count: Some(4),
+            marked_as_unread: Some(true),
+            ..Default::default()
+        };
+        assert_eq!(chat_from_conversation(&conv, 0).unread, 4);
     }
 
     #[test]

@@ -309,6 +309,15 @@ pub struct Located {
 /// Task completions.
 #[derive(Debug, Clone)]
 pub enum Done {
+    /// A forced app-state resync finished.
+    Resync {
+        /// Attempt number in this run, from 1.
+        attempt: u32,
+        /// What was applied.
+        result: Result<net::ResyncReport, String>,
+    },
+    /// Time to retry the resync.
+    ResyncDue,
     /// The autostart entry was written (`true`) or removed (`false`).
     Autostart(Result<bool, String>),
     /// Messages loaded from the cache.

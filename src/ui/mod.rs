@@ -3,6 +3,7 @@
 pub mod chat;
 pub mod icons;
 pub mod login;
+pub mod measure;
 pub mod nav;
 pub mod settings;
 pub mod sidebar;
@@ -148,11 +149,14 @@ pub fn avatar<'a>(t: &FerroTheme, group: bool, size: f32) -> El<'a> {
 /// default avatar while it is loading or when there is none.
 pub fn avatar_for<'a>(app: &'a App, jid: &str, group: bool, size: f32) -> El<'a> {
     match app.avatars.peek(jid) {
-        Some(handle) => iced::widget::image(handle.clone())
-            .width(size)
-            .height(size)
-            .content_fit(iced::ContentFit::Cover)
-            .into(),
+        Some(handle) => container(
+            iced::widget::image(handle.clone())
+                .width(size)
+                .height(size)
+                .content_fit(iced::ContentFit::Cover),
+        )
+        .clip(true)
+        .into(),
         None => avatar(&app.theme, group, size),
     }
 }

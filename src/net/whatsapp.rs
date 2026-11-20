@@ -8,6 +8,7 @@
 //!   [`super::Event`]s by the pure functions in [`super::convert`].
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use diesel::RunQueryDsl;
@@ -28,8 +29,8 @@ use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
 use super::convert::{self, Envelope, Uploaded};
 use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
-    ChatState, Content, ListDef, MediaKind, MediaRef, MsgKey, NameSource, Origin, OutgoingKind,
-    OutgoingMedia, Quote,
+    ChatState, CollectionResync, Content, ListDef, MediaKind, MediaRef, MsgKey, NameSource, Origin,
+    OutgoingKind, OutgoingMedia, Quote, ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
@@ -41,6 +42,9 @@ pub struct RealClient {
     client: Arc<Client>,
     handle: Mutex<Option<BotHandle>>,
     signal_db: PathBuf,
+    /// `contact` app-state mutations seen (counted where the library
+    /// dispatches them, so a resync can tell whether the address book came).
+    contacts_seen: Arc<AtomicUsize>,
     /// "Read receipts" privacy value and when it was fetched.
     read_receipts: Mutex<Option<(std::time::Instant, bool)>>,
 }
@@ -421,27 +425,132 @@ impl WaClient for RealClient {
         })
     }
 
-    fn resync_app_state(&self) -> BoxFuture<'_, Result<()>> {
+    fn resync_app_state(&self) -> BoxFuture<'_, Result<ResyncReport>> {
         Box::pin(async move {
             use whatsapp_rust::sync_task::MajorSyncTask;
+            use whatsapp_rust::wacore::appstate::hash::HashState;
             use whatsapp_rust::wacore::appstate::patch_decode::WAPatchName;
-            // Contacts live in `critical_unblock_low`; archive, pin, mute and
-            // labels in `regular_low` / `regular`. A snapshot replays every
-            // mutation as an event, whatever version we had stored.
+            // Contacts live in `critical_unblock_low`; archive, pin, mute,
+            // read state and labels in `regular_low` / `regular` /
+            // `regular_high`.
+            //
+            // `full_sync: true` alone is a no-op on a collection that is
+            // already synced: wacore 0.7 drops a snapshot whose version is
+            // not newer than the persisted one ("Skipping stale snapshot",
+            // `appstate_sync::snapshot_is_stale`), so no mutation is replayed
+            // and no `ContactUpdate` is emitted. Resetting the persisted
+            // version (and the mutation MACs that belong to it) first makes
+            // the snapshot the new baseline, exactly as for a freshly linked
+            // device. If the request fails half-way the version stays 0 and
+            // the next sync of that collection asks for a snapshot again.
+            let backend = self.client.persistence_manager().backend();
+            let had_sync_key = backend
+                .get_latest_sync_key_id()
+                .await
+                .map(|k| k.is_some())
+                .unwrap_or(false);
+            if !had_sync_key {
+                tracing::warn!(
+                    "app-state resync: no app-state sync key stored yet; the library asks the \
+                     phone for it (AppStateSyncKeyRequest), the phone must be online"
+                );
+            }
+            let contacts_before = self.contacts_seen.load(Ordering::Relaxed);
+            let mut collections = Vec::new();
             for name in [
                 WAPatchName::CriticalUnblockLow,
-                WAPatchName::Regular,
                 WAPatchName::RegularLow,
+                WAPatchName::Regular,
                 WAPatchName::RegularHigh,
             ] {
+                let before = backend
+                    .get_version(name.as_str())
+                    .await
+                    .map(|s| s.version)
+                    .unwrap_or(0);
+                if before > 0 {
+                    if let Err(e) = backend.clear_mutation_macs(name.as_str()).await {
+                        tracing::warn!(
+                            "app-state resync: {}: cannot reset MACs: {e}",
+                            name.as_str()
+                        );
+                        collections.push(CollectionResync {
+                            name: name.as_str(),
+                            before,
+                            after: before,
+                        });
+                        continue;
+                    }
+                    if let Err(e) = backend
+                        .set_version(name.as_str(), HashState::default())
+                        .await
+                    {
+                        tracing::warn!(
+                            "app-state resync: {}: cannot reset version: {e}",
+                            name.as_str()
+                        );
+                        collections.push(CollectionResync {
+                            name: name.as_str(),
+                            before,
+                            after: before,
+                        });
+                        continue;
+                    }
+                }
                 self.client
                     .process_sync_task(MajorSyncTask::AppStateSync {
                         name,
                         full_sync: true,
                     })
                     .await;
+                let after = backend
+                    .get_version(name.as_str())
+                    .await
+                    .map(|s| s.version)
+                    .unwrap_or(0);
+                tracing::info!(
+                    "app-state resync: {} version {before} -> {after} ({})",
+                    name.as_str(),
+                    if after > 0 {
+                        "snapshot applied"
+                    } else {
+                        "not applied, will retry"
+                    }
+                );
+                collections.push(CollectionResync {
+                    name: name.as_str(),
+                    before,
+                    after,
+                });
             }
-            Ok(())
+            Ok(ResyncReport {
+                collections,
+                had_sync_key,
+                contacts: self
+                    .contacts_seen
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(contacts_before),
+            })
+        })
+    }
+
+    fn known_lid_pairs(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
+        Box::pin(async move {
+            let backend = self.client.persistence_manager().backend();
+            let rows = backend
+                .get_all_lid_mappings()
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(rows
+                .into_iter()
+                .filter(|r| !r.lid.is_empty() && !r.phone_number.is_empty())
+                .map(|r| {
+                    (
+                        format!("{}@lid", r.lid),
+                        format!("{}@s.whatsapp.net", r.phone_number),
+                    )
+                })
+                .collect())
         })
     }
 
@@ -663,11 +772,17 @@ pub fn remove_db(path: &Path) -> Result<()> {
 
 /// Library event handler: forwards into our channel, conversion happens on
 /// our own task so the dispatch path stays cheap.
-struct Forwarder(mpsc::UnboundedSender<Arc<WaEvent>>);
+struct Forwarder {
+    tx: mpsc::UnboundedSender<Arc<WaEvent>>,
+    contacts_seen: Arc<AtomicUsize>,
+}
 
 impl EventHandler for Forwarder {
     fn handle_event(&self, event: Arc<WaEvent>) {
-        let _ = self.0.send(event);
+        if matches!(&*event, WaEvent::ContactUpdate(_)) {
+            self.contacts_seen.fetch_add(1, Ordering::Relaxed);
+        }
+        let _ = self.tx.send(event);
     }
 }
 
@@ -816,10 +931,14 @@ async fn run(
     };
 
     let (wa_tx, mut wa_rx) = mpsc::unbounded_channel::<Arc<WaEvent>>();
+    let contacts_seen = Arc::new(AtomicUsize::new(0));
     let bot = Bot::builder()
         .with_backend(store)
-        .with_device_props(DevicePropsOverride::new().with_os("Ferrochat"))
-        .with_event_handler(Forwarder(wa_tx))
+        .with_device_props(device_props())
+        .with_event_handler(Forwarder {
+            tx: wa_tx,
+            contacts_seen: contacts_seen.clone(),
+        })
         .build()
         .await
         .map_err(|e| Error::Protocol(format!("client setup failed: {e}")))?;
@@ -829,6 +948,7 @@ async fn run(
         client: client.clone(),
         handle: Mutex::new(Some(handle)),
         signal_db: signal_db.clone(),
+        contacts_seen,
         read_receipts: Mutex::new(None),
     });
     let _ = tx.send(Event::Ready(real.clone()));
@@ -865,6 +985,17 @@ async fn run(
             }
         }
     }
+}
+
+/// What this companion tells the phone about itself at pairing (shown in
+/// the phone's "Linked devices"). `DESKTOP` is the protocol's category for a
+/// native desktop client; the sync fields keep the library's default (the
+/// same recent-history sync WhatsApp Web asks for). Only sent when a device
+/// is linked: existing links keep the props they were paired with.
+fn device_props() -> DevicePropsOverride {
+    DevicePropsOverride::new()
+        .with_os("Ferrochat")
+        .with_platform_type(whatsapp_rust::waproto::whatsapp::device_props::PlatformType::DESKTOP)
 }
 
 /// Events after which the library must not keep reconnecting on its own.
@@ -1155,11 +1286,15 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             id: d.message_id.clone(),
         }],
         WaEvent::StarUpdate(u) => vec![Event::Star(convert::star_change(u))],
-        WaEvent::MarkChatAsReadUpdate(m) if m.action.read == Some(true) => {
-            vec![Event::ChatRead {
+        WaEvent::MarkChatAsReadUpdate(m) => match m.action.read {
+            Some(true) => vec![Event::ChatRead {
                 chat: convert::bare_jid(&m.jid.to_string()),
-            }]
-        }
+            }],
+            Some(false) => vec![Event::ChatMarkedUnread {
+                chat: convert::bare_jid(&m.jid.to_string()),
+            }],
+            None => vec![],
+        },
         _ => vec![],
     }
 }

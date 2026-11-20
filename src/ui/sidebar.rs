@@ -53,7 +53,7 @@ pub fn rail(app: &App) -> El<'_> {
     } else {
         Some(app.nav.section)
     };
-    let unread: u32 = app.chats.entries.iter().map(|e| e.meta.unread).sum();
+    let unread = app.chats.unread_chats() as u32;
     let chats_active = current == Some(Section::Chats);
     let chats_item: El<'_> = if unread > 0 {
         stack![
@@ -266,7 +266,7 @@ pub fn view(app: &App) -> El<'_> {
         let archived = app.chats.archived_count();
         if archived > 0 && !app.archived_view && app.filter == Filter::All && app.search.is_empty()
         {
-            col = col.push(archived_row(app, archived));
+            col = col.push(archived_row(app));
         }
         let total = entries.len();
         for e in entries.into_iter().take(MAX_ROWS) {
@@ -605,7 +605,7 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
 }
 
 /// The "Archived" row at the top of the chat list.
-fn archived_row(app: &App, count: usize) -> El<'_> {
+fn archived_row(app: &App) -> El<'_> {
     let t = &app.theme;
     let p = t.palette;
     let unread = app.chats.archived_unread();
@@ -618,10 +618,16 @@ fn archived_row(app: &App, count: usize) -> El<'_> {
     ]
     .spacing(15)
     .align_y(Alignment::Center);
+    // WhatsApp Desktop: the number of archived chats with unread messages,
+    // in green, no pill; nothing when none is unread.
     if unread > 0 {
-        r = r.push(badge(t, unread as u32, true));
+        r = r.push(
+            text(unread.to_string())
+                .size(12)
+                .font(theme::INTER_SEMIBOLD)
+                .color(p.accent),
+        );
     }
-    r = r.push(text(count.to_string()).size(12).color(p.accent));
     button(r)
         .padding([14, 16])
         .width(Length::Fill)

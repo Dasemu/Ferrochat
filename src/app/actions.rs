@@ -759,6 +759,9 @@ impl App {
             return Task::none();
         };
         let (chat, ts, id) = (c.chat.clone(), last.timestamp, last.id.clone());
+        if let Some(c) = &mut self.open {
+            c.loading = true;
+        }
         let s = self.store.clone();
         blocking(
             move || s.load_newer(&chat, (ts, &id), PAGE).map(|r| (chat, r)),

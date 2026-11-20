@@ -84,8 +84,7 @@ Rust stable (edition 2024, ≥ 1.94) and, on Debian/Ubuntu:
 
 ```sh
 sudo apt-get install -y pkg-config cmake libdbus-1-dev libasound2-dev \
-  libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev \
-  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+  libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev
 cargo build --release
 ```
 
@@ -95,12 +94,11 @@ cargo build --release
 libopus package at runtime. Runtime packages: OpenSSL's `libcrypto`, ALSA /
 PipeWire, D-Bus, a Secret Service (KWallet or GNOME Keyring) and
 `xdg-open`. Videos play inside the app through a small helper,
-`ferrochat-player` (installed next to `ferrochat`), which needs GStreamer:
-`gstreamer1.0-plugins-base`, `gstreamer1.0-plugins-good` and
-`gstreamer1.0-libav` (H.264/AAC) on Debian/Ubuntu. Without GStreamer the app
-still runs; opening a video shows a message and an "Open externally" button.
-Build with `--no-default-features` to leave the helper (and the GStreamer
-dev packages) out. Linux (KDE Plasma / Wayland) is the primary
+`ferrochat-player` (installed next to `ferrochat`) that needs no codec
+package: it decodes MP4 with H.264 (OpenH264, built from source and linked
+statically) and AAC (symphonia, pure Rust). Videos in other formats (H.265)
+show which codec is missing and an "Open externally" button. Build with
+`--no-default-features` to leave the helper out. Linux (KDE Plasma / Wayland) is the primary
 target; Windows and macOS should build but are not tested.
 
 ## Run
