@@ -75,6 +75,12 @@ impl std::fmt::Debug for VideoView {
 }
 
 impl VideoView {
+    /// A viewer state for `id` (also used by the status viewer, which draws
+    /// the frames itself).
+    pub(crate) fn for_id(id: String, session: u32) -> Self {
+        Self::new(id, session)
+    }
+
     fn new(id: String, session: u32) -> Self {
         Self {
             id,

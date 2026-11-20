@@ -20,7 +20,11 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_2.sql"),
     include_str!("migration_3.sql"),
     include_str!("migration_4.sql"),
+    include_str!("migration_5.sql"),
 ];
+
+mod social;
+pub use social::{MAX_STARRED, MAX_STATUS_ROWS, StoredStatus};
 
 /// Longest emoji string accepted as a reaction (bytes). Skin-tone and ZWJ
 /// sequences fit comfortably; anything longer is garbage.
@@ -562,7 +566,7 @@ impl Store {
         self.lock()?.execute_batch(
             "DELETE FROM messages; DELETE FROM chats; DELETE FROM contact_names; DELETE FROM kv;
              DELETE FROM lid_map; DELETE FROM reactions; DELETE FROM receipts;
-             DELETE FROM lists; DELETE FROM list_chats;",
+             DELETE FROM lists; DELETE FROM list_chats; DELETE FROM statuses; DELETE FROM starred;",
         )?;
         Ok(())
     }
@@ -1026,7 +1030,7 @@ mod tests {
     #[test]
     fn migrations_set_version() {
         let s = Store::open_in_memory().unwrap();
-        assert_eq!(s.schema_version().unwrap(), 4);
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
     }
 
     #[test]
@@ -1662,7 +1666,7 @@ mod tests {
         )
         .unwrap();
         let s = Store::init(conn).unwrap();
-        assert_eq!(s.schema_version().unwrap(), 4);
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
         assert_eq!(s.search_messages(None, "legacy", 5).unwrap().len(), 1);
         let m = s.message("c", "1").unwrap().unwrap();
         assert!(!m.edited && m.reply.is_none() && m.reactions.is_empty());

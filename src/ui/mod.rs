@@ -3,8 +3,10 @@
 pub mod chat;
 pub mod icons;
 pub mod login;
+pub mod nav;
 pub mod settings;
 pub mod sidebar;
+pub mod status;
 pub mod theme;
 
 use chrono::{Datelike, Local, TimeZone};
@@ -30,7 +32,7 @@ pub fn view(app: &App) -> El<'_> {
     // While a video plays, only the viewer is built: it covers the window,
     // and rebuilding the chat list and conversation for every video frame
     // would cost far more than decoding it.
-    if let Some(v) = &app.video {
+    if let Some(v) = app.video.as_ref().filter(|_| app.status.viewer.is_none()) {
         let mut layers = vec![chat::video_viewer(app, v)];
         if let Some(msg) = &app.toast {
             layers.push(toast(t, msg));
@@ -46,6 +48,8 @@ pub fn view(app: &App) -> El<'_> {
     } else {
         let conv: El<'_> = if app.settings_open {
             settings::view(app)
+        } else if let Some(el) = nav::conversation_override(app) {
+            el
         } else {
             match &app.open {
                 Some(c) => chat::view(app, c),
@@ -72,6 +76,12 @@ pub fn view(app: &App) -> El<'_> {
     }
     if let Some(id) = &app.viewer {
         layers.push(chat::viewer(app, id));
+    }
+    if let Some(v) = status::viewer(app) {
+        layers.push(v);
+    }
+    if let Some(d) = nav::logout_dialog(app) {
+        layers.push(d);
     }
     if let Some(d) = sidebar::list_dialog(app) {
         layers.push(d);

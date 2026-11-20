@@ -96,7 +96,7 @@ async fn existing_sessions_get_one_full_app_state_resync() {
     assert_eq!(resyncs(&h), 1, "requested right after connecting");
     assert_eq!(
         h.app.store.kv("appstate_resync").unwrap().as_deref(),
-        Some("1")
+        Some("2")
     );
     // Reconnecting does not ask again.
     h.net(Event::Connected {
@@ -111,13 +111,31 @@ async fn the_resync_marker_in_the_cache_prevents_repeats_across_runs() {
     let mut cfg = crate::config::Config::defaults();
     cfg.mock = true;
     let (mut app, _) = super::App::boot(cfg);
-    app.store.set_kv("appstate_resync", "1").unwrap();
+    app.store.set_kv("appstate_resync", "2").unwrap();
     let (fake, _stream) = crate::net::fake::start(FakeOptions::default(), mock::mock_data(1));
     app.client = Some(fake.clone());
     let _ = app.update(super::Message::Net(Event::Connected {
         jid: Some(OWN_JID.into()),
     }));
     assert!(fake.log().iter().all(|s| !matches!(s, Sent::Resync)));
+}
+
+#[tokio::test]
+async fn sessions_synced_before_stars_get_one_more_snapshot() {
+    let mut h = Harness::new().await;
+    assert_eq!(resyncs(&h), 1);
+    // A v0.8 cache: names and lists were synced, stars never were.
+    h.app.store.set_kv("appstate_resync", "1").unwrap();
+    h.app.resync_done = false;
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    assert_eq!(resyncs(&h), 2);
+    assert_eq!(
+        h.app.store.kv("appstate_resync").unwrap().as_deref(),
+        Some("2")
+    );
 }
 
 #[tokio::test]

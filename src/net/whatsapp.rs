@@ -26,6 +26,7 @@ use whatsapp_rust::{Client, Jid};
 use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
 
 use super::convert::{self, Envelope, Uploaded};
+use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
     ChatState, Content, ListDef, MediaKind, MediaRef, MsgKey, NameSource, Origin, OutgoingKind,
     OutgoingMedia, Quote,
@@ -40,6 +41,39 @@ pub struct RealClient {
     client: Arc<Client>,
     handle: Mutex<Option<BotHandle>>,
     signal_db: PathBuf,
+    /// "Read receipts" privacy value and when it was fetched.
+    read_receipts: Mutex<Option<(std::time::Instant, bool)>>,
+}
+
+/// How long the fetched "read receipts" privacy value is trusted.
+const PRIVACY_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+impl RealClient {
+    /// Is the account's "read receipts" privacy setting on? Cached for a few
+    /// minutes; an unreadable setting counts as "off" (never leak a view).
+    async fn read_receipts_on(&self) -> bool {
+        if let Ok(g) = self.read_receipts.lock()
+            && let Some((at, v)) = *g
+            && at.elapsed() < PRIVACY_TTL
+        {
+            return v;
+        }
+        use whatsapp_rust::wacore::iq::privacy::{PrivacyCategory, PrivacyValue};
+        let on = match self.client.fetch_privacy_settings().await {
+            Ok(s) => !matches!(
+                s.get_value(&PrivacyCategory::ReadReceipts),
+                Some(PrivacyValue::None)
+            ),
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the read-receipts privacy setting");
+                return false;
+            }
+        };
+        if let Ok(mut g) = self.read_receipts.lock() {
+            *g = Some((std::time::Instant::now(), on));
+        }
+        on
+    }
 }
 
 fn parse_jid(s: &str) -> Result<Jid> {
@@ -411,6 +445,175 @@ impl WaClient for RealClient {
         })
     }
 
+    fn send_status_view<'a>(
+        &'a self,
+        author: &'a str,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            if ids.is_empty() || !self.read_receipts_on().await {
+                return Ok(false);
+            }
+            let chat = Jid::status_broadcast();
+            let sender = parse_jid(author)?;
+            let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+            self.client
+                .mark_as_read(&chat, Some(&sender), &ids)
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(true)
+        })
+    }
+
+    fn set_starred<'a>(&'a self, key: &'a MsgKey, starred: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let chat = parse_jid(&key.chat)?;
+            let participant = (chat.is_group() && !key.from_me)
+                .then(|| parse_jid(&key.sender))
+                .transpose()?;
+            let actions = self.client.chat_actions();
+            if starred {
+                actions
+                    .star_message(&chat, participant.as_ref(), &key.id, key.from_me)
+                    .await
+            } else {
+                actions
+                    .unstar_message(&chat, participant.as_ref(), &key.id, key.from_me)
+                    .await
+            }
+            .map_err(|e| Error::Net(e.to_string()))
+        })
+    }
+
+    fn create_group<'a>(
+        &'a self,
+        subject: &'a str,
+        participants: &'a [String],
+        icon: Option<Vec<u8>>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            use whatsapp_rust::features::{GroupCreateOptions, GroupParticipantOptions};
+            let mut parts = Vec::with_capacity(participants.len());
+            for p in participants {
+                parts.push(GroupParticipantOptions::from_phone(parse_jid(p)?));
+            }
+            let opts = GroupCreateOptions::new(subject).with_participants(parts);
+            let made = self
+                .client
+                .groups()
+                .create_group(opts)
+                .await
+                .map_err(|e| Error::Net(format!("could not create the group: {e}")))?;
+            let jid = made.metadata.id.clone();
+            if let Some(jpeg) = icon {
+                // The group exists either way; a failed icon is only logged.
+                if let Err(e) = self
+                    .client
+                    .groups()
+                    .set_profile_picture(jid.clone(), jpeg)
+                    .await
+                {
+                    tracing::warn!(error = %e, "group icon was not set");
+                }
+            }
+            Ok(convert::bare_jid(&jid.to_string()))
+        })
+    }
+
+    fn create_community<'a>(
+        &'a self,
+        name: &'a str,
+        description: &'a str,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            use whatsapp_rust::features::CreateCommunityOptions;
+            let mut opts = CreateCommunityOptions::new(name);
+            opts.description = Some(description.to_string()).filter(|d| !d.is_empty());
+            let made = self
+                .client
+                .community()
+                .create(opts)
+                .await
+                .map_err(|e| Error::Net(format!("could not create the community: {e}")))?;
+            Ok(convert::bare_jid(&made.metadata.id.to_string()))
+        })
+    }
+
+    fn communities(&self) -> BoxFuture<'_, Result<Vec<CommunityInfo>>> {
+        Box::pin(async move {
+            let parents = self
+                .client
+                .community()
+                .get_participating()
+                .await
+                .map_err(|e| Error::Net(format!("communities: {e}")))?;
+            // Every group we are in: subgroups we joined, and the fallback
+            // source when the subgroup query fails.
+            let groups = self
+                .client
+                .groups()
+                .get_participating()
+                .await
+                .map_err(|e| Error::Net(format!("groups: {e}")))?;
+            let mut out = Vec::new();
+            for (jid, meta) in parents.iter() {
+                let known = self.client.community().get_subgroups(jid).await.ok();
+                out.push(convert::community_info(
+                    jid,
+                    meta,
+                    known.as_deref(),
+                    &groups,
+                ));
+            }
+            Ok(out)
+        })
+    }
+
+    fn check_numbers<'a>(
+        &'a self,
+        digits: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<PhoneLookup>>> {
+        Box::pin(async move {
+            let jids: Vec<Jid> = digits.iter().map(|d| Jid::pn(d.as_str())).collect();
+            let found = self
+                .client
+                .contacts()
+                .is_on_whatsapp(&jids)
+                .await
+                .map_err(|e| Error::Net(format!("number check failed: {e}")))?;
+            Ok(digits
+                .iter()
+                .map(|d| convert::phone_lookup(d, &found))
+                .collect())
+        })
+    }
+
+    fn post_status_text<'a>(
+        &'a self,
+        text: &'a str,
+        background: u32,
+        font: i32,
+        recipients: &'a [String],
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            use whatsapp_rust::buffa::Enumeration;
+            use whatsapp_rust::waproto::whatsapp::message::extended_text_message::FontType;
+            let mut to = Vec::with_capacity(recipients.len());
+            for r in recipients {
+                to.push(parse_jid(r)?);
+            }
+            // Unknown font ids fall back to the system font.
+            let font = FontType::from_i32(font).unwrap_or(FontType::SYSTEM);
+            let sent = self
+                .client
+                .status()
+                .send_text(text, background, font, &to, Default::default())
+                .await
+                .map_err(|e| Error::Net(format!("could not post the status: {e}")))?;
+            Ok(sent.message_id)
+        })
+    }
+
     fn logout(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             // Deregister (best effort: it cannot reach the server offline),
@@ -626,6 +829,7 @@ async fn run(
         client: client.clone(),
         handle: Mutex::new(Some(handle)),
         signal_db: signal_db.clone(),
+        read_receipts: Mutex::new(None),
     });
     let _ = tx.send(Event::Ready(real.clone()));
 
@@ -778,8 +982,30 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             let mut extra = Vec::new();
             let mut pairs = Vec::new();
             let mut business = Vec::new();
+            let mut statuses = Vec::new();
             for m in batch.messages.iter() {
                 let info = &m.info;
+                if info.source.chat.is_status_broadcast() {
+                    // Statuses are not conversations: they never become
+                    // chat rows or messages.
+                    let author = info.source.sender.to_string();
+                    if let Some(id) = super::social::status_revoked_target(&m.message) {
+                        extra.push(Event::StatusRevoked {
+                            author: convert::bare_jid(&author),
+                            id,
+                        });
+                    } else if let Some(item) = super::social::status_from_wa(
+                        &info.id.to_string(),
+                        &author,
+                        &info.push_name,
+                        info.source.is_from_me,
+                        info.timestamp.timestamp(),
+                        &m.message,
+                    ) {
+                        statuses.push(item);
+                    }
+                    continue;
+                }
                 if !info.source.is_from_me
                     && let Some(name) = info
                         .verified_name
@@ -833,6 +1059,9 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
                 }
             }
             let mut v = business;
+            if !statuses.is_empty() {
+                v.push(Event::Status(statuses));
+            }
             if !pairs.is_empty() {
                 v.push(Event::LidMappings(pairs));
             }
@@ -925,6 +1154,7 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             chat: convert::bare_jid(&d.chat_jid.to_string()),
             id: d.message_id.clone(),
         }],
+        WaEvent::StarUpdate(u) => vec![Event::Star(convert::star_change(u))],
         WaEvent::MarkChatAsReadUpdate(m) if m.action.read == Some(true) => {
             vec![Event::ChatRead {
                 chat: convert::bare_jid(&m.jid.to_string()),

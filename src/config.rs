@@ -35,6 +35,22 @@ pub enum ScreenshotTarget {
     ChatMenu,
     /// The in-app video player.
     Video,
+    /// Status tab: recent and viewed updates.
+    StatusList,
+    /// Status viewer on a photo status.
+    StatusViewer,
+    /// Communities tab.
+    Communities,
+    /// "New chat" panel.
+    NewChat,
+    /// "New group": picking participants.
+    NewGroup,
+    /// "New group": name and icon.
+    NewGroupName,
+    /// "Starred messages" panel.
+    Starred,
+    /// The chats header "⋮" menu.
+    HeaderMenu,
 }
 
 impl ScreenshotTarget {
@@ -42,12 +58,39 @@ impl ScreenshotTarget {
     pub fn list_only(self) -> bool {
         matches!(
             self,
-            Self::Login | Self::ChatList | Self::Archived | Self::Lists | Self::ChatMenu
+            Self::Login
+                | Self::ChatList
+                | Self::Archived
+                | Self::Lists
+                | Self::ChatMenu
+                | Self::StatusList
+                | Self::StatusViewer
+                | Self::Communities
+                | Self::NewChat
+                | Self::NewGroup
+                | Self::NewGroupName
+                | Self::Starred
+                | Self::HeaderMenu
         )
     }
 }
 
 impl ScreenshotTarget {
+    /// Screens of the Status / Communities / panels family.
+    pub fn is_nav(self) -> bool {
+        matches!(
+            self,
+            Self::StatusList
+                | Self::StatusViewer
+                | Self::Communities
+                | Self::NewChat
+                | Self::NewGroup
+                | Self::NewGroupName
+                | Self::Starred
+                | Self::HeaderMenu
+        )
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s {
             "login" | "qr" => Some(Self::Login),
@@ -63,6 +106,14 @@ impl ScreenshotTarget {
             "lists" => Some(Self::Lists),
             "chat-menu" => Some(Self::ChatMenu),
             "video" => Some(Self::Video),
+            "status" | "status-list" => Some(Self::StatusList),
+            "status-viewer" => Some(Self::StatusViewer),
+            "communities" => Some(Self::Communities),
+            "new-chat" => Some(Self::NewChat),
+            "new-group" => Some(Self::NewGroup),
+            "new-group-name" => Some(Self::NewGroupName),
+            "starred" => Some(Self::Starred),
+            "header-menu" | "menu-header" => Some(Self::HeaderMenu),
             _ => None,
         }
     }
@@ -121,7 +172,7 @@ pub const USAGE: &str = "\
 ferrochat - unofficial native WhatsApp desktop client
 
 USAGE:
-    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|archived|lists|chat-menu|video> <out.png>]
+    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|archived|lists|chat-menu|video|status|status-viewer|communities|new-chat|new-group|new-group-name|starred|header-menu> <out.png>]
 
 OPTIONS:
     --mock                      Run with mock data and a fake protocol (no network)
