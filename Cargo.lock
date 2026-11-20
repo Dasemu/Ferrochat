@@ -1648,7 +1648,7 @@ dependencies = [
 
 [[package]]
 name = "ferrochat"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "audiopus_sys",
  "chrono",
