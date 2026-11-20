@@ -13,6 +13,7 @@ use futures::future::BoxFuture;
 use futures::stream::Stream;
 use tokio::sync::mpsc;
 
+use super::social::{CommunityInfo, PhoneLookup, StatusItem};
 use super::types::{
     ChatFlag, ChatState, CollectionResync, Content, ListDef, MediaRef, Message, MsgKey, NameSource,
     Origin, OutgoingMedia, Quote, ReceiptStatus, ResyncReport,
@@ -40,6 +41,8 @@ pub struct FakeOptions {
     pub fail_sends: bool,
     /// Other participants reported for every group.
     pub group_size: usize,
+    /// The account's "read receipts" privacy setting.
+    pub read_receipts: bool,
 }
 
 impl Default for FakeOptions {
@@ -53,6 +56,7 @@ impl Default for FakeOptions {
             auto_reply: false,
             fail_sends: false,
             group_size: 3,
+            read_receipts: true,
         }
     }
 }
@@ -165,6 +169,43 @@ pub enum Sent {
     },
     /// Full app-state resync requested.
     Resync,
+    /// "Viewed" receipt for statuses (only when read receipts are on).
+    StatusView {
+        /// Author.
+        author: String,
+        /// Status ids.
+        ids: Vec<String>,
+    },
+    /// Star / unstar.
+    Star {
+        /// Message.
+        key: MsgKey,
+        /// New state.
+        starred: bool,
+    },
+    /// Group created.
+    CreateGroup {
+        /// Subject.
+        subject: String,
+        /// Participants.
+        participants: Vec<String>,
+        /// An icon was supplied.
+        icon: bool,
+    },
+    /// Community created.
+    CreateCommunity {
+        /// Name.
+        name: String,
+    },
+    /// On-WhatsApp check.
+    CheckNumbers(Vec<String>),
+    /// Text status posted.
+    PostStatus {
+        /// Text.
+        text: String,
+        /// Number of recipients.
+        recipients: usize,
+    },
 }
 
 /// The fake client.
@@ -178,6 +219,9 @@ pub struct FakeClient {
     pending_pair: Mutex<Option<(Vec<Event>, Vec<Message>)>>,
     resync_reports: Mutex<std::collections::VecDeque<ResyncReport>>,
     lid_pairs: Mutex<Vec<(String, String)>>,
+    communities: Vec<CommunityInfo>,
+    registered: Vec<String>,
+    next_group: Mutex<u32>,
 }
 
 impl FakeClient {
@@ -312,6 +356,28 @@ impl FakeClient {
             chat: chat.into(),
             member,
         });
+    }
+
+    /// Simulates new statuses arriving.
+    pub fn simulate_status(&self, items: Vec<StatusItem>) {
+        let _ = self.tx.send(Event::Status(items));
+    }
+
+    /// Simulates an author deleting a status.
+    pub fn simulate_status_revoked(&self, author: &str, id: &str) {
+        let _ = self.tx.send(Event::StatusRevoked {
+            author: author.into(),
+            id: id.into(),
+        });
+    }
+
+    /// Simulates a star change made on the phone.
+    pub fn simulate_star(&self, key: MsgKey, starred: bool) {
+        let _ = self.tx.send(Event::Star(super::social::StarChange {
+            key,
+            starred,
+            ts: chrono::Utc::now().timestamp(),
+        }));
     }
 
     /// Simulates a participant's receipt in a group.
@@ -660,6 +726,124 @@ impl WaClient for FakeClient {
         Box::pin(async move { Ok(self.lid_pairs.lock().map(|p| p.clone()).unwrap_or_default()) })
     }
 
+    fn send_status_view<'a>(
+        &'a self,
+        author: &'a str,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            if !self.opts.read_receipts {
+                return Ok(false);
+            }
+            self.record(Sent::StatusView {
+                author: author.into(),
+                ids: ids.to_vec(),
+            });
+            Ok(true)
+        })
+    }
+
+    fn set_starred<'a>(&'a self, key: &'a MsgKey, starred: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::Star {
+                key: key.clone(),
+                starred,
+            });
+            Ok(())
+        })
+    }
+
+    fn create_group<'a>(
+        &'a self,
+        subject: &'a str,
+        participants: &'a [String],
+        icon: Option<Vec<u8>>,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::CreateGroup {
+                subject: subject.into(),
+                participants: participants.to_vec(),
+                icon: icon.is_some(),
+            });
+            let n = match self.next_group.lock() {
+                Ok(mut g) => {
+                    *g += 1;
+                    *g
+                }
+                Err(_) => 1,
+            };
+            Ok(format!("1203639999{n:08}@g.us"))
+        })
+    }
+
+    fn create_community<'a>(
+        &'a self,
+        name: &'a str,
+        _description: &'a str,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::CreateCommunity { name: name.into() });
+            Ok("1203638888000000001@g.us".into())
+        })
+    }
+
+    fn communities(&self) -> BoxFuture<'_, Result<Vec<CommunityInfo>>> {
+        Box::pin(async move { Ok(self.communities.clone()) })
+    }
+
+    fn check_numbers<'a>(
+        &'a self,
+        digits: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<PhoneLookup>>> {
+        Box::pin(async move {
+            self.record(Sent::CheckNumbers(digits.to_vec()));
+            Ok(digits
+                .iter()
+                .map(|d| {
+                    if self.registered.iter().any(|r| r == d) {
+                        PhoneLookup::OnWhatsApp {
+                            jid: super::social::phone_jid(d),
+                            business: false,
+                        }
+                    } else {
+                        PhoneLookup::NotOnWhatsApp
+                    }
+                })
+                .collect())
+        })
+    }
+
+    fn post_status_text<'a>(
+        &'a self,
+        text: &'a str,
+        _background: u32,
+        _font: i32,
+        recipients: &'a [String],
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::PostStatus {
+                text: text.into(),
+                recipients: recipients.len(),
+            });
+            Ok(crate::net::new_message_id())
+        })
+    }
+
     fn simulate_scan(&self) {
         self.scan();
     }
@@ -725,6 +909,9 @@ pub fn start(
         pending_pair: Mutex::new(None),
         resync_reports: Mutex::new(std::collections::VecDeque::new()),
         lid_pairs: Mutex::new(Vec::new()),
+        communities: data.communities.clone(),
+        registered: data.registered.clone(),
+        next_group: Mutex::new(0),
     });
     let _ = tx.send(if opts.paired {
         Event::SessionFound
@@ -744,6 +931,16 @@ pub fn start(
             messages: data.messages,
             origin: Origin::History,
         });
+        for (i, key) in data.starred.iter().enumerate() {
+            let _ = tx.send(Event::Star(super::social::StarChange {
+                key: key.clone(),
+                starred: true,
+                ts: 1_700_000_000 + i as i64,
+            }));
+        }
+        if !data.statuses.is_empty() {
+            let _ = tx.send(Event::Status(data.statuses.clone()));
+        }
         for (chat, participant, state) in data.typing {
             let _ = tx.send(Event::ChatState {
                 chat,

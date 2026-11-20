@@ -96,7 +96,7 @@ async fn existing_sessions_get_one_full_app_state_resync() {
     assert_eq!(resyncs(&h), 1, "requested right after connecting");
     assert_eq!(
         h.app.store.kv("appstate_resync").unwrap().as_deref(),
-        Some("2")
+        Some("3")
     );
     // Reconnecting does not ask again.
     h.net(Event::Connected {
@@ -111,7 +111,7 @@ async fn the_resync_marker_in_the_cache_prevents_repeats_across_runs() {
     let mut cfg = crate::config::Config::defaults();
     cfg.mock = true;
     let (mut app, _) = super::App::boot(cfg);
-    app.store.set_kv("appstate_resync", "2").unwrap();
+    app.store.set_kv("appstate_resync", "3").unwrap();
     let (fake, _stream) = crate::net::fake::start(FakeOptions::default(), mock::mock_data(1));
     app.client = Some(fake.clone());
     let _ = app.update(super::Message::Net(Event::Connected {
@@ -139,7 +139,7 @@ async fn the_v080_marker_does_not_count() {
     assert_eq!(resyncs(&h), 1);
     assert_eq!(
         h.app.store.kv("appstate_resync").unwrap().as_deref(),
-        Some("2")
+        Some("3")
     );
 }
 
@@ -174,7 +174,7 @@ async fn a_resync_that_delivered_nothing_is_retried_and_not_marked_done() {
     assert_eq!(resyncs(&h), 3, "retried until the contacts came");
     assert_eq!(
         h.app.store.kv("appstate_resync").unwrap().as_deref(),
-        Some("2")
+        Some("3")
     );
 }
 
@@ -251,6 +251,25 @@ async fn a_name_learned_before_its_lid_pair_is_found_later() {
     )]))
     .await;
     assert_eq!(h.app.chats.display_name(STRANGER), "Desconocida Ahora");
+}
+
+#[tokio::test]
+async fn sessions_synced_before_stars_get_one_more_snapshot() {
+    let mut h = Harness::new().await;
+    assert_eq!(resyncs(&h), 1);
+    // A v0.8 / pre-fix development cache: its marker does not count, one
+    // real resync covers names and stars.
+    h.app.store.set_kv("appstate_resync", "2").unwrap();
+    h.app.resync = super::Resync::default();
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    assert_eq!(resyncs(&h), 2);
+    assert_eq!(
+        h.app.store.kv("appstate_resync").unwrap().as_deref(),
+        Some("3")
+    );
 }
 
 #[tokio::test]

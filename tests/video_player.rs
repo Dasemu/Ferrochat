@@ -135,11 +135,36 @@ async fn a_missing_file_fails_cleanly() {
 
 /// Writes an executable shell script acting as the helper.
 fn script(dir: &Path, body: &str) -> PathBuf {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
     let p = dir.join("helper.sh");
-    std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let tmp = dir.join("helper.sh.tmp");
+    let mut f = std::fs::File::create(&tmp).unwrap();
+    f.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+        .unwrap();
+    f.set_permissions(std::fs::Permissions::from_mode(0o755))
+        .unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    std::fs::rename(&tmp, &p).unwrap();
     p
+}
+
+/// `spawn_with` for scripted helpers. Another test thread can fork while our
+/// script's write fd is still open, which makes exec fail with ETXTBSY (os
+/// error 26) for a moment; retry that only, here and not in production.
+fn spawn_script(helper: &Path, file: &Path) -> Result<(Player, UnboundedReceiver<Event>), Failure> {
+    let mut last = None;
+    for _ in 0..20 {
+        match spawn_with(helper, file) {
+            Err(Failure::Unavailable(m)) if m.contains("os error 26") => {
+                last = Some(Failure::Unavailable(m));
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+    Err(last.unwrap())
 }
 
 #[tokio::test]
@@ -154,7 +179,7 @@ printf 'T\364\001\000\000\000\000\000\000\350\003\000\000\000\000\000\000\001'
 cat > "$1.cmds""#,
     );
     let target = dir.join("clip.mp4");
-    let (player, mut rx) = spawn_with(&helper, &target).expect("spawn");
+    let (player, mut rx) = spawn_script(&helper, &target).expect("spawn");
     assert_eq!(
         next(&mut rx).await,
         Some(Event::Ready {
@@ -198,7 +223,7 @@ async fn a_helper_the_loader_refuses_is_reported_with_the_loader_message() {
         &dir,
         "echo 'ferrochat-player: error while loading shared libraries: libfoo.so.1: cannot open shared object file' >&2; exit 127",
     );
-    let (_player, mut rx) = spawn_with(&helper, &dir.join("x.mp4")).expect("spawn");
+    let (_player, mut rx) = spawn_script(&helper, &dir.join("x.mp4")).expect("spawn");
     match next(&mut rx).await {
         Some(Event::Failed(f @ Failure::Unavailable(_))) => {
             let msg = f.user_message();

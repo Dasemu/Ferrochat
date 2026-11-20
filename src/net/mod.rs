@@ -10,6 +10,7 @@
 
 pub mod convert;
 pub mod fake;
+pub mod social;
 pub mod types;
 pub mod whatsapp;
 
@@ -19,6 +20,10 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::error::Result;
+pub use social::{
+    CommunityInfo, PhoneLookup, StarChange, StarredMessage, StatusBody, StatusGroup, StatusItem,
+    SubGroup,
+};
 pub use types::*;
 
 /// Shared handle to the active protocol client.
@@ -104,6 +109,44 @@ pub trait WaClient: Send + Sync {
     fn known_lid_pairs(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
         Box::pin(async { Ok(Vec::new()) })
     }
+    /// Tells `author` that we viewed these statuses. Returns `Ok(false)` when
+    /// nothing was sent because our "read receipts" privacy setting is off
+    /// (or could not be read): statuses are then only marked seen locally.
+    fn send_status_view<'a>(
+        &'a self,
+        author: &'a str,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<bool>>;
+    /// Stars or unstars a message on every device (app-state `star`).
+    fn set_starred<'a>(&'a self, key: &'a MsgKey, starred: bool) -> BoxFuture<'a, Result<()>>;
+    /// Creates a group and returns its JID. `icon` is a JPEG.
+    fn create_group<'a>(
+        &'a self,
+        subject: &'a str,
+        participants: &'a [String],
+        icon: Option<Vec<u8>>,
+    ) -> BoxFuture<'a, Result<String>>;
+    /// Creates a community and returns its JID.
+    fn create_community<'a>(
+        &'a self,
+        name: &'a str,
+        description: &'a str,
+    ) -> BoxFuture<'a, Result<String>>;
+    /// The communities we belong to, with their subgroups.
+    fn communities(&self) -> BoxFuture<'_, Result<Vec<CommunityInfo>>>;
+    /// Asks the server whether these phone numbers (digits only) have a
+    /// WhatsApp account. The answer has one entry per input, in order.
+    fn check_numbers<'a>(&'a self, digits: &'a [String])
+    -> BoxFuture<'a, Result<Vec<PhoneLookup>>>;
+    /// Posts a text status to `recipients` (our saved contacts) and returns
+    /// its id.
+    fn post_status_text<'a>(
+        &'a self,
+        text: &'a str,
+        background: u32,
+        font: i32,
+        recipients: &'a [String],
+    ) -> BoxFuture<'a, Result<String>>;
     /// Unlinks this device, disconnects and deletes the session store.
     fn logout(&self) -> BoxFuture<'_, Result<()>>;
     /// `--mock` only: pretend the phone scanned the QR code. The live client
@@ -301,6 +344,17 @@ pub enum Event {
         /// Chat.
         chat: ChatId,
     },
+    /// New statuses (live or from the offline queue).
+    Status(Vec<StatusItem>),
+    /// A status was revoked by its author.
+    StatusRevoked {
+        /// Author (bare JID).
+        author: String,
+        /// Status id.
+        id: String,
+    },
+    /// A message was starred / unstarred (here or on another device).
+    Star(StarChange),
     /// LID ↔ phone-number pairs learned from envelopes or history.
     LidMappings(Vec<(String, String)>),
     /// The session store exists but cannot be decrypted with the keyring key
@@ -352,6 +406,9 @@ impl fmt::Debug for Event {
             Event::ListChat { member, .. } => write!(f, "ListChat(member={member})"),
             Event::ChatRead { .. } => write!(f, "ChatRead"),
             Event::ChatMarkedUnread { .. } => write!(f, "ChatMarkedUnread"),
+            Event::Status(v) => write!(f, "Status(n={})", v.len()),
+            Event::StatusRevoked { .. } => write!(f, "StatusRevoked"),
+            Event::Star(c) => write!(f, "Star({})", c.starred),
             Event::LidMappings(p) => write!(f, "LidMappings(n={})", p.len()),
             Event::SessionUnreadable(_) => write!(f, "SessionUnreadable"),
             Event::Fatal(_) => write!(f, "Fatal"),

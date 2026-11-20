@@ -90,3 +90,9 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   (`app/lists.rs`). Never send the `favorites` app-state action (it carries
   the whole list and would overwrite the phone's).
 - App-level tests: `app::test_support::Harness` (real `App` + fake client).
+- Statuses are not chats (`net::social`, `app/status.rs`): diverted in
+  `net/whatsapp.rs::translate`, own cache tables, 24 h + 1500-row bound. View
+  receipts go through `WaClient::send_status_view`, which respects the
+  `readreceipts` privacy setting. All Status / panel / star / logout actions
+  are `Ui::Nav(NavMsg)` handled in `app/nav.rs`; leaving the status viewer
+  must clear `App::video`.

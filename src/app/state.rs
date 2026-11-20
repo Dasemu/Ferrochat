@@ -133,6 +133,11 @@ impl NameBook {
         self.alias.insert(pn.to_string(), lid.to_string());
     }
 
+    /// Every address-book name as `(jid, name)`.
+    pub fn saved(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.saved.iter().map(|(j, n)| (j.as_str(), n.as_str()))
+    }
+
     /// The best known name and where it comes from, looking at the other id
     /// of the same person (LID / phone number) too: a saved name under
     /// either id beats a push name under either.
@@ -231,6 +236,7 @@ impl ChatList {
         let mut list = Self {
             entries: rows
                 .into_iter()
+                .filter(|r| !crate::net::social::is_status_jid(&r.meta.id))
                 .map(|r| ChatEntry {
                     meta: r.meta,
                     last: r.last,

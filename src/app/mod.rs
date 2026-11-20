@@ -12,9 +12,13 @@ pub use background::WindowGeom;
 mod flows;
 pub mod live;
 pub mod message;
+pub mod nav;
 #[cfg(test)]
 mod perf;
+#[cfg(test)]
+mod social_flows;
 pub mod state;
+pub mod status;
 #[cfg(test)]
 mod test_support;
 pub mod window;
@@ -67,10 +71,11 @@ pub const MAX_STICKER_BYTES: u64 = 2 * 1024 * 1024;
 /// Videos kept in the cache directory.
 pub const MAX_VIDEO_FILES: usize = 4;
 /// Cache key / value recording that the full app-state resync was requested.
-/// `"1"` was written by v0.8.0 whether or not the snapshot was applied (it
-/// never was: see `RealClient::resync_app_state`), so only `"2"` counts.
 const RESYNC_KEY: &str = "appstate_resync";
-const RESYNC_VERSION: &str = "2";
+// "3": the first resync that really replays the snapshots (contacts and
+// starred messages). "1" (v0.8.0) and "2" (development before the reset
+// fix) ran into wacore's stale-snapshot check and replayed nothing.
+const RESYNC_VERSION: &str = "3";
 /// Resync attempts per run before waiting for the next start.
 const RESYNC_MAX_ATTEMPTS: u32 = 4;
 /// An account whose snapshot applied with no contact at all is done after
@@ -269,8 +274,14 @@ pub struct App {
     pub(crate) chat_search: Option<ChatSearch>,
     /// Screenshot mode: the scripted interaction already ran.
     scene_started: bool,
+    /// Screenshot mode: the navigation scene already ran.
+    nav_scene_done: bool,
     /// Last known scroll offset of the conversation.
     scroll_y: f32,
+    /// Rail section, panels, communities, stars, log out confirmation.
+    pub(crate) nav: nav::NavState,
+    /// Statuses and their viewer.
+    pub(crate) status: status::StatusState,
     /// Persisted preferences (background mode, mute).
     pub(crate) settings: crate::settings::Settings,
     /// The tray service reported at least once (up or not).
@@ -513,7 +524,10 @@ impl App {
             search_generation: 0,
             chat_search: None,
             scene_started: false,
+            nav_scene_done: false,
             scroll_y: 0.0,
+            nav: nav::NavState::default(),
+            status: status::StatusState::default(),
             settings,
             autostart,
             tray_checked: false,
@@ -531,6 +545,8 @@ impl App {
             );
         }
         let mut tasks = vec![Task::done(Message::FirstFrame)];
+        tasks.push(app.load_statuses_task());
+        tasks.push(app.load_star_keys_task());
         if app.window.open {
             tasks.push(app.open_window());
         }
@@ -547,13 +563,12 @@ impl App {
         }
         if app.cfg.screenshot.is_some() {
             tasks.push(Task::perform(
-                tokio::time::sleep(Duration::from_millis(
-                    if matches!(app.cfg.screenshot, Some((ScreenshotTarget::Video, _))) {
-                        9000
-                    } else {
-                        2500
-                    },
-                )),
+                tokio::time::sleep(Duration::from_millis(match app.cfg.screenshot {
+                    Some((ScreenshotTarget::Video, _)) => 9000,
+                    // Scenes that wait for statuses, stars or communities.
+                    Some((t, _)) if t.is_nav() => 6000,
+                    _ => 2500,
+                })),
                 |_| Message::CaptureScreenshot,
             ));
         }
@@ -609,6 +624,19 @@ impl App {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
                     ..
                 }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::VideoToggle)),
+                // Status viewer: arrows step through the updates.
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight),
+                    ..
+                }) if status == iced::event::Status::Ignored => {
+                    Some(Message::Ui(Ui::Nav(nav::NavMsg::StatusNext)))
+                }
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
+                    ..
+                }) if status == iced::event::Status::Ignored => {
+                    Some(Message::Ui(Ui::Nav(nav::NavMsg::StatusPrev)))
+                }
                 _ => None,
             }),
         ];
@@ -625,6 +653,12 @@ impl App {
                 },
                 video::video_stream,
             ));
+        }
+        if self.status.viewer.is_some() {
+            subs.push(
+                iced::time::every(Duration::from_millis(status::TICK_MS))
+                    .map(|_| Message::Ui(Ui::Nav(nav::NavMsg::StatusTick))),
+            );
         }
         let playing = self.voice.as_ref().is_some_and(|v| !v.paused);
         if playing || self.recording_since.is_some() {
@@ -659,7 +693,7 @@ impl App {
             Message::Quit => self.quit(),
             Message::Video(m) => {
                 self.on_video_event(*m);
-                Task::none()
+                self.status_after_video()
             }
             Message::Ui(ui) => self.on_ui(ui),
             Message::Net(ev) => self.on_net(ev),
@@ -698,6 +732,9 @@ impl App {
     // ---------------------------------------------------------------- UI
 
     fn on_ui(&mut self, ui: Ui) -> Task<Message> {
+        if let Ui::Nav(m) = ui {
+            return self.on_nav(m);
+        }
         let ui = match self.on_ui_extra(ui) {
             Ok(task) => return task,
             Err(ui) => ui,
@@ -715,7 +752,8 @@ impl App {
             Ui::CloseChat => {
                 // Esc closes the topmost layer first, the conversation last.
                 let mut close_video = None;
-                let consumed = std::mem::take(&mut self.settings_open)
+                let consumed = self.nav_escape()
+                    || std::mem::take(&mut self.settings_open)
                     || self.list_dialog.take().is_some()
                     || self.sidebar_menu.take().is_some()
                     || self.dialog.take().is_some()
@@ -1390,6 +1428,7 @@ impl App {
         self.dialog = None;
         self.popup = None;
         self.own_jid = None;
+        self.reset_nav();
         if let Some(p) = &self.player {
             p.stop();
         }
@@ -1517,6 +1556,10 @@ impl App {
         } else {
             ev
         };
+        let ev = match self.on_nav_event(ev) {
+            Ok(task) => return task,
+            Err(ev) => ev,
+        };
         match ev {
             Event::Ready(h) => {
                 self.client = Some(h);
@@ -1621,6 +1664,7 @@ impl App {
                         crate::mock::SHOWCASE_CHAT.into(),
                     ))));
                 }
+                tasks.extend(self.nav_scene(nav::SceneStage::History));
                 return Task::batch(tasks);
             }
             Event::Receipt {
@@ -1742,6 +1786,8 @@ impl App {
                 self.advance_auth(AuthEvent::Fatal(reason));
                 self.session_unreadable = true;
             }
+            // Handled by `on_nav_event` before this match.
+            Event::Status(_) | Event::StatusRevoked { .. } | Event::Star(_) => {}
             Event::Fatal(msg) => self.advance_auth(AuthEvent::Fatal(msg)),
         }
         Task::none()
@@ -2251,6 +2297,7 @@ impl App {
                 undo,
                 error,
             } => return self.on_member_failed(list, chat, undo, error),
+            Done::Nav(d) => return self.on_nav_done(*d),
             Done::Stored(Ok(())) | Done::Nothing => {}
             Done::Resync { attempt, result } => return self.on_resync(attempt, result),
             Done::ResyncDue => return self.maybe_resync(),
