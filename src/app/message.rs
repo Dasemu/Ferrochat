@@ -185,6 +185,8 @@ pub enum Ui {
         /// Viewport height.
         height: f32,
     },
+    /// Rail sections, panels, starred messages, communities, statuses.
+    Nav(crate::app::nav::NavMsg),
     /// Search icon in the conversation header.
     ToggleChatSearch,
     /// In-chat search box edited.
@@ -493,6 +495,8 @@ pub enum Done {
         /// Error text.
         error: String,
     },
+    /// A task started by a navigation / status action finished.
+    Nav(Box<crate::app::nav::NavDone>),
     /// Nothing to do.
     Nothing,
 }

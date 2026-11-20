@@ -111,6 +111,20 @@ pub enum Icon {
     Volume2,
     /// `volume-x`
     VolumeX,
+    /// `chevron-left`
+    ChevronLeft,
+    /// `chevron-right`
+    ChevronRight,
+    /// `camera`
+    Camera,
+    /// `type`
+    Type,
+    /// `palette`
+    Palette,
+    /// `star-off`
+    StarOff,
+    /// `user-plus`
+    UserPlus,
 }
 
 impl Icon {
@@ -167,6 +181,13 @@ impl Icon {
             Icon::RotateCcw => include_bytes!("../../assets/icons/rotate-ccw.svg"),
             Icon::Volume2 => include_bytes!("../../assets/icons/volume-2.svg"),
             Icon::VolumeX => include_bytes!("../../assets/icons/volume-x.svg"),
+            Icon::ChevronLeft => include_bytes!("../../assets/icons/chevron-left.svg"),
+            Icon::ChevronRight => include_bytes!("../../assets/icons/chevron-right.svg"),
+            Icon::Camera => include_bytes!("../../assets/icons/camera.svg"),
+            Icon::Type => include_bytes!("../../assets/icons/type.svg"),
+            Icon::Palette => include_bytes!("../../assets/icons/palette.svg"),
+            Icon::StarOff => include_bytes!("../../assets/icons/star-off.svg"),
+            Icon::UserPlus => include_bytes!("../../assets/icons/user-plus.svg"),
         }
     }
 

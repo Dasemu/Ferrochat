@@ -1133,6 +1133,12 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
         Ui::ToggleReactionPicker(id.clone()),
     ));
     col = col.push(item(Icon::Copy, "Copy", Ui::CopyText(id.clone())));
+    let starred = app.is_starred(&msg.chat, &msg.id);
+    col = col.push(item(
+        if starred { Icon::StarOff } else { Icon::Star },
+        if starred { "Unstar" } else { "Star" },
+        Ui::Nav(crate::app::nav::NavMsg::ToggleStar(id.clone())),
+    ));
     if matches!(msg.content, Content::Video { .. }) {
         col = col.push(item(
             Icon::ExternalLink,

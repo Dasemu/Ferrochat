@@ -101,6 +101,11 @@ impl NameBook {
         self.map(source).get(jid).map(String::as_str)
     }
 
+    /// Every address-book name as `(jid, name)`.
+    pub fn saved(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.saved.iter().map(|(j, n)| (j.as_str(), n.as_str()))
+    }
+
     /// The best known name and where it comes from.
     pub fn best(&self, jid: &str) -> Option<(NameSource, &str)> {
         [NameSource::Saved, NameSource::Business, NameSource::Push]
@@ -187,6 +192,7 @@ impl ChatList {
         let mut list = Self {
             entries: rows
                 .into_iter()
+                .filter(|r| !crate::net::social::is_status_jid(&r.meta.id))
                 .map(|r| ChatEntry {
                     meta: r.meta,
                     last: r.last,

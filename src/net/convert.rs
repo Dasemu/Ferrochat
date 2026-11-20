@@ -9,7 +9,8 @@ use whatsapp_rust::waproto::whatsapp as wa;
 use super::Event;
 use super::types::{
     ChatFlag, ChatMeta, Content, LinkPreview, ListDef, ListKind, MediaKind, MediaRef, Message,
-    NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote, Reaction, ReceiptStatus,
+    MsgKey, NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote, Reaction,
+    ReceiptStatus,
 };
 
 /// Unwraps ephemeral / view-once / edited / caption wrappers (up to a few
@@ -1628,5 +1629,100 @@ mod name_and_list_tests {
         let mut big = ext;
         big.jpeg_thumbnail = Some(vec![0; MAX_PREVIEW_THUMB + 1]);
         assert_eq!(link_preview(&big).unwrap().thumbnail, None);
+    }
+}
+
+// ------------------------------------------------------------ communities
+
+/// Builds a community from its parent metadata, the subgroups the server
+/// lists for it (`known`, may include groups we are not in) and every group
+/// we participate in (`groups`). Subgroups we are in that the listing missed
+/// are derived from their `parent_group_jid`.
+pub fn community_info(
+    jid: &whatsapp_rust::Jid,
+    meta: &whatsapp_rust::features::GroupMetadata,
+    known: Option<&[whatsapp_rust::features::CommunitySubgroup]>,
+    groups: &std::collections::HashMap<whatsapp_rust::Jid, whatsapp_rust::features::GroupMetadata>,
+) -> super::social::CommunityInfo {
+    use super::social::{CommunityInfo, SubGroup};
+    let mut subgroups: Vec<SubGroup> = Vec::new();
+    for sg in known.unwrap_or_default() {
+        subgroups.push(SubGroup {
+            jid: bare_jid(&sg.id.to_string()),
+            name: sg.subject.clone(),
+            announcement: sg.is_default_sub_group,
+            general: sg.is_general_chat,
+            joined: groups.contains_key(&sg.id),
+            members: sg.participant_count,
+        });
+    }
+    for (gid, g) in groups {
+        let is_child = g.parent_group_jid.as_ref().is_some_and(|p| p == jid);
+        let id = bare_jid(&gid.to_string());
+        if is_child && !subgroups.iter().any(|s| s.jid == id) {
+            subgroups.push(SubGroup {
+                jid: id,
+                name: g.subject.clone(),
+                announcement: g.is_default_sub_group,
+                general: g.is_general_chat,
+                joined: true,
+                members: g.size,
+            });
+        }
+    }
+    let mut info = CommunityInfo {
+        jid: bare_jid(&jid.to_string()),
+        name: meta.subject.clone(),
+        description: meta.description.clone().filter(|d| !d.is_empty()),
+        members: meta.size,
+        subgroups,
+    };
+    info.sort();
+    info
+}
+
+/// Picks the answer for `digits` out of the usync results.
+pub fn phone_lookup(
+    digits: &str,
+    found: &[whatsapp_rust::features::IsOnWhatsAppResult],
+) -> super::social::PhoneLookup {
+    use super::social::{PhoneLookup, phone_jid};
+    // The server may answer with the LID as primary id; match on the PN
+    // we asked about.
+    let hit = found
+        .iter()
+        .find(|r| r.jid.user == digits || r.pn_jid.as_ref().is_some_and(|p| p.user == digits));
+    match hit {
+        Some(r) if r.is_registered => PhoneLookup::OnWhatsApp {
+            jid: phone_jid(digits),
+            business: r.is_business,
+        },
+        Some(_) => PhoneLookup::NotOnWhatsApp,
+        None if found.len() == 1 && found[0].is_registered => PhoneLookup::OnWhatsApp {
+            jid: phone_jid(digits),
+            business: found[0].is_business,
+        },
+        None => PhoneLookup::NotOnWhatsApp,
+    }
+}
+
+/// App-state `star` update → domain change.
+pub fn star_change(
+    u: &whatsapp_rust::wacore::types::events::StarUpdate,
+) -> super::social::StarChange {
+    let chat = bare_jid(&u.chat_jid.to_string());
+    let sender = match (&u.participant_jid, u.from_me) {
+        (Some(p), false) => bare_jid(&p.to_string()),
+        _ => String::new(),
+    };
+    super::social::StarChange {
+        key: MsgKey {
+            chat,
+            id: u.message_id.clone(),
+            from_me: u.from_me,
+            sender,
+        },
+        starred: u.action.starred.unwrap_or(false),
+        ts: u.timestamp.timestamp(),
     }
 }
