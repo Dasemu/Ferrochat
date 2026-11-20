@@ -1766,7 +1766,11 @@ mod community_tests {
         assert_eq!(c.name, "Barrio");
         assert_eq!(c.members, Some(40));
         let names: Vec<_> = c.subgroups.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(names, ["Avisos", "Huerto"], "announcement first, strangers out");
+        assert_eq!(
+            names,
+            ["Avisos", "Huerto"],
+            "announcement first, strangers out"
+        );
         assert!(c.subgroups.iter().all(|s| s.joined));
         assert!(c.subgroups[0].announcement);
     }
