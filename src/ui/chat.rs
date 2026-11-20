@@ -284,7 +284,8 @@ fn popup_layer<'a>(
     let (card, card_h) = match which {
         Popup::Reactions => (reaction_picker(app, msg), 52.0),
         Popup::Menu => {
-            let items = 4
+            // Reply, React, Copy, Star, Delete.
+            let items = 5
                 + usize::from(msg.can_edit(now))
                 + usize::from(matches!(msg.content, Content::Video { .. }));
             (message_menu(app, msg), 12.0 + 38.0 * items as f32)

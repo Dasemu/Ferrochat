@@ -1726,3 +1726,48 @@ pub fn star_change(
         ts: u.timestamp.timestamp(),
     }
 }
+
+#[cfg(test)]
+mod community_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use whatsapp_rust::Jid;
+    use whatsapp_rust::features::GroupMetadata;
+
+    fn group(id: &Jid, subject: &str, parent: Option<&Jid>) -> GroupMetadata {
+        GroupMetadata {
+            id: id.clone(),
+            subject: subject.into(),
+            parent_group_jid: parent.cloned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn subgroups_are_derived_from_the_parent_link_when_the_listing_is_missing() {
+        let parent: Jid = "120363111@g.us".parse().expect("jid");
+        let ann: Jid = "120363112@g.us".parse().expect("jid");
+        let sub: Jid = "120363113@g.us".parse().expect("jid");
+        let other: Jid = "120363999@g.us".parse().expect("jid");
+        let other_parent: Jid = "120363888@g.us".parse().expect("jid");
+        let mut meta = group(&parent, "Barrio", None);
+        meta.is_parent_group = true;
+        meta.size = Some(40);
+        let mut a = group(&ann, "Avisos", Some(&parent));
+        a.is_default_sub_group = true;
+        let groups: HashMap<Jid, GroupMetadata> = [
+            (ann.clone(), a),
+            (sub.clone(), group(&sub, "Huerto", Some(&parent))),
+            (other.clone(), group(&other, "Otro", Some(&other_parent))),
+        ]
+        .into_iter()
+        .collect();
+        let c = community_info(&parent, &meta, None, &groups);
+        assert_eq!(c.name, "Barrio");
+        assert_eq!(c.members, Some(40));
+        let names: Vec<_> = c.subgroups.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Avisos", "Huerto"], "announcement first, strangers out");
+        assert!(c.subgroups.iter().all(|s| s.joined));
+        assert!(c.subgroups[0].announcement);
+    }
+}

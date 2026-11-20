@@ -537,13 +537,12 @@ impl App {
         }
         if app.cfg.screenshot.is_some() {
             tasks.push(Task::perform(
-                tokio::time::sleep(Duration::from_millis(
-                    if matches!(app.cfg.screenshot, Some((ScreenshotTarget::Video, _))) {
-                        9000
-                    } else {
-                        2500
-                    },
-                )),
+                tokio::time::sleep(Duration::from_millis(match app.cfg.screenshot {
+                    Some((ScreenshotTarget::Video, _)) => 9000,
+                    // Scenes that wait for statuses, stars or communities.
+                    Some((t, _)) if t.is_nav() => 6000,
+                    _ => 2500,
+                })),
                 |_| Message::CaptureScreenshot,
             ));
         }

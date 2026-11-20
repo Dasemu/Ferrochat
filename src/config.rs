@@ -76,6 +76,21 @@ impl ScreenshotTarget {
 }
 
 impl ScreenshotTarget {
+    /// Screens of the Status / Communities / panels family.
+    pub fn is_nav(self) -> bool {
+        matches!(
+            self,
+            Self::StatusList
+                | Self::StatusViewer
+                | Self::Communities
+                | Self::NewChat
+                | Self::NewGroup
+                | Self::NewGroupName
+                | Self::Starred
+                | Self::HeaderMenu
+        )
+    }
+
     fn parse(s: &str) -> Option<Self> {
         match s {
             "login" | "qr" => Some(Self::Login),

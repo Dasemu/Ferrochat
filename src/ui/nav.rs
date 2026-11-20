@@ -616,7 +616,7 @@ fn starred(app: &App) -> El<'_> {
                     })
                     .size(16)
                     .color(p.text_primary),
-                    text("Tap and hold on any message and choose Star to find it here later.")
+                    text("Open a message's menu and choose Star to find it here later.")
                         .size(13.5)
                         .color(p.text_secondary)
                         .align_x(Alignment::Center),

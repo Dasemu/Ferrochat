@@ -397,7 +397,7 @@ impl App {
         }
         let persist = store_task(&self.store, move |s| s.delete_status(&author, &id));
         if close {
-            self.status.viewer = None;
+            self.clear_status_viewer();
         }
         persist
     }
@@ -524,7 +524,7 @@ impl App {
             Task::none()
         };
         let Some(item) = self.current_status() else {
-            self.status.viewer = None;
+            self.clear_status_viewer();
             return stop;
         };
         let mut tasks = vec![stop];
@@ -702,11 +702,16 @@ impl App {
     }
 
     pub(super) fn close_status(&mut self) -> Task<Message> {
-        self.status.viewer = None;
-        if self.video.is_some() {
-            return self.close_video();
-        }
+        self.clear_status_viewer();
         Task::none()
+    }
+
+    /// Closes the viewer. A video playing in it stops with it (the helper
+    /// process ends when its handle is dropped); the status viewer and the
+    /// chat video viewer are never open together.
+    fn clear_status_viewer(&mut self) {
+        self.status.viewer = None;
+        self.video = None;
     }
 
     /// Progress of the current status, 0..=1. Videos report the helper's
@@ -741,7 +746,7 @@ impl App {
     /// Viewer clock. Images and text advance by time; videos by the helper.
     pub(super) fn status_tick(&mut self) -> Task<Message> {
         let Some(item) = self.current_status() else {
-            self.status.viewer = None;
+            self.clear_status_viewer();
             return Task::none();
         };
         let ready = self.status_ready(&item);
@@ -927,7 +932,7 @@ impl App {
         if self.status.viewer.is_some() {
             // The close task (stopping a video) is queued by `close_status`
             // through the normal message; here only the state is cleared.
-            self.status.viewer = None;
+            self.clear_status_viewer();
             return true;
         }
         self.status.compose.take().is_some()

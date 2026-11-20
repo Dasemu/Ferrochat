@@ -683,3 +683,49 @@ async fn views_build_for_every_section_and_panel() {
     }
     let _ = Message::Quit;
 }
+
+#[tokio::test]
+async fn a_video_status_uses_the_video_viewer_and_a_failing_one_never_blocks_the_queue() {
+    let mut h = Harness::new().await;
+    nav(&mut h, NavMsg::OpenStatus(LUCIA.into())).await;
+    nav(&mut h, NavMsg::StatusNext).await; // the video
+    assert_eq!(h.app.video.as_ref().map(|v| v.id.as_str()), Some("ST3"));
+    // Let the download task finish; the helper may or may not exist here.
+    h.pump(iced::Task::none()).await;
+    for _ in 0..40 {
+        if h.app
+            .video
+            .as_ref()
+            .is_some_and(|v| matches!(v.phase, crate::app::video::VideoPhase::Failed(_)))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        h.pump(iced::Task::none()).await;
+    }
+    let failed = h
+        .app
+        .video
+        .as_ref()
+        .is_some_and(|v| matches!(v.phase, crate::app::video::VideoPhase::Failed(_)));
+    if failed {
+        // Without a working helper the viewer moves on after a still time.
+        for _ in 0..(crate::net::social::STATUS_IMAGE_MS / TICK_MS) {
+            nav(&mut h, NavMsg::StatusTick).await;
+        }
+        assert_ne!(h.app.current_status().map(|i| i.id), Some("ST3".into()));
+    }
+    // Closing the viewer ends the helper and leaves no video viewer behind.
+    nav(&mut h, NavMsg::CloseStatus).await;
+    assert!(h.app.video.is_none() && h.app.status.viewer.is_none());
+}
+
+#[tokio::test]
+async fn escape_while_a_status_video_plays_leaves_no_video_viewer() {
+    let mut h = Harness::new().await;
+    nav(&mut h, NavMsg::OpenStatus(LUCIA.into())).await;
+    nav(&mut h, NavMsg::StatusNext).await;
+    h.ui(Ui::CloseChat).await;
+    assert!(h.app.status.viewer.is_none());
+    assert!(h.app.video.is_none());
+}
