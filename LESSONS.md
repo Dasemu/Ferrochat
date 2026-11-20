@@ -112,6 +112,29 @@ next change.
 - Bot pushes made with `GITHUB_TOKEN` never trigger `push` workflows, so the release workflow chains off the version workflow with `workflow_run` (conclusion `success`, branch `main`, checkout `ref: main` for the bump commit).
 
 
+## Round 4: status, communities, navigation
+
+* **`status@broadcast` is not a chat.** v0.8 stored statuses as messages of a
+  fake group. They are diverted before they reach `Event::Messages`, and a
+  migration deletes the old rows. Never route a pseudo JID (`@broadcast`,
+  `@newsletter`) through the chat code.
+* **The library's read-receipt privacy gate does not cover statuses** (it
+  only softens private DMs). Check the account's `readreceipts` privacy value
+  yourself before sending a status view, and treat "cannot read it" as off.
+* **Keep thumbnails out of the structures `view` clones.** Grouping the status
+  list runs every frame; the in-memory status keeps only a decoded handle in
+  a byte-budgeted LRU, the bytes live in the cache table.
+* **Reuse the video viewer by id, not by message.** A status video sets
+  `App::video` with the status id and the root view skips its full-window
+  video layer while the status viewer is open; leaving the status viewer must
+  also clear `App::video` (the helper process ends on drop), or the plain
+  video viewer pops up.
+* **A newer app-state collection needs a new resync marker.** Stars were never
+  replayed for sessions synced before they were handled; bumping
+  `RESYNC_VERSION` requests one more full snapshot.
+* **Debug builds are slow in Xvfb**: screenshot scenes that wait for protocol
+  data need a longer capture delay (`ScreenshotTarget::is_nav`).
+
 ## Round 3: flicker, names, lists, video
 
 * **Hover flicker was a reflow, not a redraw.** The hover buttons (smiley,
@@ -160,3 +183,5 @@ next change.
 
 - `keyring` 4 opens a *blocking* zbus connection: if any dependency turns on zbus `tokio` (ksni default features, `rfd`/`ashpd` `tokio`, a `zbus` dev-dep) it panics ("Cannot start a runtime from within a runtime") when called on a runtime worker. Keep zbus on `async-io` (`ksni` with `default-features = false, features = ["async-io"]`, `rfd` with `async-std`); `tests/real_keyring.rs` guards it against a real Secret Service.
 
+
+- Status posting is switched off (`app::status::STATUS_POSTING_ENABLED = false`). `whatsapp-rust` posts to an explicit recipient list and does not expose the account's status privacy ("My contacts except..." / "Only share with..."), so posting to all saved contacts could leak a status to people the user excluded. "My status" is view-only; the composer code stays behind the constant. Re-enable only when the library exposes the privacy lists and we send to exactly that audience.

@@ -292,8 +292,8 @@ is no tray it opens the window anyway.
              ▼                                                     │
   Login (QR pairing) ── PairSuccess ──▶ Main ── Log out / revoked ─┘
    │  QR rotates every ~20 s                │
-   │  "Click to reload QR code" when        ├─ Rail (Chats active; Status /
-   │   the server stops rotating            │   Communities shown disabled; Settings page)
+   │  "Click to reload QR code" when        ├─ Rail (Chats / Status / Communities;
+   │   the server stops rotating            │   Settings page)
    └─ keyring / pairing errors inline       ├─ Chat list: header (new chat, ⋮ menu → Log out),
                                             │   search, chips (All / Unread / Favourites / Groups),
                                             │   connection + sync banners, rows

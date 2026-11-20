@@ -10,6 +10,7 @@ use super::icons::Icon;
 use super::theme::{self, INTER_MEDIUM, INTER_SEMIBOLD};
 use super::{El, avatar_for, badge, ellipsize, fill, gap, icon, list_time, ticks};
 use crate::app::lists::{LIST_NAME_ID, MAX_LIST_NAME};
+use crate::app::nav::{NavMsg, Section};
 use crate::app::state::{ChatEntry, Filter};
 use crate::app::{App, ListDialog, MenuTarget, Message, Ui};
 use crate::net::Connection;
@@ -17,8 +18,15 @@ use crate::net::Connection;
 /// Rows rendered at most (the list is not virtualised; search reaches the rest).
 pub const MAX_ROWS: usize = 300;
 
-/// Left navigation rail. Only "Chats" is functional; the other sections
-/// (status, channels, communities) are out of scope and shown disabled.
+fn section_button(inner: El<'_>, s: Section) -> El<'_> {
+    button(inner)
+        .on_press(Message::Ui(Ui::Nav(NavMsg::ShowSection(s))))
+        .padding(0)
+        .style(theme::flat_button(iced::Color::TRANSPARENT))
+        .into()
+}
+
+/// Left navigation rail: Chats, Status and Communities.
 pub fn rail(app: &App) -> El<'_> {
     let t = &app.theme;
     let p = t.palette;
@@ -40,10 +48,16 @@ pub fn rail(app: &App) -> El<'_> {
         })
         .into()
     };
+    let current = if app.settings_open {
+        None
+    } else {
+        Some(app.nav.section)
+    };
     let unread: u32 = app.chats.entries.iter().map(|e| e.meta.unread).sum();
+    let chats_active = current == Some(Section::Chats);
     let chats_item: El<'_> = if unread > 0 {
         stack![
-            item(Icon::MessageCircle, true),
+            item(Icon::MessageCircle, chats_active),
             container(badge(t, unread, false))
                 .width(40)
                 .align_x(Alignment::End)
@@ -56,13 +70,39 @@ pub fn rail(app: &App) -> El<'_> {
         ]
         .into()
     } else {
-        item(Icon::MessageCircle, true)
+        item(Icon::MessageCircle, chats_active)
+    };
+    // A green dot on the Status icon while there are updates not seen yet.
+    let status_item: El<'_> = if app.status.has_unseen(
+        app.own_jid.as_deref().unwrap_or_default(),
+        chrono::Utc::now().timestamp(),
+    ) {
+        stack![
+            item(Icon::CircleDashed, current == Some(Section::Status)),
+            container(
+                container(Space::new().width(9).height(9)).style(theme::rounded(p.accent, 5.0))
+            )
+            .width(40)
+            .align_x(Alignment::End)
+            .padding(iced::Padding {
+                top: 6.0,
+                right: 6.0,
+                bottom: 0.0,
+                left: 0.0
+            })
+        ]
+        .into()
+    } else {
+        item(Icon::CircleDashed, current == Some(Section::Status))
     };
     container(
         column![
-            chats_item,
-            item(Icon::CircleDashed, false),
-            item(Icon::UsersRound, false),
+            section_button(chats_item, Section::Chats),
+            section_button(status_item, Section::Status),
+            section_button(
+                item(Icon::UsersRound, current == Some(Section::Communities)),
+                Section::Communities
+            ),
             Space::new().height(Length::Fill),
             button(item(Icon::Settings, app.settings_open))
                 .on_press(Message::Ui(if app.settings_open {
@@ -93,6 +133,9 @@ pub fn rail(app: &App) -> El<'_> {
 
 /// The chat list column.
 pub fn view(app: &App) -> El<'_> {
+    if let Some(el) = super::nav::sidebar_override(app) {
+        return el;
+    }
     let t = &app.theme;
     let p = t.palette;
     let m = t.metrics;
@@ -126,7 +169,8 @@ pub fn view(app: &App) -> El<'_> {
             fill(),
             button(icon(Icon::MessageSquarePlus, m.icon, p.text_secondary))
                 .padding(8)
-                .style(theme::icon_button(t, false)),
+                .style(theme::icon_button(t, false))
+                .on_press(Message::Ui(Ui::Nav(NavMsg::OpenNewChat))),
             button(icon(Icon::EllipsisVertical, m.icon, p.text_secondary))
                 .padding(8)
                 .style(theme::icon_button(t, app.menu_open))
@@ -328,14 +372,26 @@ fn menu(app: &App) -> El<'_> {
     };
     let card = container(
         column![
-            item("New group", Icon::Users, None),
-            item("Starred messages", Icon::Star, None),
+            item(
+                "New group",
+                Icon::Users,
+                Some(Message::Ui(Ui::Nav(NavMsg::OpenNewGroup)))
+            ),
+            item(
+                "Starred messages",
+                Icon::Star,
+                Some(Message::Ui(Ui::Nav(NavMsg::OpenStarred)))
+            ),
             item(
                 "Settings",
                 Icon::Settings,
                 Some(Message::Ui(Ui::OpenSettings))
             ),
-            item("Log out", Icon::LogOut, Some(Message::Ui(Ui::Logout))),
+            item(
+                "Log out",
+                Icon::LogOut,
+                Some(Message::Ui(Ui::Nav(NavMsg::AskLogout)))
+            ),
         ]
         .width(220),
     )

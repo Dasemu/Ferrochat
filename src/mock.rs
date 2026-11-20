@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io::Cursor;
 
 use crate::media::audio;
+use crate::net::social::{CommunityInfo, StatusBody, StatusItem, SubGroup};
 use crate::net::types::{
     ChatMeta, ChatState, Content, LinkPreview, ListDef, ListKind, MediaKind, MediaRef, Message,
     Quote, Reaction, ReceiptStatus,
@@ -44,6 +45,14 @@ pub struct MockData {
     pub typing: Vec<(String, Option<String>, ChatState)>,
     /// Presence updates sent right after the history: `(jid, online, last_seen)`.
     pub presence: Vec<(String, bool, Option<i64>)>,
+    /// Statuses contacts posted (sent after the history).
+    pub statuses: Vec<crate::net::social::StatusItem>,
+    /// Communities the (fake) account belongs to.
+    pub communities: Vec<crate::net::social::CommunityInfo>,
+    /// Phone numbers (digits) that have a WhatsApp account.
+    pub registered: Vec<String>,
+    /// Messages starred on the (fake) phone, sent after the history.
+    pub starred: Vec<crate::net::types::MsgKey>,
 }
 
 /// A procedurally drawn portrait-like avatar (original artwork): a coloured
@@ -510,8 +519,8 @@ pub fn mock_data(now: i64) -> MockData {
             seconds: 3,
             width: 320,
             height: 180,
-            thumbnail: clip_thumb,
-            media: Some(clip_ref),
+            thumbnail: clip_thumb.clone(),
+            media: Some(clip_ref.clone()),
         },
         Read,
     );
@@ -758,6 +767,170 @@ pub fn mock_data(now: i64) -> MockData {
     }
     avatars.insert(OWN_JID.to_string(), avatar_png(99, false));
 
+    // Statuses of the last day.
+    let status_png = sunset_png(450, 800);
+    let status_img = media_ref(
+        "/mock/status-sunset.png",
+        MediaKind::Image,
+        "image/png",
+        &status_png,
+    );
+    let status_thumb = thumbnail_of(&status_png);
+    media.insert(status_img.direct_path.clone(), status_png);
+    // Statuses expire by the real clock, whatever `now` the chats use.
+    let status_now = chrono::Utc::now().timestamp();
+    let st = |id: &str, author: &str, name: &str, ago: i64, body: StatusBody| StatusItem {
+        id: id.into(),
+        author: author.into(),
+        author_name: Some(name.into()).filter(|n: &String| !n.is_empty()),
+        from_me: false,
+        timestamp: status_now - ago,
+        body,
+    };
+    let stext = |t: &str, bg: u32, font: i32| StatusBody::Text {
+        text: t.into(),
+        background: bg,
+        font,
+    };
+    let statuses = vec![
+        st(
+            "ST1",
+            marcos,
+            "Marcos",
+            3 * 3600,
+            StatusBody::Image {
+                caption: Some("Atardecer en la playa 🌅".into()),
+                width: 450,
+                height: 800,
+                thumbnail: status_thumb.clone(),
+                media: Some(status_img.clone()),
+            },
+        ),
+        st(
+            "ST2",
+            lucia,
+            "Lu",
+            2 * 3600,
+            stext("¡Ya tengo los billetes! ✈️", 0xFF1E_6E4F, 6),
+        ),
+        st(
+            "ST3",
+            lucia,
+            "Lu",
+            3600,
+            StatusBody::Video {
+                caption: Some("Ensayo del viernes".into()),
+                seconds: 3,
+                width: 320,
+                height: 180,
+                thumbnail: clip_thumb.clone(),
+                media: Some(clip_ref.clone()),
+            },
+        ),
+        st(
+            "ST4",
+            carmen,
+            "Carmen R.",
+            45 * 60,
+            stext("Domingo de paella y siesta", 0xFF8E_24AA, 8),
+        ),
+        st(
+            "ST5",
+            mum,
+            "Mama",
+            20 * 3600,
+            stext("Buenos días, familia 💛", 0xFF0D_47A1, 0),
+        ),
+        st("ST6", elena, "Ele", 10 * 60, {
+            StatusBody::Image {
+                caption: None,
+                width: 450,
+                height: 800,
+                thumbnail: status_thumb,
+                media: Some(status_img),
+            }
+        }),
+    ];
+
+    let sg = |jid: &str, name: &str, ann: bool, gen_: bool, joined: bool, n: u32| SubGroup {
+        jid: jid.into(),
+        name: name.into(),
+        announcement: ann,
+        general: gen_,
+        joined,
+        members: Some(n),
+    };
+    let communities = vec![
+        CommunityInfo {
+            jid: "120363111000000001@g.us".into(),
+            name: "Vecinos de la calle Mayor".into(),
+            description: Some("Avisos y charla del barrio".into()),
+            members: Some(86),
+            subgroups: vec![
+                sg("120363111000000002@g.us", "Avisos", true, false, true, 86),
+                sg("120363111000000003@g.us", "General", false, true, true, 71),
+                sg(
+                    "120363111000000004@g.us",
+                    "Huerto urbano",
+                    false,
+                    false,
+                    true,
+                    18,
+                ),
+                sg(
+                    "120363111000000005@g.us",
+                    "Compraventa",
+                    false,
+                    false,
+                    false,
+                    40,
+                ),
+            ],
+        },
+        CommunityInfo {
+            jid: "120363222000000001@g.us".into(),
+            name: "Club de escalada".into(),
+            description: None,
+            members: Some(142),
+            subgroups: vec![
+                sg("120363222000000002@g.us", "Avisos", true, false, true, 142),
+                sg(
+                    "120363222000000003@g.us",
+                    "Salidas del finde",
+                    false,
+                    false,
+                    true,
+                    55,
+                ),
+            ],
+        },
+    ];
+    let star_key = |needle: &str| {
+        b.msgs
+            .iter()
+            .find(|m| matches!(&m.content, Content::Text(t) if t.contains(needle)))
+            .map(|m| crate::net::types::MsgKey {
+                chat: m.chat.clone(),
+                id: m.id.clone(),
+                from_me: m.from_me,
+                sender: if m.from_me {
+                    String::new()
+                } else {
+                    m.sender.clone()
+                },
+            })
+    };
+    let starred: Vec<_> = [
+        "Hola! ¿Ya tienes los billetes",
+        "Sábado en el rocódromo",
+        "He subido los nuevos mockups",
+        "Yo llevo el postre",
+    ]
+    .iter()
+    .filter_map(|n| star_key(n))
+    .collect();
+    let registered = vec!["34600555123".to_string(), "34611111111".to_string()];
+
     MockData {
         own_jid: OWN_JID.into(),
         chats,
@@ -771,6 +944,10 @@ pub fn mock_data(now: i64) -> MockData {
         avatars,
         typing: vec![(carmen.to_string(), None, ChatState::Composing)],
         presence: vec![(lucia.to_string(), true, None)],
+        statuses,
+        communities,
+        registered,
+        starred,
     }
 }
 
