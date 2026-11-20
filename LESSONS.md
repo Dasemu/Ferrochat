@@ -160,3 +160,35 @@ next change.
 
 - `keyring` 4 opens a *blocking* zbus connection: if any dependency turns on zbus `tokio` (ksni default features, `rfd`/`ashpd` `tokio`, a `zbus` dev-dep) it panics ("Cannot start a runtime from within a runtime") when called on a runtime worker. Keep zbus on `async-io` (`ksni` with `default-features = false, features = ["async-io"]`, `rfd` with `async-std`); `tests/real_keyring.rs` guards it against a real Secret Service.
 
+
+## Round 4: names, bubbles, unread, scrolling, video
+
+* **A snapshot is not a resync.** wacore 0.7 drops an app-state snapshot
+  whose version is not newer than the persisted one, so `full_sync: true` on
+  a synced collection replays nothing (warn "Skipping stale snapshot", target
+  `AppState`). Reset the version and MACs first. And never write a "done"
+  marker from a call that returns `()`: measure the result (versions,
+  contact events counted where the library dispatches them).
+* **Library log targets are not crate paths.** whatsapp-rust logs app state
+  under `Client/AppState` / `AppState`; `RUST_LOG=whatsapp_rust=info` hides
+  them.
+* **iced 0.14 fluid sizing.** A container or column with a Fill child
+  becomes Fill. A bubble holding a right-aligned time therefore split its row
+  50/50 with the spacer. Mark such widgets `width(Shrink)`; inside a Shrink
+  (compressed) parent, Fill children get the widest non-Fill sibling's
+  width, and a column whose children are all Fill collapses to zero width
+  (text then wraps one glyph per line). Columns drop void (`Fixed(0)`)
+  children, so a zero-height probe must report Shrink.
+* **tiny-skia does not clip images and renders shadows per pixel.**
+  `ContentFit::Cover` pictures spill over neighbours (the "dark rectangle"),
+  and any quad `Shadow` costs an SDF evaluation per pixel per frame. Use
+  Contain, and draw small shadows as plain quads.
+* **Profile the raster, not just `view`.** `app::perf` drives the real view
+  through iced's `UserInterface` and the headless renderer; view + layout
+  were small, rasterization was the frame. Build the renderer crates with
+  `--config profile.dev.package.<crate>.opt-level=3` for realistic numbers.
+* **OpenH264 handles High profile with B-frames** only with
+  `Flush::NoFlush`; the crate's default flush after every sample breaks the
+  reorder buffer (9 of 90 frames decoded).
+* **Count unread chats, not messages**, and keep `status@broadcast` and
+  channels out of the chat list: status updates arrive as messages.
