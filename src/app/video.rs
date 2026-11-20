@@ -283,10 +283,12 @@ impl App {
             return;
         };
         if let Event::Failed(f) = &msg.event {
-            tracing::warn!(kind = ?std::mem::discriminant(f), "video playback failed");
-            if matches!(f, Failure::Unavailable(_)) {
-                tracing::warn!("GStreamer is not available for the video helper");
-            }
+            let step = match f {
+                Failure::Unavailable(_) => "helper start",
+                Failure::MissingCodec(_) => "unsupported codec",
+                Failure::Broken(_) => "decode",
+            };
+            tracing::warn!(step, detail = %f.detail(), "video playback failed");
         }
         v.apply(msg.event);
     }
@@ -487,7 +489,7 @@ mod tests {
         let close = v.apply(Event::Failed(Failure::Unavailable("x".into())));
         assert!(close);
         match &v.phase {
-            VideoPhase::Failed(m) => assert!(m.contains("GStreamer")),
+            VideoPhase::Failed(m) => assert!(m.contains("could not start (x)")),
             p => panic!("{p:?}"),
         }
     }

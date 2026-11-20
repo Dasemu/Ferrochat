@@ -51,26 +51,27 @@ jobs:
         if: steps.ver.outputs.skip != 'true'
         run: |
           sudo apt-get update
-          # The ubuntu-22.04 image ships libunwind-14-dev, which conflicts with the
-          # libunwind-dev that libgstreamer1.0-dev depends on.
-          sudo apt-get remove -y libunwind-14-dev || true
           sudo apt-get install -y pkg-config cmake libdbus-1-dev libasound2-dev \
-            libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev \
-            libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev
+            libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev
       - uses: dtolnay/rust-toolchain@stable
         if: steps.ver.outputs.skip != 'true'
       - uses: Swatinem/rust-cache@v2
         if: steps.ver.outputs.skip != 'true'
       - name: Build release binary
         if: steps.ver.outputs.skip != 'true'
-        run: cargo build --release --locked
+        run: |
+          # OpenH264 (C++) is built from source; link libstdc++ statically so the
+          # video helper needs no C++ runtime package on the user's machine.
+          export CXXSTDLIB=static=stdc++
+          export RUSTFLAGS="-L native=$(dirname "$(g++ -print-file-name=libstdc++.a)")"
+          cargo build --release --locked
       - name: Shared libraries of the binary
         if: steps.ver.outputs.skip != 'true'
         run: |
           ldd target/release/ferrochat
-          # The main binary must not depend on GStreamer: only the helper does.
-          if ldd target/release/ferrochat | grep -qi gst; then echo "::error::ferrochat links GStreamer"; exit 1; fi
-          ldd target/release/ferrochat-player | grep -i gstreamer
+          # No codec libraries anywhere; the helper needs only the base system.
+          if ldd target/release/ferrochat | grep -Eqi 'gst|openh264|stdc\+\+'; then echo "::error::ferrochat links a codec library"; exit 1; fi
+          .github/scripts/check-helper-libs.sh target/release/ferrochat-player
       - name: Package
         if: steps.ver.outputs.skip != 'true'
         env:
@@ -84,6 +85,8 @@ jobs:
           cp packaging/dev.ferro.ferrochat.svg "dist/$name/packaging/dev.ferro.ferrochat.svg"
           cp assets/fonts/Inter-LICENSE.txt "dist/$name/licenses/Inter-OFL.txt"
           cp assets/icons/LICENSE "dist/$name/licenses/Lucide-ISC.txt"
+          cp "$(find ~/.cargo/registry/src -path '*openh264-sys2-*/upstream/LICENSE' | head -n 1)" \
+            "dist/$name/licenses/OpenH264-BSD-2-Clause.txt"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
           ls -l dist

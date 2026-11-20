@@ -1,4 +1,5 @@
-//! The video helper against real GStreamer (the mock clip is a 3 s VP8 WebM)
+//! The video helper against real files (the mock clip is a 3 s H.264 High
+//! profile + AAC MP4 with B-frames, like a phone video)
 //! and the app-side `Player` against scripted fake helpers. No network, no
 //! window: frames are just bytes.
 
@@ -19,7 +20,7 @@ fn tmp(name: &str) -> PathBuf {
 }
 
 fn clip() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/mock-clip.webm")
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/mock-clip.mp4")
 }
 
 async fn next(rx: &mut UnboundedReceiver<Event>) -> Option<Event> {
@@ -216,21 +217,64 @@ cat > "$1.cmds""#,
 }
 
 #[tokio::test]
-async fn a_helper_that_cannot_load_gstreamer_is_reported_as_unavailable() {
+async fn a_helper_the_loader_refuses_is_reported_with_the_loader_message() {
     let dir = tmp("noloader");
     let helper = script(
         &dir,
-        "echo 'ferrochat-player: error while loading shared libraries: libgstreamer-1.0.so.0: cannot open shared object file' >&2; exit 127",
+        "echo 'ferrochat-player: error while loading shared libraries: libfoo.so.1: cannot open shared object file' >&2; exit 127",
     );
     let (_player, mut rx) = spawn_script(&helper, &dir.join("x.mp4")).expect("spawn");
     match next(&mut rx).await {
-        Some(Event::Failed(Failure::Unavailable(line))) => {
-            assert!(line.contains("libgstreamer"), "{line}");
+        Some(Event::Failed(f @ Failure::Unavailable(_))) => {
+            let msg = f.user_message();
+            assert!(msg.contains("libfoo.so.1"), "{msg}");
+            assert!(msg.contains("Open externally"));
         }
         other => panic!("{other:?}"),
     }
-    let msg = Failure::Unavailable(String::new()).user_message();
-    assert!(msg.contains("GStreamer") && msg.contains("Open externally"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn a_portrait_phone_video_is_shown_upright() {
+    // 160x96 stored, 90° display matrix (how phones record portrait).
+    let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rotated-portrait.mp4");
+    let (_player, mut rx) = spawn_with(Path::new(HELPER), &clip).expect("spawn");
+    match next(&mut rx).await {
+        Some(Event::Ready { width, height, .. }) => assert_eq!((width, height), (96, 160)),
+        other => panic!("{other:?}"),
+    }
+    match next(&mut rx).await {
+        Some(Event::Frame {
+            width,
+            height,
+            rgba,
+        }) => {
+            assert_eq!((width, height), (96, 160));
+            assert_eq!(rgba.len(), 96 * 160 * 4);
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_unsupported_codec_is_named() {
+    // A WebM/VP8 file is not MP4: the failure says so instead of "GStreamer".
+    let dir = tmp("webm");
+    let file = dir.join("clip.webm");
+    std::fs::write(
+        &file,
+        [0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81, 0x01].repeat(20),
+    )
+    .unwrap();
+    let (_player, mut rx) = spawn_with(Path::new(HELPER), &file).expect("spawn");
+    match next(&mut rx).await {
+        Some(Event::Failed(f)) => {
+            let m = f.user_message();
+            assert!(m.contains("MP4") || m.contains("cannot decode"), "{m}");
+        }
+        other => panic!("{other:?}"),
+    }
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -7,7 +7,7 @@ use super::test_support::Harness;
 use super::{MenuTarget, Ui};
 use crate::mock::{self, OWN_JID, SHOWCASE_CHAT};
 use crate::net::fake::{FakeOptions, Sent};
-use crate::net::{ChatFlag, Event, ListDef, ListKind, NameSource};
+use crate::net::{ChatFlag, CollectionResync, Event, ListDef, ListKind, NameSource, ResyncReport};
 
 const MARCOS: &str = "34622222222@s.whatsapp.net";
 const PABLO: &str = "34655555555@s.whatsapp.net";
@@ -96,7 +96,7 @@ async fn existing_sessions_get_one_full_app_state_resync() {
     assert_eq!(resyncs(&h), 1, "requested right after connecting");
     assert_eq!(
         h.app.store.kv("appstate_resync").unwrap().as_deref(),
-        Some("2")
+        Some("3")
     );
     // Reconnecting does not ask again.
     h.net(Event::Connected {
@@ -111,7 +111,7 @@ async fn the_resync_marker_in_the_cache_prevents_repeats_across_runs() {
     let mut cfg = crate::config::Config::defaults();
     cfg.mock = true;
     let (mut app, _) = super::App::boot(cfg);
-    app.store.set_kv("appstate_resync", "2").unwrap();
+    app.store.set_kv("appstate_resync", "3").unwrap();
     let (fake, _stream) = crate::net::fake::start(FakeOptions::default(), mock::mock_data(1));
     app.client = Some(fake.clone());
     let _ = app.update(super::Message::Net(Event::Connected {
@@ -120,13 +120,147 @@ async fn the_resync_marker_in_the_cache_prevents_repeats_across_runs() {
     assert!(fake.log().iter().all(|s| !matches!(s, Sent::Resync)));
 }
 
+/// v0.8.0 wrote marker "1" although the library had dropped the snapshot as
+/// stale: those caches must resync again.
+#[tokio::test]
+async fn the_v080_marker_does_not_count() {
+    let mut cfg = crate::config::Config::defaults();
+    cfg.mock = true;
+    let (app, _) = super::App::boot(cfg);
+    app.store.set_kv("appstate_resync", "1").unwrap();
+    let (fake, stream) = crate::net::fake::start(FakeOptions::default(), mock::mock_data(1));
+    let mut h = Harness { app, fake };
+    drop(stream);
+    h.app.client = Some(h.fake.clone());
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    assert_eq!(resyncs(&h), 1);
+    assert_eq!(
+        h.app.store.kv("appstate_resync").unwrap().as_deref(),
+        Some("3")
+    );
+}
+
+fn report(applied: bool, contacts: usize) -> ResyncReport {
+    ResyncReport {
+        collections: vec![CollectionResync {
+            name: "critical_unblock_low",
+            before: 7,
+            after: if applied { 8 } else { 0 },
+        }],
+        had_sync_key: applied,
+        contacts,
+    }
+}
+
+#[tokio::test]
+async fn a_resync_that_delivered_nothing_is_retried_and_not_marked_done() {
+    let mut cfg = crate::config::Config::defaults();
+    cfg.mock = true;
+    let (app, _) = super::App::boot(cfg);
+    let (fake, stream) = crate::net::fake::start(FakeOptions::default(), mock::mock_data(1));
+    drop(stream);
+    // 1: snapshot not applied (keys missing); 2: applied but no contact
+    // arrived; 3: the address book arrives.
+    fake.script_resync(vec![report(false, 0), report(true, 0), report(true, 42)]);
+    let mut h = Harness { app, fake };
+    h.app.client = Some(h.fake.clone());
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    assert_eq!(resyncs(&h), 3, "retried until the contacts came");
+    assert_eq!(
+        h.app.store.kv("appstate_resync").unwrap().as_deref(),
+        Some("3")
+    );
+}
+
+#[tokio::test]
+async fn a_resync_failing_every_time_stops_for_this_run_and_retries_next_start() {
+    let mut cfg = crate::config::Config::defaults();
+    cfg.mock = true;
+    let (app, _) = super::App::boot(cfg);
+    let (fake, stream) = crate::net::fake::start(FakeOptions::default(), mock::mock_data(1));
+    drop(stream);
+    fake.script_resync((0..10).map(|_| report(false, 0)).collect());
+    let mut h = Harness { app, fake };
+    h.app.client = Some(h.fake.clone());
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    assert_eq!(resyncs(&h), super::RESYNC_MAX_ATTEMPTS as usize);
+    assert_eq!(h.app.store.kv("appstate_resync").unwrap(), None);
+    // A reconnect in the same run does not hammer the server again.
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    assert_eq!(resyncs(&h), super::RESYNC_MAX_ATTEMPTS as usize);
+}
+
+/// The real-account shape: the chat is keyed by the phone number and only
+/// has a push name; the address-book entry arrives keyed by the LID with no
+/// `pnJid`, and the pair is only known to the protocol library.
+#[tokio::test]
+async fn a_lid_keyed_contact_names_the_phone_number_chat() {
+    use crate::net::convert::contact_events;
+    use whatsapp_rust::waproto::whatsapp as wa;
+    let mut h = Harness::new().await;
+    assert_eq!(h.app.chats.display_name(PABLO), "~ Pablo");
+    // The library already knew the pair (usync / earlier history sync).
+    h.fake
+        .set_known_lid_pairs(vec![("205000111222333@lid".into(), PABLO.into())]);
+    h.net(Event::Connected {
+        jid: Some(OWN_JID.into()),
+    })
+    .await;
+    let action = wa::sync_action_value::ContactAction {
+        full_name: Some("Pablo Gómez".into()),
+        first_name: Some("Pablo".into()),
+        lid_jid: None,
+        pn_jid: None,
+        ..Default::default()
+    };
+    for ev in contact_events("205000111222333@lid", &action) {
+        h.net(ev).await;
+    }
+    assert_eq!(h.app.chats.display_name(PABLO), "Pablo Gómez");
+    let st = h.app.chats.name_stats();
+    assert!(st.chats_saved >= 1);
+}
+
+/// A name stored under the LID before the pair was known still shows on the
+/// phone-number chat once the pair arrives (and after a restart).
+#[tokio::test]
+async fn a_name_learned_before_its_lid_pair_is_found_later() {
+    let mut h = Harness::new().await;
+    h.net(Event::ContactName {
+        jid: "205000999@lid".into(),
+        name: "Desconocida Ahora".into(),
+        source: NameSource::Saved,
+    })
+    .await;
+    assert_eq!(h.app.chats.display_name(STRANGER), "+34 600 999 888");
+    h.net(Event::LidMappings(vec![(
+        "205000999@lid".into(),
+        STRANGER.into(),
+    )]))
+    .await;
+    assert_eq!(h.app.chats.display_name(STRANGER), "Desconocida Ahora");
+}
+
 #[tokio::test]
 async fn sessions_synced_before_stars_get_one_more_snapshot() {
     let mut h = Harness::new().await;
     assert_eq!(resyncs(&h), 1);
-    // A v0.8 cache: names and lists were synced, stars never were.
-    h.app.store.set_kv("appstate_resync", "1").unwrap();
-    h.app.resync_done = false;
+    // A v0.8 / pre-fix development cache: its marker does not count, one
+    // real resync covers names and stars.
+    h.app.store.set_kv("appstate_resync", "2").unwrap();
+    h.app.resync = super::Resync::default();
     h.net(Event::Connected {
         jid: Some(OWN_JID.into()),
     })
@@ -134,7 +268,7 @@ async fn sessions_synced_before_stars_get_one_more_snapshot() {
     assert_eq!(resyncs(&h), 2);
     assert_eq!(
         h.app.store.kv("appstate_resync").unwrap().as_deref(),
-        Some("2")
+        Some("3")
     );
 }
 

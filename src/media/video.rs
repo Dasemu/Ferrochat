@@ -1,6 +1,7 @@
 //! In-app video playback through the `ferrochat-player` helper process.
 //!
-//! The helper (GStreamer) decodes one file and streams RGBA frames; this
+//! The helper (OpenH264 + symphonia, no system codecs) decodes one file and
+//! streams RGBA frames; this
 //! module spawns it, parses its output on a reader thread and forwards
 //! [`Event`]s over a channel. One [`Player`] exists at a time (the app keeps
 //! it in the open viewer); dropping it ends the process, which releases the
@@ -21,34 +22,56 @@ pub const HELPER_NAME: &str = "ferrochat-player";
 /// What went wrong, in terms the user can act on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Failure {
-    /// The helper is missing or GStreamer cannot be loaded.
+    /// The helper is missing or could not start.
     Unavailable(String),
-    /// A decoder plug-in is missing (the video codec is not installed).
+    /// The video uses a codec the built-in decoder does not handle.
     MissingCodec(String),
     /// The file could not be played.
     Broken(String),
 }
 
 impl Failure {
-    /// The text shown in the viewer (never a crash, never silent).
+    /// The text shown in the viewer: which step failed, never a crash, never
+    /// silent. Path-like words are removed from the helper's detail.
     pub fn user_message(&self) -> String {
         match self {
-            Failure::Unavailable(_) => "Video playback needs GStreamer, which is not \
-                installed or cannot be loaded. Install gstreamer1.0-plugins-good and \
-                gstreamer1.0-libav (Debian/Ubuntu), gst-plugins-good and gst-libav (Fedora, \
-                Arch), or choose \u{201c}Open externally\u{201d}."
-                .into(),
-            Failure::MissingCodec(what) => format!(
-                "This video cannot be played because {what} is not installed. Install \
-                 gstreamer1.0-libav and gstreamer1.0-plugins-good (or your distribution's \
-                 equivalent), or choose \u{201c}Open externally\u{201d}."
+            Failure::Unavailable(d) => format!(
+                "The video player could not start ({}). Choose \u{201c}Open externally\u{201d} \
+                 to use another player.",
+                scrub(d)
             ),
-            Failure::Broken(_) => "This video could not be played. It may be damaged or \
-                use a format GStreamer does not support. Choose \u{201c}Open externally\u{201d} \
-                to try another player."
-                .into(),
+            Failure::MissingCodec(what) => format!(
+                "This video uses {}, which the built-in player cannot decode. Choose \
+                 \u{201c}Open externally\u{201d} to play it with another player.",
+                scrub(what)
+            ),
+            Failure::Broken(d) => format!(
+                "This video could not be played: {}. Choose \u{201c}Open externally\u{201d} \
+                 to try another player.",
+                scrub(d)
+            ),
         }
     }
+
+    /// Short detail for logs (no paths).
+    pub fn detail(&self) -> String {
+        match self {
+            Failure::Unavailable(d) | Failure::MissingCodec(d) | Failure::Broken(d) => scrub(d),
+        }
+    }
+}
+
+/// Drops words that look like file paths and caps the length.
+fn scrub(s: &str) -> String {
+    let words: Vec<&str> = s
+        .split_whitespace()
+        .filter(|w| !w.contains('/') && !w.contains('\\'))
+        .collect();
+    let mut out: String = words.join(" ").chars().take(160).collect();
+    if out.is_empty() {
+        out = "unknown error".into();
+    }
+    out
 }
 
 /// What the helper reports.
@@ -142,7 +165,7 @@ pub fn spawn_with(
         return Err(Failure::Unavailable("no pipes to the video helper".into()));
     };
     let (tx, rx) = mpsc::unbounded_channel();
-    // stderr must be drained: GStreamer can be chatty, and a full pipe would
+    // stderr must be drained: a chatty helper with a full pipe would
     // stall the helper. Only the last line is kept (for load failures).
     let last_err = std::sync::Arc::new(Mutex::new(String::new()));
     {
@@ -213,7 +236,7 @@ pub fn spawn_with(
         }
         if !announced {
             // The helper died before saying anything: the dynamic loader
-            // could not find GStreamer, or it crashed on start.
+            // refused it, or it crashed on start.
             // Give the stderr thread a moment to see the loader's message.
             std::thread::sleep(std::time::Duration::from_millis(100));
             let line = last_err
@@ -333,21 +356,20 @@ mod tests {
     }
 
     #[test]
-    fn failures_have_actionable_messages() {
-        let m = Failure::Unavailable("x".into()).user_message();
-        assert!(m.contains("GStreamer") && m.contains("Open externally"));
-        let m = Failure::MissingCodec("an H.264 decoder".into()).user_message();
-        assert!(m.contains("H.264") && m.contains("gstreamer1.0-libav"));
+    fn failures_say_which_step_failed() {
+        let m = Failure::Unavailable("the helper exited".into()).user_message();
+        assert!(m.contains("could not start (the helper exited)") && m.contains("Open externally"));
+        let m = Failure::MissingCodec("H.265 (HEVC)".into()).user_message();
+        assert!(m.contains("uses H.265 (HEVC)") && m.contains("cannot decode"));
+        let m = Failure::Broken("H.264 decoding failed at 1.0 s: bitstream".into()).user_message();
+        assert!(m.contains("H.264 decoding failed at 1.0 s"));
+        // Paths (which may name files) are never shown.
+        let m = Failure::Broken("cannot open /secret/path now".into()).user_message();
+        assert!(!m.contains("secret") && m.contains("cannot open now"));
         assert!(
-            Failure::Broken("x".into())
+            Failure::Broken(String::new())
                 .user_message()
-                .contains("could not be played")
-        );
-        // The raw error text (which may name files) is never shown.
-        assert!(
-            !Failure::Broken("/secret/path".into())
-                .user_message()
-                .contains("secret")
+                .contains("unknown error")
         );
     }
 

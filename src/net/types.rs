@@ -580,6 +580,17 @@ pub enum Origin {
     History,
 }
 
+/// Status updates (`status@broadcast`), broadcast lists and channels: not
+/// chats of the chat list, never counted as unread.
+pub fn is_pseudo_chat(jid: &str) -> bool {
+    jid.ends_with("@broadcast") || jid.ends_with("@newsletter")
+}
+
+/// True for a `(…@lid, …@s.whatsapp.net)` pair.
+pub fn is_lid_pair(lid: &str, pn: &str) -> bool {
+    lid.ends_with("@lid") && pn.ends_with("@s.whatsapp.net")
+}
+
 /// Maps `@lid` JIDs to phone-number JIDs so one contact is one chat.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct LidMap {
@@ -734,6 +745,51 @@ impl NameSource {
             3 => Some(Self::Saved),
             _ => None,
         }
+    }
+}
+
+/// What one app-state collection did during a forced resync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CollectionResync {
+    /// Collection name (`critical_unblock_low`, `regular`, ...).
+    pub name: &'static str,
+    /// Persisted version before the resync.
+    pub before: u64,
+    /// Persisted version after it (0: the snapshot was not applied).
+    pub after: u64,
+}
+
+impl CollectionResync {
+    /// The snapshot was applied (the version only leaves 0 through a
+    /// snapshot or the genesis patch).
+    pub fn applied(&self) -> bool {
+        self.after > 0
+    }
+}
+
+/// Outcome of a forced app-state resync. Counts only: never names or ids.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResyncReport {
+    /// Per collection.
+    pub collections: Vec<CollectionResync>,
+    /// An app-state sync key was stored before the resync (keys come from
+    /// the phone in `AppStateSyncKeyShare`; without one nothing decrypts).
+    pub had_sync_key: bool,
+    /// `contact` mutations (address-book entries) received while it ran.
+    pub contacts: usize,
+}
+
+impl ResyncReport {
+    /// Every collection applied its snapshot.
+    pub fn complete(&self) -> bool {
+        !self.collections.is_empty() && self.collections.iter().all(CollectionResync::applied)
+    }
+
+    /// The resync achieved its purpose: the snapshots were applied and the
+    /// address book arrived. An account with no saved contact at all only
+    /// counts as done after `attempt` reaches `max_empty`.
+    pub fn succeeded(&self, attempt: u32, max_empty: u32) -> bool {
+        self.complete() && (self.contacts > 0 || attempt >= max_empty)
     }
 }
 

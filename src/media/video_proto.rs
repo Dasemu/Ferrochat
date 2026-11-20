@@ -1,11 +1,10 @@
 //! Wire format between the app and the `ferrochat-player` helper process.
 //!
-//! The helper decodes video with GStreamer and writes messages to its
-//! stdout; the app sends line-based commands to its stdin. Keeping GStreamer
-//! in a separate process means the app itself has no GStreamer dependency at
-//! load time (a machine without it still starts and shows a clear message),
-//! and closing a video frees every byte the decoder held by ending the
-//! process.
+//! The helper decodes video (OpenH264 + symphonia, linked into the helper
+//! only) and writes messages to its stdout; the app sends line-based
+//! commands to its stdin. Keeping the decoders in a separate process keeps
+//! the main binary light, isolates a decoder crash from the app, and closing
+//! a video frees every byte the decoder held by ending the process.
 //!
 //! Helper → app: a tag byte, then little-endian fields.
 //!

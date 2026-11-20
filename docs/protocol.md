@@ -65,7 +65,7 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `ArchiveUpdate`, `PinUpdate`, `MuteUpdate` (app-state `archive`, `pin_v1`, `mute`) | `ChatFlag` | archive / pin / mute applied, persisted |
 | `LabelEditUpdate` (app-state `label_edit`) | `ListEdit` | list created / renamed / deleted |
 | `LabelAssociationUpdate` (`label_jid`) | `ListChat` | chat added to / removed from a list |
-| `MarkChatAsReadUpdate` | `ChatRead` | badge cleared |
+| `MarkChatAsReadUpdate` | `ChatRead` (read) / `ChatMarkedUnread` | badge cleared / one unread |
 
 Reactions, edits and "delete for me" events wait until the message batch that
 may contain their target is in the cache (`App::deferred`).
@@ -139,12 +139,44 @@ and the pair is learned.
 
 **Existing sessions.** A session linked before this was implemented already
 holds the collections at their latest version, so the contact mutations are
-never replayed. On the first connection of a cache that has no
-`appstate_resync` marker the app calls `Client::process_sync_task(
-MajorSyncTask::AppStateSync { full_sync: true })` for `critical_unblock_low`,
-`regular`, `regular_low` and `regular_high` (the library then requests a
-snapshot and replays every mutation as an event) and stores the marker. Fresh
-links get the same data from the initial sync.
+never replayed. Asking for a snapshot is not enough: wacore 0.7 discards a
+snapshot whose version is not newer than the persisted one
+(`appstate_sync::snapshot_is_stale`, logged as "Skipping stale snapshot"
+under the `AppState` target), which is why v0.8.0's one-time resync applied
+nothing. Ferrochat therefore resets the collection first (persisted version
+to 0 and its mutation MACs cleared: the state of a freshly linked device)
+and then calls `Client::process_sync_task(MajorSyncTask::AppStateSync {
+full_sync: true })` for `critical_unblock_low`, `regular_low`, `regular` and
+`regular_high`; the snapshot then becomes the new baseline and every
+mutation is replayed as an event. If a request fails half-way, the version
+stays 0 and the next sync of that collection asks for a snapshot by itself.
+Missing app-state keys are requested from the phone by the library
+(`AppStateSyncKeyRequest`, 10 s wait); the phone must be online.
+
+The resync reports per collection whether the snapshot was applied and how
+many `contact` entries arrived. The `appstate_resync` marker (value `3`;
+v0.8.0's `1` and the pre-fix development `2` do not count; the same resync
+also replays starred messages) is written only once snapshots were applied and
+the address book arrived (an account whose snapshot applies with no contact
+at all counts as done after three attempts). Otherwise it is retried after
+45 s, up to four times per run, and again at the next start.
+
+**LID vs. phone number.** Contacts may be keyed by LID (`…@lid`) while the
+chat uses the phone number, or the reverse. On every connection the LID ↔
+PN pairs the library already knows (`get_all_lid_mappings`: usync, device
+lists, earlier history syncs) are imported, and the name book looks a name
+up under the other id of the same person, so a saved name stored under
+either id wins over a push name under either. History conversations'
+`displayName` is used as a chat-record name when `name` is empty.
+
+**Diagnostics** (info level, counts only, never names, numbers or ids):
+`app-state resync: <collection> version A -> B (snapshot applied | not
+applied)`, `app-state resync attempt N: X/Y collections applied, K contact
+entries, sync key stored before: …`, and `names after app-state resync:
+saved=… business=… push=… lid_pairs=…; direct chats … (saved …, push …,
+number only …)`. The library's own app-state logs use the targets
+`Client/AppState` and `AppState` (not `whatsapp_rust`), e.g.
+`RUST_LOG=info,ferrochat=debug,Client/AppState=debug,AppState=debug`.
 
 Known limits: a contact *removed* from the address book arrives as a syncd
 `REMOVE`, which `whatsapp-rust` 0.7 does not turn into an event, so the old
@@ -196,7 +228,7 @@ chats are unchanged.
 | `$XDG_DATA_HOME/ferrochat/cache.sqlite3` (+ `-wal`, `-shm`) | Cache: chats, message bodies, media references (CDN path + per-file media key, needed to download later), contact names (by source), chat lists and their members, own JID | Plain SQLite, mode 0600, like the official desktop client's local database. Deletable at any time; rebuilt from history sync. Never contains credentials or Signal keys. |
 | (cache tables `statuses`, `starred`) | Statuses of the last 24 h (author, text / media references, thumbnail, viewed flag) and starred message keys | Same file as above; wiped on logout |
 | `$XDG_CACHE_HOME/ferrochat/avatars/*.img` / `*.none` | Profile picture previews (JPEG as served) and "no picture" markers. File names are a hash of the JID. Refreshed after 7 days / 12 h or when the contact changes the picture; at most 1500 files and 32 MB; deleted on logout | Directory 0700 |
-| `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB), decrypted, so the player (in-app helper or system player) can read them | Directory 0700. `--mock` writes its 27 kB clip to `$TMPDIR/ferrochat-mock-<pid>` and removes it when the viewer closes. |
+| `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB), decrypted, so the player (in-app helper or system player) can read them | Directory 0700. `--mock` writes its 40 kB clip to `$TMPDIR/ferrochat-mock-<pid>` and removes it when the viewer closes. |
 | `$XDG_CONFIG_HOME/ferrochat/settings.json` | Preferences: close to tray, start minimized, mute notifications | Plain JSON, no secrets; not written in `--mock` |
 | `~/.config/autostart/dev.ferro.ferrochat.desktop` | "Start at login" entry (`Exec=<binary> --minimized`) | Only when the user turns the toggle on; the toggle removes it |
 | `$XDG_DATA_HOME/ferrochat/ferrochat.sock` | Single-instance hand-off: accepts only the line `show` | Unix socket in the 0700 data directory, mode 0600, removed on exit |
@@ -316,9 +348,18 @@ draws the waveform bars as played / unplayed.
 
 ### 6.1 Video playback
 
-Videos play inside the app. Decoding runs in a helper process,
-`ferrochat-player` (GStreamer: `playbin` with an RGBA `appsink`), one process
-per open video:
+Videos play inside the app with no system codec package. Decoding runs in a
+helper process, `ferrochat-player`, one process per open video: MP4 demux
+with the `mp4` crate (pure Rust; sample table, `avcC`, display matrix),
+H.264 with OpenH264 (Cisco's BSD-licensed decoder built from source and
+linked statically; Main and High profile with B-frames, decoder reorder
+buffer kept, no per-sample flush), AAC with symphonia (pure Rust), sound
+through rodio, YUV → RGBA with scaling and rotation in one pass. The release
+links libstdc++ statically; CI checks with `ldd` that the helper needs only
+glibc, libgcc_s and libasound. H.265 (some iPhone videos), VP9 and other
+codecs are reported by name ("This video uses H.265 (HEVC), which the
+built-in player cannot decode") with "Open externally"; every failure names
+its step (helper start, container, codec, decode position).
 
 * The helper writes tagged binary messages to stdout (ready, RGBA frames of at
   most 960x540, position / state every 250 ms, failure) and reads text
@@ -331,12 +372,18 @@ per open video:
   chat list and conversation.
 * Closing the viewer drops the `Player`, which ends the process: the decoder,
   its buffers and the audio stream are freed. At most one exists at a time.
-* The main binary does not link GStreamer. A machine without it starts
-  normally; opening a video shows which packages to install (or which codec
-  is missing), plus an "Open externally" button. The system player is only ever
-  used through that explicit button or the message menu entry.
+* The main binary links no codec. The system player is only ever used
+  through the explicit "Open externally" button or the message menu entry.
 * Controls: play / pause (also click on the picture and Space), seek bar with
   elapsed and total time, volume and mute, full screen, close (Esc).
+
+GStreamer (v0.8.0) was replaced because it depends on system plugins the
+user may not have. A static minimal ffmpeg was the alternative: more
+codecs (H.265), but LGPL obligations for static linking and a C build of
+ffmpeg in the release; OpenH264 + symphonia cover what WhatsApp sends
+(phones transcode to H.264 + AAC). Patent note: Cisco's patent licence only
+covers its prebuilt binaries, like any other software H.264 decoder built
+from source.
 
 `iced_video_player` 0.6 (GStreamer, iced 0.14) was evaluated and rejected: it
 renders through a wgpu shader only (nothing is drawn on the tiny-skia
