@@ -12,7 +12,7 @@ use super::icons::Icon;
 use super::theme::{self, INTER, INTER_MEDIUM, INTER_SEMIBOLD};
 use super::{El, avatar_for, clock, ellipsize, fill, icon, local_day};
 use crate::app::nav::NavMsg;
-use crate::app::status::{TEXT_COLORS, TEXT_FONTS, segment_fill};
+use crate::app::status::{STATUS_POSTING_ENABLED, TEXT_COLORS, TEXT_FONTS, segment_fill};
 use crate::app::{App, Message, Ui};
 use crate::net::social::{StatusBody, StatusGroup, StatusItem};
 
@@ -143,25 +143,30 @@ pub fn list(app: &App) -> El<'_> {
     let m = t.metrics;
     let now = chrono::Utc::now().timestamp();
     let split = app.status_split();
-    let header = row![
+    let mut header = row![
         text("Status")
             .size(m.text_title)
             .font(INTER_SEMIBOLD)
             .color(p.text_primary),
         fill(),
-        button(icon(Icon::Plus, m.icon, p.text_secondary))
-            .padding(8)
-            .style(theme::icon_button(t, app.status.compose.is_some()))
-            .on_press(nav(NavMsg::StatusCompose)),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center)
-    .padding(iced::Padding {
-        top: 10.0,
-        right: 10.0,
-        bottom: 6.0,
-        left: 20.0,
-    });
+    ];
+    if STATUS_POSTING_ENABLED {
+        header = header.push(
+            button(icon(Icon::Plus, m.icon, p.text_secondary))
+                .padding(8)
+                .style(theme::icon_button(t, app.status.compose.is_some()))
+                .on_press(nav(NavMsg::StatusCompose)),
+        );
+    }
+    let header = header
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .padding(iced::Padding {
+            top: 10.0,
+            right: 10.0,
+            bottom: 6.0,
+            left: 20.0,
+        });
 
     // "My status".
     let mine_row: El<'_> = {
@@ -173,27 +178,28 @@ pub fn list(app: &App) -> El<'_> {
                     if g.items.len() == 1 { "" } else { "s" },
                     status_time(g.newest(), now)
                 ),
-                nav(NavMsg::OpenStatus(g.author.clone())),
+                Some(nav(NavMsg::OpenStatus(g.author.clone()))),
             ),
-            None => (
+            None if STATUS_POSTING_ENABLED => (
                 "Click to add a status update".to_string(),
-                nav(NavMsg::StatusCompose),
+                Some(nav(NavMsg::StatusCompose)),
             ),
+            None => ("No status updates".to_string(), None),
         };
         let own = app.own_jid.clone().unwrap_or_default();
-        let lead: El<'_> = stack![
-            container(avatar_for(app, &own, false, 49.0)).padding(2),
-            container(
-                container(icon(Icon::Plus, 12.0, p.accent_text))
-                    .padding(2)
-                    .style(theme::rounded(p.accent, 9.0))
-            )
-            .align_right(53)
-            .align_bottom(53),
-        ]
-        .width(53)
-        .height(53)
-        .into();
+        let mut lead = stack![container(avatar_for(app, &own, false, 49.0)).padding(2)];
+        if STATUS_POSTING_ENABLED && split.mine.is_none() {
+            lead = lead.push(
+                container(
+                    container(icon(Icon::Plus, 12.0, p.accent_text))
+                        .padding(2)
+                        .style(theme::rounded(p.accent, 9.0)),
+                )
+                .align_right(53)
+                .align_bottom(53),
+            );
+        }
+        let lead: El<'_> = lead.width(53).height(53).into();
         button(
             container(
                 row![
@@ -212,7 +218,7 @@ pub fn list(app: &App) -> El<'_> {
         .padding(0)
         .width(Length::Fill)
         .style(theme::chat_row(t, false))
-        .on_press(on)
+        .on_press_maybe(on)
         .into()
     };
 

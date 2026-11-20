@@ -247,6 +247,9 @@ async fn expired_statuses_are_dropped_from_memory_and_the_cache() {
 #[tokio::test]
 async fn posting_a_text_status_goes_to_the_saved_contacts_and_appears_as_mine() {
     let mut h = Harness::new().await;
+    if !crate::app::status::STATUS_POSTING_ENABLED {
+        return;
+    }
     nav(&mut h, NavMsg::StatusCompose).await;
     nav(&mut h, NavMsg::StatusComposeText("Hola a todos".into())).await;
     nav(&mut h, NavMsg::StatusComposeColor).await;
@@ -261,6 +264,24 @@ async fn posting_a_text_status_goes_to_the_saved_contacts_and_appears_as_mine() 
     assert!(recipients > 0);
     assert!(h.app.status.compose.is_none());
     assert!(h.app.status_split().mine.is_some());
+}
+
+#[tokio::test]
+async fn posting_is_off_while_the_privacy_lists_are_unreadable() {
+    let mut h = Harness::new().await;
+    if crate::app::status::STATUS_POSTING_ENABLED {
+        return;
+    }
+    nav(&mut h, NavMsg::StatusCompose).await;
+    nav(&mut h, NavMsg::StatusComposeText("hola".into())).await;
+    nav(&mut h, NavMsg::StatusPost).await;
+    assert!(h.app.status.compose.is_none());
+    assert!(
+        h.fake
+            .log()
+            .iter()
+            .all(|s| !matches!(s, Sent::PostStatus { .. }))
+    );
 }
 
 #[tokio::test]

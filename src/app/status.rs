@@ -193,6 +193,12 @@ pub fn segment_fill(i: usize, current: usize, progress: f32) -> f32 {
     }
 }
 
+/// Posting a status is switched off: the library does not expose the account's
+/// status privacy lists ("My contacts except..." / "Only share with..."), so a
+/// post would go to every saved contact and could leak to people the user
+/// excluded. The code stays; flip this once the lists are readable.
+pub const STATUS_POSTING_ENABLED: bool = false;
+
 /// The text status composer.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Compose {
@@ -897,7 +903,9 @@ impl App {
             }
             NavMsg::CloseStatus => self.close_status(),
             NavMsg::StatusCompose => {
-                self.status.compose = Some(Compose::default());
+                if STATUS_POSTING_ENABLED {
+                    self.status.compose = Some(Compose::default());
+                }
                 Task::none()
             }
             NavMsg::StatusComposeText(t) => {

@@ -183,3 +183,5 @@ next change.
 
 - `keyring` 4 opens a *blocking* zbus connection: if any dependency turns on zbus `tokio` (ksni default features, `rfd`/`ashpd` `tokio`, a `zbus` dev-dep) it panics ("Cannot start a runtime from within a runtime") when called on a runtime worker. Keep zbus on `async-io` (`ksni` with `default-features = false, features = ["async-io"]`, `rfd` with `async-std`); `tests/real_keyring.rs` guards it against a real Secret Service.
 
+
+- Status posting is switched off (`app::status::STATUS_POSTING_ENABLED = false`). `whatsapp-rust` posts to an explicit recipient list and does not expose the account's status privacy ("My contacts except..." / "Only share with..."), so posting to all saved contacts could leak a status to people the user excluded. "My status" is view-only; the composer code stays behind the constant. Re-enable only when the library exposes the privacy lists and we send to exactly that audience.
