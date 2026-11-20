@@ -51,9 +51,6 @@ jobs:
         if: steps.ver.outputs.skip != 'true'
         run: |
           sudo apt-get update
-          # The ubuntu-22.04 image ships libunwind-14-dev, which conflicts with the
-          # libunwind-dev that libgstreamer1.0-dev depends on.
-          sudo apt-get remove -y libunwind-14-dev || true
           sudo apt-get install -y pkg-config cmake libdbus-1-dev libasound2-dev \
             libxkbcommon-dev libwayland-dev libssl-dev libfontconfig1-dev
       - uses: dtolnay/rust-toolchain@stable
