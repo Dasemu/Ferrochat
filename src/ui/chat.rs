@@ -982,6 +982,17 @@ fn finish<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, content: El<'a>) 
     if sticker {
         b = b.padding(2).style(theme::solid(Color::TRANSPARENT));
     }
+    // The drop shadow: one plain quad 1 px lower (see `theme::bubble`).
+    let b = if sticker {
+        container(b)
+    } else {
+        container(b)
+            .padding(iced::Padding {
+                bottom: 1.0,
+                ..Default::default()
+            })
+            .style(theme::bubble_shadow(t, out, first))
+    };
     let bubble: El<'a> = if msg.status == ReceiptStatus::Failed && out {
         mouse_area(b)
             .on_press(Message::Ui(Ui::Retry(msg.id.clone())))
