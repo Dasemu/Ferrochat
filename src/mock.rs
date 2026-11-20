@@ -379,10 +379,10 @@ pub fn mock_data(now: i64) -> MockData {
     );
     media.insert(voice_out.direct_path.clone(), ogg_out);
 
-    // A real 3-second test clip (VP8 in WebM, a few kB) so the in-app player
-    // works in mock mode too.
-    let clip = include_bytes!("../assets/mock-clip.webm").to_vec();
-    let clip_ref = media_ref("/mock/clip.webm", MediaKind::Video, "video/webm", &clip);
+    // A real 3-second clip shaped like a phone video (H.264 High profile with
+    // B-frames + AAC in MP4, 40 kB) so the in-app player works in mock mode.
+    let clip = include_bytes!("../assets/mock-clip.mp4").to_vec();
+    let clip_ref = media_ref("/mock/clip.mp4", MediaKind::Video, "video/mp4", &clip);
     media.insert(clip_ref.direct_path.clone(), clip);
     let clip_thumb = thumbnail_of(&sunset_png(320, 180));
     let webp = sticker_webp();
@@ -758,6 +758,16 @@ pub fn mock_data(now: i64) -> MockData {
     }
     avatars.insert(OWN_JID.to_string(), avatar_png(99, false));
 
+    // Profiling aid: `FERROCHAT_MOCK_MESSAGES=600 ferrochat --mock` adds a
+    // long scroll-back to the showcase chat.
+    if let Some(n) = std::env::var("FERROCHAT_MOCK_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        b.msgs
+            .extend(long_history(lucia, n.min(20_000), now - 30 * 86_400));
+    }
+
     MockData {
         own_jid: OWN_JID.into(),
         chats,
@@ -772,6 +782,38 @@ pub fn mock_data(now: i64) -> MockData {
         typing: vec![(carmen.to_string(), None, ChatState::Composing)],
         presence: vec![(lucia.to_string(), true, None)],
     }
+}
+
+/// `n` older text messages (varied lengths, links, mentions), the newest
+/// ending at `until`. Used to profile scrolling.
+pub fn long_history(chat: &str, n: usize, until: i64) -> Vec<Message> {
+    const LINES: [&str; 6] = [
+        "ok",
+        "¿Quedamos mañana a las siete en la puerta del cine?",
+        "Mira esto: https://example.com/articulo/sobre-escalada-en-roca y dime qué te parece 😄",
+        "Vale, perfecto. Llevo yo las entradas y tú las palomitas, que la última vez me tocó a mí pagar todo.",
+        "Una frase larga que ocupa varias líneas del globo de mensaje para medir cómo se comporta el texto cuando el panel es estrecho y hay que partirlo en muchas líneas distintas sin perder el ritmo de lectura.",
+        "jajaja 😂😂",
+    ];
+    (0..n)
+        .map(|i| {
+            let from_me = i % 3 == 0;
+            Message {
+                id: format!("LONG{i:06}"),
+                chat: chat.into(),
+                sender: if from_me { OWN_JID.into() } else { chat.into() },
+                sender_name: None,
+                from_me,
+                timestamp: until - ((n - i) as i64) * 600,
+                content: Content::Text(LINES[(i * 7 + i / 3) % LINES.len()].into()),
+                status: ReceiptStatus::Read,
+                expires_at: None,
+                reply: None,
+                edited: false,
+                reactions: Vec::new(),
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

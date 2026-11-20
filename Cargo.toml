@@ -12,13 +12,14 @@ default-run = "ferrochat"
 
 [features]
 default = ["video"]
-# In-app video playback: the `ferrochat-player` helper process decodes with
-# GStreamer (system libraries). The main binary does not link GStreamer.
-video = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
+# In-app video playback: the `ferrochat-player` helper process decodes MP4
+# (H.264 + AAC) with statically linked decoders; no system codec libraries.
+# The main binary links none of them.
+video = ["dep:openh264", "dep:mp4", "dep:symphonia"]
 
 [[bin]]
 name = "ferrochat-player"
-path = "src/bin/ferrochat-player.rs"
+path = "src/bin/ferrochat-player/main.rs"
 required-features = ["video"]
 
 [[test]]
@@ -66,10 +67,13 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 # Opens documents without a shell (ShellExecuteW on Windows, xdg-open/open elsewhere).
 open = { version = "5", features = ["shellexecute-on-windows"] }
 lru = "0.16"
-# Video helper (in `ferrochat-player` only): GStreamer bindings, decoding to RGBA frames.
-gstreamer = { version = "0.25", optional = true }
-gstreamer-app = { version = "0.25", optional = true }
-gstreamer-video = { version = "0.25", optional = true }
+# Video helper (in `ferrochat-player` only), no system libraries:
+# H.264 decoder (Cisco's BSD OpenH264, built from source, linked statically; Main/High with B-frames).
+openh264 = { version = "0.9", optional = true }
+# Pure-Rust MP4 demuxer for the H.264 track (sample table, avcC, rotation).
+mp4 = { version = "0.14", optional = true }
+# Pure-Rust AAC decoder + MP4 audio demuxer (symphonia is already in the tree through rodio).
+symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"], optional = true }
 # Renders the app's SVG icon to ARGB32 tray pixmaps / the window icon (already in the tree via iced's svg).
 resvg = { version = "0.45", default-features = false }
 
