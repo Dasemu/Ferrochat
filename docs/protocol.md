@@ -194,6 +194,7 @@ chats are unchanged.
 | OS keyring, service `dev.ferro.ferrochat`, account `signal-store-key` | 256-bit random key (hex) for the session store | Secret Service (KWallet / GNOME Keyring), Keychain, Credential Manager |
 | `$XDG_DATA_HOME/ferrochat/session.sqlcipher` (+ `-wal`, `-shm`) | The library's whole Signal / device state: identity key pair, noise key, signed pre-keys, sessions, sender keys, app-state sync keys, LID mappings | **SQLCipher** (AES-256, HMAC per page) keyed with the raw key above (`PRAGMA key = "x'…'"`, no PBKDF2). File mode 0600. Tested: no `SQLite format 3` header and no schema text in the file; a wrong key is rejected. |
 | `$XDG_DATA_HOME/ferrochat/cache.sqlite3` (+ `-wal`, `-shm`) | Cache: chats, message bodies, media references (CDN path + per-file media key, needed to download later), contact names (by source), chat lists and their members, own JID | Plain SQLite, mode 0600, like the official desktop client's local database. Deletable at any time; rebuilt from history sync. Never contains credentials or Signal keys. |
+| (cache tables `statuses`, `starred`) | Statuses of the last 24 h (author, text / media references, thumbnail, viewed flag) and starred message keys | Same file as above; wiped on logout |
 | `$XDG_CACHE_HOME/ferrochat/avatars/*.img` / `*.none` | Profile picture previews (JPEG as served) and "no picture" markers. File names are a hash of the JID. Refreshed after 7 days / 12 h or when the contact changes the picture; at most 1500 files and 32 MB; deleted on logout | Directory 0700 |
 | `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB), decrypted, so the player (in-app helper or system player) can read them | Directory 0700. `--mock` writes its 27 kB clip to `$TMPDIR/ferrochat-mock-<pid>` and removes it when the viewer closes. |
 | `$XDG_CONFIG_HOME/ferrochat/settings.json` | Preferences: close to tray, start minimized, mute notifications | Plain JSON, no secrets; not written in `--mock` |
@@ -273,6 +274,38 @@ last *unread* incoming messages are marked read with `mark_as_read`,
 batched per participant in groups (the protocol needs the sender there).
 Playing an incoming voice note sends a `played` receipt. Live messages in
 the focused open chat are marked read immediately.
+
+## 5b. Status, communities, groups, stars
+
+* **Status** (`status@broadcast`). Statuses are never a chat. In `translate`
+  every message whose chat is the status broadcast is diverted to
+  `Event::Status` (text with `background_argb` + font, photo, video) or
+  `Event::StatusRevoked`; history sync already skips `@broadcast`. They are
+  kept in the cache table `statuses` (24 h from the send time, at most 1500
+  rows, thumbnails capped at 64 kB) and the legacy `status@broadcast` chat
+  rows of v0.8 caches are deleted by migration 5. Viewing a status sends a
+  `<receipt type="read" context="status">` through `Client::mark_as_read`
+  (participant = author). The library's own privacy gate only covers private
+  chats, so `RealClient::send_status_view` first reads the account's
+  `readreceipts` privacy setting (`fetch_privacy_settings`, cached 10 min) and
+  sends nothing when it is `none` or cannot be read. Posting a text status
+  uses `Client::status().send_text` to the saved contacts.
+* **Communities.** `community().get_participating()` (parents),
+  `community().get_subgroups()` (MEX, includes groups we are not in) and
+  `groups().get_participating()` (every group we are in, with
+  `parent_group_jid` / `is_default_sub_group` / `is_general_chat`) are merged;
+  subgroups we are in are derived from the parent link when the MEX query
+  fails. Creating a community uses `community().create`.
+* **New chat.** Contacts are the address-book names (app-state `contact`).
+  A typed number is checked with `contacts().is_on_whatsapp` (usync) only
+  when the user clicks "Message +...", never while typing.
+* **New group.** `groups().create_group` with the picked phone JIDs, then
+  `set_profile_picture` (640 px square JPEG) when an icon was chosen.
+* **Starred messages.** `chat_actions().star_message / unstar_message`
+  (app-state `star`) and `Event::StarUpdate` into the `starred` table.
+  Existing sessions get one more full app-state snapshot (marker
+  `appstate_resync` = 2) because stars were never replayed before. A star
+  whose message is not in the local cache is kept but not listed.
 
 ## 6. Voice note playback
 
