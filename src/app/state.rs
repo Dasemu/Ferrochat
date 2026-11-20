@@ -59,6 +59,32 @@ pub struct NameBook {
     saved: HashMap<String, String>,
     business: HashMap<String, String>,
     push: HashMap<String, String>,
+    /// LID ↔ phone-number JID (both directions): an address-book entry may
+    /// be keyed by either id while the chat uses the other.
+    alias: HashMap<String, String>,
+}
+
+/// Where names come from, for the info-level diagnostics. Counts only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct NameStats {
+    /// Entries per source.
+    pub saved: usize,
+    /// Business verified names.
+    pub business: usize,
+    /// Push names.
+    pub push: usize,
+    /// One-to-one chats in the list.
+    pub direct_chats: usize,
+    /// ... shown with an address-book name.
+    pub chats_saved: usize,
+    /// ... with a business name.
+    pub chats_business: usize,
+    /// ... with a push name ("~ Name").
+    pub chats_push: usize,
+    /// ... with the name the chat record carries.
+    pub chats_chat_name: usize,
+    /// ... with the number only.
+    pub chats_number: usize,
 }
 
 impl NameBook {
@@ -101,11 +127,29 @@ impl NameBook {
         self.map(source).get(jid).map(String::as_str)
     }
 
-    /// The best known name and where it comes from.
+    /// Records that `lid` and `pn` are the same person.
+    pub fn link(&mut self, lid: &str, pn: &str) {
+        self.alias.insert(lid.to_string(), pn.to_string());
+        self.alias.insert(pn.to_string(), lid.to_string());
+    }
+
+    /// The best known name and where it comes from, looking at the other id
+    /// of the same person (LID / phone number) too: a saved name under
+    /// either id beats a push name under either.
     pub fn best(&self, jid: &str) -> Option<(NameSource, &str)> {
+        let other = self.alias.get(jid);
         [NameSource::Saved, NameSource::Business, NameSource::Push]
             .into_iter()
-            .find_map(|src| self.get(jid, src).map(|n| (src, n)))
+            .find_map(|src| {
+                self.get(jid, src)
+                    .or_else(|| other.and_then(|o| self.get(o, src)))
+                    .map(|n| (src, n))
+            })
+    }
+
+    /// Number of entries per source `(saved, business, push)`.
+    pub fn counts(&self) -> (usize, usize, usize) {
+        (self.saved.len(), self.business.len(), self.push.len())
     }
 }
 
@@ -264,6 +308,31 @@ impl ChatList {
             Some(n) => Resolved::ChatName(n),
             None => Resolved::Number(fallback_name(jid)),
         }
+    }
+
+    /// Diagnostics: how the one-to-one chats are named right now.
+    pub fn name_stats(&self) -> NameStats {
+        let (saved, business, push) = self.names.counts();
+        let mut st = NameStats {
+            saved,
+            business,
+            push,
+            ..NameStats::default()
+        };
+        for e in &self.entries {
+            if e.is_group() || !e.meta.id.contains('@') || e.meta.id.ends_with("@broadcast") {
+                continue;
+            }
+            st.direct_chats += 1;
+            match self.resolve(&e.meta.id, None) {
+                Resolved::Saved(_) => st.chats_saved += 1,
+                Resolved::Business(_) => st.chats_business += 1,
+                Resolved::Push(_) => st.chats_push += 1,
+                Resolved::ChatName(_) => st.chats_chat_name += 1,
+                Resolved::Number(_) => st.chats_number += 1,
+            }
+        }
+        st
     }
 
     /// Display name for a chat or a sender ("~ Name" for push names).
@@ -578,6 +647,30 @@ impl ChatList {
     }
 
     /// Unread chats among the archived ones (badge on the "Archived" row).
+    /// The number on the rail's Chats icon: unread chats, like WhatsApp
+    /// Desktop (chats, not messages; archived and muted chats and status /
+    /// channel pseudo-chats excluded).
+    pub fn unread_chats(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.meta.unread > 0
+                    && !e.meta.archived
+                    && !e.meta.muted
+                    && !crate::net::is_pseudo_chat(&e.meta.id)
+            })
+            .count()
+    }
+
+    /// Marks a chat unread from another device (keeps a real count).
+    pub fn mark_unread(&mut self, chat: &str) {
+        if let Some(e) = self.get_mut(chat)
+            && e.meta.unread == 0
+        {
+            e.meta.unread = 1;
+        }
+    }
+
     pub fn archived_unread(&self) -> usize {
         self.entries
             .iter()
@@ -1189,6 +1282,85 @@ mod tests {
         // A flag for an unknown chat creates the row.
         l.apply_flag("new@s.whatsapp.net", ChatFlag::Archived(true));
         assert_eq!(l.archived_count(), 1);
+    }
+
+    #[test]
+    fn the_rail_badge_counts_unread_chats_not_messages() {
+        let mut l = ChatList::default();
+        let chat = |id: &str, unread: u32| ChatMeta {
+            id: id.into(),
+            unread,
+            last_ts: 1,
+            ..Default::default()
+        };
+        l.apply_history(
+            &[
+                chat("a@s.whatsapp.net", 120),
+                chat("b@s.whatsapp.net", 3),
+                chat("c@s.whatsapp.net", 0),
+                chat("status@broadcast", 250),
+                chat("123@newsletter", 9),
+                chat("muted@s.whatsapp.net", 4),
+                chat("arch@s.whatsapp.net", 5),
+            ],
+            &[],
+        );
+        l.apply_flag("muted@s.whatsapp.net", ChatFlag::Muted(true));
+        l.apply_flag("arch@s.whatsapp.net", ChatFlag::Archived(true));
+        assert_eq!(
+            l.unread_chats(),
+            2,
+            "a and b; not messages, status, channels, muted or archived"
+        );
+        l.mark_read("a@s.whatsapp.net");
+        assert_eq!(l.unread_chats(), 1);
+        // Marked unread on the phone: one, without inventing a count.
+        l.mark_unread("c@s.whatsapp.net");
+        assert_eq!(l.get("c@s.whatsapp.net").unwrap().meta.unread, 1);
+        l.mark_unread("b@s.whatsapp.net");
+        assert_eq!(l.get("b@s.whatsapp.net").unwrap().meta.unread, 3);
+        assert_eq!(l.unread_chats(), 2);
+    }
+
+    #[test]
+    fn a_saved_name_under_the_other_id_wins_over_a_push_name() {
+        let mut b = NameBook::default();
+        b.set("1@s.whatsapp.net", NameSource::Push, "Pushy");
+        b.set("9@lid", NameSource::Saved, "Saved Name");
+        assert_eq!(
+            b.best("1@s.whatsapp.net"),
+            Some((NameSource::Push, "Pushy"))
+        );
+        b.link("9@lid", "1@s.whatsapp.net");
+        assert_eq!(
+            b.best("1@s.whatsapp.net"),
+            Some((NameSource::Saved, "Saved Name"))
+        );
+        assert_eq!(b.best("9@lid"), Some((NameSource::Saved, "Saved Name")));
+        // The id's own saved name still beats the alias's.
+        b.set("1@s.whatsapp.net", NameSource::Saved, "Own");
+        assert_eq!(b.best("1@s.whatsapp.net"), Some((NameSource::Saved, "Own")));
+        assert_eq!(b.counts(), (2, 0, 1));
+    }
+
+    #[test]
+    fn name_stats_count_sources_without_names() {
+        let mut l = list();
+        l.apply_history(
+            &[ChatMeta {
+                id: "1@s.whatsapp.net".into(),
+                last_ts: 3,
+                ..Default::default()
+            }],
+            &[],
+        );
+        l.set_name("1@s.whatsapp.net", NameSource::Saved, "X");
+        let st = l.name_stats();
+        assert_eq!(st.saved, 1);
+        assert_eq!(st.chats_saved, 1);
+        // "a" is not a JID and the group is not a person: neither counts.
+        assert_eq!(st.direct_chats, 1);
+        assert!(!format!("{st:?}").contains('X'));
     }
 
     #[test]

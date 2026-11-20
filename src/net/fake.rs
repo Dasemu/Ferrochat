@@ -14,8 +14,8 @@ use futures::stream::Stream;
 use tokio::sync::mpsc;
 
 use super::types::{
-    ChatFlag, ChatState, Content, ListDef, MediaRef, Message, MsgKey, NameSource, Origin,
-    OutgoingMedia, Quote, ReceiptStatus,
+    ChatFlag, ChatState, CollectionResync, Content, ListDef, MediaRef, Message, MsgKey, NameSource,
+    Origin, OutgoingMedia, Quote, ReceiptStatus, ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::error::{Error, Result};
@@ -176,6 +176,8 @@ pub struct FakeClient {
     media: Mutex<HashMap<String, Vec<u8>>>,
     avatars: HashMap<String, Vec<u8>>,
     pending_pair: Mutex<Option<(Vec<Event>, Vec<Message>)>>,
+    resync_reports: Mutex<std::collections::VecDeque<ResyncReport>>,
+    lid_pairs: Mutex<Vec<(String, String)>>,
 }
 
 impl FakeClient {
@@ -207,6 +209,20 @@ impl FakeClient {
                 messages,
                 origin: Origin::History,
             });
+        }
+    }
+
+    /// Scripts the outcome of the next resync requests (tests).
+    pub fn script_resync(&self, reports: Vec<ResyncReport>) {
+        if let Ok(mut q) = self.resync_reports.lock() {
+            q.extend(reports);
+        }
+    }
+
+    /// LID pairs the "library" reports as already known (tests).
+    pub fn set_known_lid_pairs(&self, pairs: Vec<(String, String)>) {
+        if let Ok(mut p) = self.lid_pairs.lock() {
+            *p = pairs;
         }
     }
 
@@ -620,11 +636,28 @@ impl WaClient for FakeClient {
         })
     }
 
-    fn resync_app_state(&self) -> BoxFuture<'_, Result<()>> {
+    fn resync_app_state(&self) -> BoxFuture<'_, Result<ResyncReport>> {
         Box::pin(async move {
             self.record(Sent::Resync);
-            Ok(())
+            let scripted = self
+                .resync_reports
+                .lock()
+                .ok()
+                .and_then(|mut q| q.pop_front());
+            Ok(scripted.unwrap_or_else(|| ResyncReport {
+                collections: vec![CollectionResync {
+                    name: "critical_unblock_low",
+                    before: 3,
+                    after: 4,
+                }],
+                had_sync_key: true,
+                contacts: 1,
+            }))
         })
+    }
+
+    fn known_lid_pairs(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
+        Box::pin(async move { Ok(self.lid_pairs.lock().map(|p| p.clone()).unwrap_or_default()) })
     }
 
     fn simulate_scan(&self) {
@@ -690,6 +723,8 @@ pub fn start(
         media: Mutex::new(data.media),
         avatars: data.avatars,
         pending_pair: Mutex::new(None),
+        resync_reports: Mutex::new(std::collections::VecDeque::new()),
+        lid_pairs: Mutex::new(Vec::new()),
     });
     let _ = tx.send(if opts.paired {
         Event::SessionFound

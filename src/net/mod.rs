@@ -95,10 +95,15 @@ pub trait WaClient: Send + Sync {
         chat: &'a str,
         member: bool,
     ) -> BoxFuture<'a, Result<()>>;
-    /// Asks the server for a full app-state snapshot (contacts, archive,
-    /// pins, lists) so names saved on the phone arrive even when the
-    /// collections were synced before this client used them.
-    fn resync_app_state(&self) -> BoxFuture<'_, Result<()>>;
+    /// Forces a full app-state snapshot (contacts, archive, pins, lists) so
+    /// names saved on the phone arrive even when the collections were synced
+    /// before this client used them. Reports what was applied.
+    fn resync_app_state(&self) -> BoxFuture<'_, Result<ResyncReport>>;
+    /// LID ↔ phone-number pairs the protocol library already knows
+    /// (`(lid, pn)` JIDs), so names keyed by either id meet.
+    fn known_lid_pairs(&self) -> BoxFuture<'_, Result<Vec<(String, String)>>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
     /// Unlinks this device, disconnects and deletes the session store.
     fn logout(&self) -> BoxFuture<'_, Result<()>>;
     /// `--mock` only: pretend the phone scanned the QR code. The live client
@@ -285,6 +290,12 @@ pub enum Event {
         /// Now a member.
         member: bool,
     },
+    /// Chat marked unread on another device (app-state `markChatAsRead`
+    /// with `read = false`).
+    ChatMarkedUnread {
+        /// Chat.
+        chat: ChatId,
+    },
     /// Chat marked read on another device.
     ChatRead {
         /// Chat.
@@ -340,6 +351,7 @@ impl fmt::Debug for Event {
             Event::ListEdit { deleted, .. } => write!(f, "ListEdit(deleted={deleted})"),
             Event::ListChat { member, .. } => write!(f, "ListChat(member={member})"),
             Event::ChatRead { .. } => write!(f, "ChatRead"),
+            Event::ChatMarkedUnread { .. } => write!(f, "ChatMarkedUnread"),
             Event::LidMappings(p) => write!(f, "LidMappings(n={})", p.len()),
             Event::SessionUnreadable(_) => write!(f, "SessionUnreadable"),
             Event::Fatal(_) => write!(f, "Fatal"),

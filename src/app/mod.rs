@@ -12,6 +12,8 @@ pub use background::WindowGeom;
 mod flows;
 pub mod live;
 pub mod message;
+#[cfg(test)]
+mod perf;
 pub mod state;
 #[cfg(test)]
 mod test_support;
@@ -65,10 +67,33 @@ pub const MAX_STICKER_BYTES: u64 = 2 * 1024 * 1024;
 /// Videos kept in the cache directory.
 pub const MAX_VIDEO_FILES: usize = 4;
 /// Cache key / value recording that the full app-state resync was requested.
+/// `"1"` was written by v0.8.0 whether or not the snapshot was applied (it
+/// never was: see `RealClient::resync_app_state`), so only `"2"` counts.
 const RESYNC_KEY: &str = "appstate_resync";
-const RESYNC_VERSION: &str = "1";
+const RESYNC_VERSION: &str = "2";
+/// Resync attempts per run before waiting for the next start.
+const RESYNC_MAX_ATTEMPTS: u32 = 4;
+/// An account whose snapshot applied with no contact at all is done after
+/// this many attempts (it may really have an empty address book).
+const RESYNC_MAX_EMPTY: u32 = 3;
+/// Delay before retrying a resync that did not deliver.
+#[cfg(not(test))]
+const RESYNC_RETRY: Duration = Duration::from_secs(45);
+#[cfg(test)]
+const RESYNC_RETRY: Duration = Duration::from_millis(1);
 /// Unprocessed reactions / edits buffered behind a message insert.
 const MAX_DEFERRED: usize = 5000;
+
+/// Progress of the forced app-state resync in this run.
+#[derive(Debug, Default)]
+struct Resync {
+    /// Delivered (or already recorded in the cache).
+    done: bool,
+    /// A request is in flight.
+    running: bool,
+    /// Requests made in this run.
+    attempts: u32,
+}
 
 /// What a message's floating popup shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,8 +226,8 @@ pub struct App {
     video_session: u32,
     /// The window is full screen because of the video viewer.
     pub(crate) video_fullscreen: bool,
-    /// The one-time full app-state resync (names, archive, lists) ran.
-    resync_done: bool,
+    /// The one-time full app-state resync (names, archive, lists).
+    resync: Resync,
     /// Message under the pointer (hover actions).
     pub(crate) hovered: Option<String>,
     /// Open reaction picker / menu.
@@ -391,8 +416,10 @@ impl App {
         let own_jid = store.kv("own_jid").ok().flatten();
         let _ = store.prune_expired(now_secs());
         let mut lid_map = LidMap::default();
+        let mut chats = chats;
         for (lid, pn) in store.lid_pairs().unwrap_or_default() {
             lid_map.learn(&lid, &pn);
+            chats.names.link(&lid, &pn);
         }
         let secrets: Arc<dyn SecretStore> = if cfg.mock {
             Arc::new(MemoryStore::new())
@@ -435,7 +462,7 @@ impl App {
             video: None,
             video_session: 0,
             video_fullscreen: false,
-            resync_done: false,
+            resync: Resync::default(),
             sidebar_menu: None,
             list_dialog: None,
             open: None,
@@ -1522,7 +1549,7 @@ impl App {
                     self.own_jid = Some(j.clone());
                 }
                 self.advance_auth(AuthEvent::Connected { jid: jid.clone() });
-                let resync = self.maybe_resync();
+                let resync = Task::batch([self.import_lid_pairs(), self.maybe_resync()]);
                 if let Some(j) = jid {
                     return Task::batch([
                         store_task(&self.store, move |s| s.set_kv("own_jid", &j)),
@@ -1647,12 +1674,26 @@ impl App {
                     s.set_list_member(&list, &chat, member)
                 });
             }
+            Event::ChatMarkedUnread { chat } => {
+                let chat = self.lid_map.normalize(&chat);
+                self.chats.mark_unread(&chat);
+                let n = self.chats.get(&chat).map(|e| e.meta.unread).unwrap_or(0);
+                if n == 0 {
+                    return Task::none();
+                }
+                return store_task(&self.store, move |s| s.set_unread(&chat, n));
+            }
             Event::ChatRead { chat } => {
                 let chat = self.lid_map.normalize(&chat);
                 self.chats.mark_read(&chat);
                 return store_task(&self.store, move |s| s.set_unread(&chat, 0));
             }
             Event::LidMappings(pairs) => {
+                for (lid, pn) in &pairs {
+                    if crate::net::is_lid_pair(lid, pn) {
+                        self.chats.names.link(lid, pn);
+                    }
+                }
                 let learned: Vec<_> = pairs
                     .into_iter()
                     .filter(|(lid, pn)| self.lid_map.learn(lid, pn))
@@ -1699,32 +1740,113 @@ impl App {
         Task::none()
     }
 
-    /// Asks for a full app-state snapshot once per cache. Sessions linked by
-    /// an older Ferrochat already hold the contact / archive / list
-    /// collections at their latest version, so the mutations that carry the
-    /// address-book names would never be replayed otherwise.
+    /// Asks for a full app-state snapshot until one delivered, once per
+    /// cache. Sessions linked by an older Ferrochat already hold the contact
+    /// / archive / list collections at their latest version, so the
+    /// mutations that carry the address-book names would never be replayed
+    /// otherwise. A resync that did not deliver is retried
+    /// ([`RESYNC_RETRY`], at most [`RESYNC_MAX_ATTEMPTS`] per run) and the
+    /// marker is only written after a success.
     fn maybe_resync(&mut self) -> Task<Message> {
-        if self.resync_done {
+        if self.resync.done || self.resync.running {
             return Task::none();
         }
         let Some(client) = self.client.clone() else {
             return Task::none();
         };
         if self.store.kv(RESYNC_KEY).ok().flatten().as_deref() == Some(RESYNC_VERSION) {
-            self.resync_done = true;
+            tracing::info!("app-state resync: already done for this cache");
+            self.resync.done = true;
             return Task::none();
         }
-        self.resync_done = true;
-        let store = self.store.clone();
+        if self.resync.attempts >= RESYNC_MAX_ATTEMPTS {
+            return Task::none();
+        }
+        self.resync.attempts += 1;
+        self.resync.running = true;
+        let attempt = self.resync.attempts;
+        tracing::info!("app-state resync: requesting full snapshots (attempt {attempt})");
         Task::perform(
-            async move {
-                client.resync_app_state().await.map_err(|e| e.to_string())?;
-                tokio::task::spawn_blocking(move || store.set_kv(RESYNC_KEY, RESYNC_VERSION))
-                    .await
-                    .map_err(|e| e.to_string())?
-                    .map_err(|e| e.to_string())
+            async move { client.resync_app_state().await.map_err(|e| e.to_string()) },
+            move |result| Message::done(Done::Resync { attempt, result }),
+        )
+    }
+
+    fn on_resync(
+        &mut self,
+        attempt: u32,
+        result: Result<net::ResyncReport, String>,
+    ) -> Task<Message> {
+        self.resync.running = false;
+        let ok = match &result {
+            Ok(r) => {
+                let applied = r.collections.iter().filter(|c| c.applied()).count();
+                tracing::info!(
+                    "app-state resync attempt {attempt}: {applied}/{} collections applied, \
+                     {} contact entries, sync key stored before: {}",
+                    r.collections.len(),
+                    r.contacts,
+                    r.had_sync_key
+                );
+                r.succeeded(attempt, RESYNC_MAX_EMPTY)
+            }
+            Err(e) => {
+                tracing::warn!("app-state resync attempt {attempt} failed: {e}");
+                false
+            }
+        };
+        self.log_name_stats("after app-state resync");
+        if ok {
+            self.resync.done = true;
+            return store_task(&self.store, |s| s.set_kv(RESYNC_KEY, RESYNC_VERSION));
+        }
+        if self.resync.attempts >= RESYNC_MAX_ATTEMPTS {
+            tracing::warn!(
+                "app-state resync: no address book after {attempt} attempts; trying again at the \
+                 next start"
+            );
+            return Task::none();
+        }
+        tracing::info!("app-state resync: retrying in {} s", RESYNC_RETRY.as_secs());
+        Task::perform(async { tokio::time::sleep(RESYNC_RETRY).await }, |_| {
+            Message::done(Done::ResyncDue)
+        })
+    }
+
+    /// Info-level summary of where names come from. Counts only.
+    fn log_name_stats(&self, when: &str) {
+        let st = self.chats.name_stats();
+        tracing::info!(
+            "names {when}: saved={} business={} push={} lid_pairs={}; direct chats {} \
+             (saved {}, business {}, push {}, chat record {}, number only {})",
+            st.saved,
+            st.business,
+            st.push,
+            self.lid_map.len(),
+            st.direct_chats,
+            st.chats_saved,
+            st.chats_business,
+            st.chats_push,
+            st.chats_chat_name,
+            st.chats_number
+        );
+    }
+
+    /// Imports the LID ↔ phone pairs the protocol library learned (usync,
+    /// device lists, earlier history syncs) into our map.
+    fn import_lid_pairs(&self) -> Task<Message> {
+        let Some(client) = self.client.clone() else {
+            return Task::none();
+        };
+        Task::perform(
+            async move { client.known_lid_pairs().await.unwrap_or_default() },
+            |pairs| {
+                if pairs.is_empty() {
+                    Message::done(Done::Nothing)
+                } else {
+                    Message::Net(Event::LidMappings(pairs))
+                }
             },
-            |r| Message::done(Done::Stored(r)),
         )
     }
 
@@ -2123,6 +2245,8 @@ impl App {
                 error,
             } => return self.on_member_failed(list, chat, undo, error),
             Done::Stored(Ok(())) | Done::Nothing => {}
+            Done::Resync { attempt, result } => return self.on_resync(attempt, result),
+            Done::ResyncDue => return self.maybe_resync(),
             Done::CleanedUp(problems) => {
                 if !problems.is_empty() {
                     tracing::warn!(?problems, "logout cleanup incomplete");
