@@ -125,6 +125,94 @@ pub fn outgoing_from_file(path: &Path, bytes: Vec<u8>, caption: Option<String>) 
     }
 }
 
+/// Longest side of a pasted photo: WhatsApp's standard photo quality.
+pub const MAX_PHOTO_SIDE: u32 = 1600;
+/// JPEG quality of pasted photos.
+const PHOTO_QUALITY: u8 = 82;
+/// Longest side of the attachment preview tile.
+pub const PREVIEW_SIDE: u32 = 960;
+
+fn encode_jpeg(img: &image::RgbImage, quality: u8) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut out), quality)
+        .encode_image(img)
+        .map_err(media_err)?;
+    Ok(out)
+}
+
+/// Turns raw RGBA pixels (a copied image) into a JPEG photo the way WhatsApp
+/// sends photos: transparency flattened onto white, the longest side capped
+/// at [`MAX_PHOTO_SIDE`], plus the inline thumbnail. Oversized or short
+/// buffers are errors, never panics.
+pub fn outgoing_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<OutgoingMedia> {
+    let w = u32::try_from(width).map_err(media_err)?;
+    let h = u32::try_from(height).map_err(media_err)?;
+    if w == 0 || h == 0 {
+        return Err(Error::Media("empty image".into()));
+    }
+    if u64::from(w) * u64::from(h) > crate::media::MAX_IMAGE_PIXELS {
+        return Err(Error::Media(format!("image too large ({w}x{h})")));
+    }
+    let len = width
+        .checked_mul(height)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| Error::Media("image too large".into()))?;
+    let Some(px) = rgba.get(..len) else {
+        return Err(Error::Media("truncated image data".into()));
+    };
+    let blend = |c: u8, a: u8| -> u8 {
+        let (c, a) = (u16::from(c), u16::from(a));
+        ((c * a + 255 * (255 - a) + 127) / 255) as u8
+    };
+    let rgb: Vec<u8> = px
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, a]| [blend(r, a), blend(g, a), blend(b, a)])
+        .collect();
+    let mut img = image::RgbImage::from_raw(w, h, rgb)
+        .ok_or_else(|| Error::Media("bad image buffer".into()))?;
+    if w.max(h) > MAX_PHOTO_SIDE {
+        img = image::DynamicImage::ImageRgb8(img)
+            .resize(
+                MAX_PHOTO_SIDE,
+                MAX_PHOTO_SIDE,
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgb8();
+    }
+    let thumb = image::DynamicImage::ImageRgb8(img.clone())
+        .thumbnail(THUMB_SIDE, THUMB_SIDE)
+        .to_rgb8();
+    Ok(OutgoingMedia {
+        kind: OutgoingKind::Image {
+            width: img.width(),
+            height: img.height(),
+            thumbnail: encode_jpeg(&thumb, 70)?,
+        },
+        bytes: encode_jpeg(&img, PHOTO_QUALITY)?,
+        file_name: "image.jpg".into(),
+        mimetype: "image/jpeg".into(),
+        caption: None,
+    })
+}
+
+/// Downscaled RGBA pixels `(width, height, rgba)` for the attachment
+/// preview of a photo; `None` for documents or undecodable data.
+pub fn preview_rgba(media: &OutgoingMedia) -> Option<(u32, u32, Vec<u8>)> {
+    if !matches!(media.kind, OutgoingKind::Image { .. }) {
+        return None;
+    }
+    let img = decode_limited(&media.bytes).ok()?;
+    let img = if img.width().max(img.height()) > PREVIEW_SIDE {
+        img.thumbnail(PREVIEW_SIDE, PREVIEW_SIDE)
+    } else {
+        img
+    };
+    let rgba = img.to_rgba8();
+    Some((rgba.width(), rgba.height(), rgba.into_raw()))
+}
+
 /// Human-readable size (`1.2 MB`, `340 kB`).
 pub fn human_size(bytes: u64) -> String {
     const KB: f64 = 1000.0;
@@ -186,6 +274,56 @@ mod tests {
         out[20..24].copy_from_slice(&20_000u32.to_be_bytes());
         assert!(check_image_bounds(&out).is_err());
         assert!(check_image_bounds(&png(10, 10)).is_ok());
+    }
+
+    #[test]
+    fn pasted_pixels_become_a_jpeg_photo() {
+        // 2x1: opaque red, fully transparent (flattened to white).
+        let px = [255, 0, 0, 255, 0, 0, 0, 0];
+        let m = outgoing_from_rgba(2, 1, &px).unwrap();
+        assert_eq!(m.mimetype, "image/jpeg");
+        assert!(m.bytes.starts_with(&[0xFF, 0xD8]), "JPEG magic");
+        let OutgoingKind::Image {
+            width,
+            height,
+            thumbnail,
+        } = &m.kind
+        else {
+            panic!("not an image: {:?}", m.kind);
+        };
+        assert_eq!((*width, *height), (2, 1));
+        assert!(thumbnail.starts_with(&[0xFF, 0xD8]));
+        let back = image::load_from_memory(&m.bytes).unwrap().to_rgb8();
+        let white = back.get_pixel(1, 0);
+        assert!(white.0.iter().all(|&c| c > 230), "transparent -> white");
+        let (pw, ph, rgba) = preview_rgba(&m).unwrap();
+        assert_eq!((pw, ph, rgba.len()), (2, 1, 8));
+    }
+
+    #[test]
+    fn pasted_pixels_are_scaled_and_bounded() {
+        let (w, h) = (3200usize, 1000usize);
+        let px = vec![200u8; w * h * 4];
+        let m = outgoing_from_rgba(w, h, &px).unwrap();
+        assert!(matches!(
+            m.kind,
+            OutgoingKind::Image {
+                width: MAX_PHOTO_SIDE,
+                height: 500,
+                ..
+            }
+        ));
+        let (pw, ph, _) = preview_rgba(&m).unwrap();
+        assert_eq!((pw, ph), (PREVIEW_SIDE, 300));
+        assert!(outgoing_from_rgba(0, 10, &px).is_err(), "empty");
+        assert!(outgoing_from_rgba(4, 4, &px[..10]).is_err(), "short buffer");
+        assert!(
+            outgoing_from_rgba(100_000, 100_000, &px).is_err(),
+            "pixel cap"
+        );
+        assert!(outgoing_from_rgba(usize::MAX, 2, &px).is_err(), "overflow");
+        let doc = outgoing_from_file(Path::new("/x/a.pdf"), b"%PDF".to_vec(), None);
+        assert!(preview_rgba(&doc).is_none());
     }
 
     #[test]
