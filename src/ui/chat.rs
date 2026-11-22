@@ -15,7 +15,8 @@ use super::{
 use crate::app::live::typing_label;
 use crate::app::state::{Conversation, reaction_summary};
 use crate::app::{
-    App, CHAT_SEARCH_ID, COMPOSER_ID, CONVERSATION_SCROLL, Dialog, Message, Popup, Ui, row_id,
+    ATTACH_CAPTION_ID, App, CHAT_SEARCH_ID, COMPOSER_ID, CONVERSATION_SCROLL, Dialog, Message,
+    Popup, Ui, row_id,
 };
 use crate::media::image::human_size;
 use crate::net::{
@@ -236,6 +237,9 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         .height(Length::Fill)
         .style(theme::solid(p.bg_panel));
 
+    if let Some(a) = app.attach.as_ref().filter(|a| a.chat == conv.chat) {
+        return column![header, attach_preview(app, a)].into();
+    }
     let mut body = column![header];
     if let Some(cs) = &app.chat_search {
         body = body.push(search_bar(app, cs));
@@ -484,6 +488,76 @@ fn emoji_panel(t: &FerroTheme) -> El<'_> {
     )
     .height(Length::Fill)
     .align_y(Alignment::End)
+    .into()
+}
+
+/// Attachment preview (picked or pasted media): replaces the messages and
+/// the composer until the media is sent or discarded, like WhatsApp Desktop.
+fn attach_preview<'a>(app: &'a App, a: &'a crate::app::paste::AttachPreview) -> El<'a> {
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let Some(first) = a.items.first() else {
+        return Space::new().into();
+    };
+    let title = match a.items.len() {
+        1 => first.file_name.clone(),
+        n => format!("{} and {} more", first.file_name, n - 1),
+    };
+    let top = row![
+        button(icon(Icon::X, 22.0, p.text_secondary))
+            .padding(8)
+            .style(theme::icon_button(t, false))
+            .on_press(Message::Ui(Ui::AttachCancel)),
+        text(title)
+            .size(m.text)
+            .color(p.text_primary)
+            .wrapping(Wrapping::None),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center)
+    .padding([8, 16]);
+    let content: El<'a> = match &a.handle {
+        Some(h) => image(h.clone()).content_fit(ContentFit::ScaleDown).into(),
+        None => column![
+            icon(Icon::FileText, 72.0, p.text_secondary),
+            text(first.file_name.clone())
+                .size(m.text + 1.0)
+                .color(p.text_primary),
+            text(human_size(first.bytes.len() as u64))
+                .size(m.text - 1.0)
+                .color(p.text_secondary),
+        ]
+        .spacing(10)
+        .align_x(Alignment::Center)
+        .into(),
+    };
+    let caption = container(
+        text_input("Add a caption", &a.caption)
+            .id(ATTACH_CAPTION_ID)
+            .on_input(|s| Message::Ui(Ui::AttachCaption(s)))
+            .on_submit(Message::Ui(Ui::AttachSend))
+            .size(m.text + 0.5)
+            .padding([9, 12])
+            .style(theme::input(t)),
+    )
+    .padding([2, 8])
+    .width(Length::Fill)
+    .style(theme::rounded(p.bg_selected, 22.0));
+    let send = button(icon(Icon::SendHorizontal, 20.0, p.accent_text))
+        .padding(11)
+        .style(theme::primary_button(t))
+        .on_press(Message::Ui(Ui::AttachSend));
+    container(column![
+        top,
+        center(content).padding(32),
+        container(row![caption, send].spacing(10).align_y(Alignment::Center))
+            .padding([12, 16])
+            .style(theme::solid(p.bg_elevated)),
+    ])
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .style(theme::solid(p.bg_panel))
     .into()
 }
 

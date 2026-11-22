@@ -51,6 +51,8 @@ pub enum ScreenshotTarget {
     Starred,
     /// The chats header "⋮" menu.
     HeaderMenu,
+    /// Conversation with the attachment preview of a pasted image.
+    Paste,
 }
 
 impl ScreenshotTarget {
@@ -114,6 +116,7 @@ impl ScreenshotTarget {
             "new-group-name" => Some(Self::NewGroupName),
             "starred" => Some(Self::Starred),
             "header-menu" | "menu-header" => Some(Self::HeaderMenu),
+            "paste" | "attach" => Some(Self::Paste),
             _ => None,
         }
     }
