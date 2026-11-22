@@ -165,8 +165,10 @@ pub fn outgoing_from_rgba(width: usize, height: usize, rgba: &[u8]) -> Result<Ou
         ((c * a + 255 * (255 - a) + 127) / 255) as u8
     };
     let rgb: Vec<u8> = px
-        .chunks_exact(4)
-        .flat_map(|p| [blend(p[0], p[3]), blend(p[1], p[3]), blend(p[2], p[3])])
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|&[r, g, b, a]| [blend(r, a), blend(g, a), blend(b, a)])
         .collect();
     let mut img = image::RgbImage::from_raw(w, h, rgb)
         .ok_or_else(|| Error::Media("bad image buffer".into()))?;
