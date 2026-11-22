@@ -13,6 +13,7 @@ mod flows;
 pub mod live;
 pub mod message;
 pub mod nav;
+pub mod paste;
 #[cfg(test)]
 mod perf;
 #[cfg(test)]
@@ -56,6 +57,8 @@ pub const PAGE: usize = 60;
 pub const IMAGE_BUDGET: usize = 48 * 1024 * 1024;
 /// Id of the composer text input (focus after "reply" / "edit").
 pub const COMPOSER_ID: &str = "composer";
+/// Id of the caption input of the attachment preview.
+pub const ATTACH_CAPTION_ID: &str = "attach-caption";
 /// Id of the in-chat search input.
 pub const CHAT_SEARCH_ID: &str = "chat-search";
 /// Decoded profile pictures kept in memory (about 36 kB each).
@@ -202,6 +205,8 @@ pub struct App {
     pending_read: usize,
     pub(crate) composer: String,
     pub(crate) emoji_open: bool,
+    /// Attachment preview (picked or pasted media waiting for "send").
+    pub(crate) attach: Option<paste::AttachPreview>,
     pub(crate) menu_open: bool,
     pub(crate) qr: Option<image::Handle>,
     pub(crate) images: ByteLru<String, image::Handle>,
@@ -480,6 +485,7 @@ impl App {
             pending_read: 0,
             composer: String::new(),
             emoji_open: false,
+            attach: None,
             menu_open: false,
             qr: None,
             images: ByteLru::new(IMAGE_BUDGET),
@@ -565,6 +571,8 @@ impl App {
             tasks.push(Task::perform(
                 tokio::time::sleep(Duration::from_millis(match app.cfg.screenshot {
                     Some((ScreenshotTarget::Video, _)) => 9000,
+                    // Encodes a photo after the history loads.
+                    Some((ScreenshotTarget::Paste, _)) => 6000,
                     // Scenes that wait for statuses, stars or communities.
                     Some((t, _)) if t.is_nav() => 6000,
                     _ => 2500,
@@ -619,6 +627,16 @@ impl App {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
                     ..
                 }) => Some(Message::Ui(Ui::CloseChat)),
+                // Paste: the composer's text input pastes text itself; this
+                // only looks for a copied image or files (see `app::paste`).
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key,
+                    physical_key,
+                    modifiers,
+                    ..
+                }) if paste::is_paste_shortcut(&key, physical_key, modifiers) => {
+                    Some(Message::Ui(Ui::Paste))
+                }
                 // Space pauses the video viewer, unless a text field took it.
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
@@ -757,6 +775,7 @@ impl App {
                     || self.list_dialog.take().is_some()
                     || self.sidebar_menu.take().is_some()
                     || self.dialog.take().is_some()
+                    || self.attach.take().is_some()
                     || self.popup.take().is_some()
                     || self.video.is_some() && {
                         close_video = Some(self.close_video());
@@ -794,32 +813,34 @@ impl App {
             }
             Ui::Attach => {
                 self.emoji_open = false;
+                let Some(chat) = self.open.as_ref().map(|c| c.chat.clone()) else {
+                    return Task::none();
+                };
                 return Task::perform(
                     async {
-                        let file = rfd::AsyncFileDialog::new()
-                            .set_title("Send a photo or document")
-                            .pick_file()
+                        let files = rfd::AsyncFileDialog::new()
+                            .set_title("Send photos or documents")
+                            .pick_files()
                             .await?;
-                        let path = file.path().to_path_buf();
-                        let res = tokio::task::spawn_blocking(move || {
-                            // Check the size before reading anything into memory.
-                            let len = std::fs::metadata(&path).map_err(|e| e.to_string())?.len();
-                            if len > crate::media::MAX_DOWNLOAD_BYTES {
-                                return Err("Files over 100 MB cannot be sent.".to_string());
-                            }
-                            let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
-                            Ok(Box::new(crate::media::image::outgoing_from_file(
-                                &path, bytes, None,
-                            )))
+                        let paths: Vec<PathBuf> =
+                            files.iter().map(|f| f.path().to_path_buf()).collect();
+                        tokio::task::spawn_blocking(move || {
+                            Box::new(paste::Staged::from_paths(paths, false))
                         })
                         .await
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| r);
-                        Some(res)
+                        .ok()
                     },
-                    |r| Message::done(Done::Prepared(r)),
+                    move |staged| Message::done(Done::Staged { chat, staged }),
                 );
             }
+            Ui::Paste => return self.paste(),
+            Ui::AttachCaption(c) => {
+                if let Some(a) = &mut self.attach {
+                    a.caption = c;
+                }
+            }
+            Ui::AttachSend => return self.send_attachment(),
+            Ui::AttachCancel => self.attach = None,
             Ui::ToggleEmoji => self.emoji_open = !self.emoji_open,
             Ui::Emoji(e) => self.composer.push_str(e),
             Ui::StartRecording => {
@@ -1003,6 +1024,7 @@ impl App {
         let paused = self.compose_stop();
         self.open = Some(Conversation::new(chat.clone(), Vec::new(), false));
         self.composer.clear();
+        self.attach = None;
         self.reply_to = None;
         self.editing = None;
         self.popup = None;
@@ -1135,6 +1157,80 @@ impl App {
             |(chat, id, result)| Message::done(Done::MediaSent { chat, id, result }),
         );
         Task::batch([t1, t2])
+    }
+
+    /// Ctrl+V: if the composer has focus and the clipboard holds an image or
+    /// copied files (and no text), open the attachment preview. The text
+    /// input pastes text by itself; the clipboard is read off the UI thread.
+    fn paste(&mut self) -> Task<Message> {
+        if self.attach.is_some() || self.editing.is_some() || self.recording_since.is_some() {
+            return Task::none();
+        }
+        let Some(chat) = self.open.as_ref().map(|c| c.chat.clone()) else {
+            return Task::none();
+        };
+        operation::is_focused(COMPOSER_ID).then(move |focused| {
+            if !focused {
+                return Task::none();
+            }
+            let chat = chat.clone();
+            Task::perform(
+                async {
+                    tokio::task::spawn_blocking(|| paste::stage(paste::read_clipboard()))
+                        .await
+                        .ok()
+                        .flatten()
+                        .map(Box::new)
+                },
+                move |staged| Message::done(Done::Staged { chat, staged }),
+            )
+        })
+    }
+
+    /// Picked or pasted media is ready: show the preview (the preview image
+    /// handle is made here, never in `view`).
+    fn on_staged(&mut self, chat: String, staged: Option<Box<paste::Staged>>) -> Task<Message> {
+        let Some(staged) = staged else {
+            return Task::none();
+        };
+        if self.open.as_ref().is_none_or(|c| c.chat != chat) {
+            return Task::none();
+        }
+        let staged = *staged;
+        if let Some(text) = paste::strip_pasted_paths(&self.composer, &staged.pasted_paths) {
+            self.composer = text;
+        }
+        if let Some(first) = staged.problems.first() {
+            let more = staged.problems.len() - 1;
+            self.toast(if more > 0 {
+                format!("{first} (and {more} more)")
+            } else {
+                first.clone()
+            });
+        }
+        let Some(preview) = paste::AttachPreview::new(chat, staged) else {
+            return Task::none();
+        };
+        self.emoji_open = false;
+        self.popup = None;
+        self.attach = Some(preview);
+        operation::focus(ATTACH_CAPTION_ID)
+    }
+
+    /// Sends the previewed media through the normal upload path.
+    fn send_attachment(&mut self) -> Task<Message> {
+        let Some(preview) = self.attach.take() else {
+            return Task::none();
+        };
+        if self.open.as_ref().is_none_or(|c| c.chat != preview.chat) {
+            return Task::none();
+        }
+        let tasks: Vec<_> = preview
+            .into_outgoing()
+            .into_iter()
+            .map(|m| self.send_media(m))
+            .collect();
+        Task::batch(tasks).chain(operation::focus(COMPOSER_ID))
     }
 
     fn retry(&mut self, id: &str) -> Task<Message> {
@@ -2224,6 +2320,7 @@ impl App {
             Done::Prepared(Some(Ok(media))) => return self.send_media(*media),
             Done::Prepared(Some(Err(e))) => self.toast(e),
             Done::Prepared(None) => {}
+            Done::Staged { chat, staged } => return self.on_staged(chat, staged),
             Done::DocumentOpened(Ok((path, dangerous))) => {
                 if dangerous {
                     self.toast(format!(
@@ -2373,6 +2470,24 @@ impl App {
                 v.push(ui(Ui::ChatSearch("café".into())));
             }
             ScreenshotTarget::ListSearch => v.push(ui(Ui::Search("hola".into()))),
+            ScreenshotTarget::Paste => {
+                // What a pasted screenshot goes through, minus the clipboard.
+                let staged = ::image::load_from_memory(&crate::mock::sunset_png(800, 500))
+                    .ok()
+                    .map(|i| {
+                        let i = i.to_rgba8();
+                        paste::Staged::from_image(&paste::RawImage {
+                            width: i.width() as usize,
+                            height: i.height() as usize,
+                            rgba: i.into_raw(),
+                        })
+                    });
+                v.push(Task::done(Message::done(Done::Staged {
+                    chat: c.chat.clone(),
+                    staged: staged.map(Box::new),
+                })));
+                v.push(ui(Ui::AttachCaption("Look at this sunset".into())));
+            }
             ScreenshotTarget::Delete => {
                 if let Some(a) = find("Llevo yo el café") {
                     v.push(ui(Ui::AskDelete(a)));

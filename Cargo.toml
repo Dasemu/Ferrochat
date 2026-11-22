@@ -1,6 +1,6 @@
 [package]
 name = "ferrochat"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 rust-version = "1.94"
 description = "Unofficial lightweight native WhatsApp desktop client written in Rust"
@@ -67,6 +67,8 @@ audiopus_sys = { version = "0.2", features = ["static"] }
 # Opens documents without a shell (ShellExecuteW on Windows, xdg-open/open elsewhere).
 open = { version = "5", features = ["shellexecute-on-windows"] }
 lru = "0.16"
+# Reads copied images and file lists for paste-to-send (X11, Wayland data-control, Windows); same crate as Ferrocord.
+arboard = { version = "3", default-features = false, features = ["image-data", "wayland-data-control"] }
 # Video helper (in `ferrochat-player` only), no system libraries:
 # H.264 decoder (Cisco's BSD OpenH264, built from source, linked statically; Main/High with B-frames).
 openh264 = { version = "0.9", optional = true }

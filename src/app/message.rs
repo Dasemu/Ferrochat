@@ -69,6 +69,14 @@ pub enum Ui {
     Send,
     /// Paperclip.
     Attach,
+    /// Ctrl+V / Shift+Insert: a copied image or files open the preview.
+    Paste,
+    /// Attachment preview caption edited.
+    AttachCaption(String),
+    /// Attachment preview "send".
+    AttachSend,
+    /// Attachment preview closed without sending.
+    AttachCancel,
     /// Emoji panel toggle.
     ToggleEmoji,
     /// Emoji picked.
@@ -456,8 +464,16 @@ pub enum Done {
         /// PCM or error.
         result: Result<Arc<Pcm>, String>,
     },
-    /// File picked and turned into outgoing media (`None` = cancelled).
+    /// Voice note encoded and ready to send.
     Prepared(Option<Result<Box<OutgoingMedia>, String>>),
+    /// Picked or pasted media prepared for the attachment preview
+    /// (`None` = dialog cancelled or a plain text paste).
+    Staged {
+        /// Chat that was open when the paste / pick started.
+        chat: ChatId,
+        /// The prepared media.
+        staged: Option<Box<crate::app::paste::Staged>>,
+    },
     /// Document saved to disk (and opened unless it is an executable type).
     DocumentOpened(Result<(PathBuf, bool), String>),
     /// Messages persisted; `new_ids` were not in the cache before.

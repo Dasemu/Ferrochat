@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -96,3 +96,11 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   `readreceipts` privacy setting. All Status / panel / star / logout actions
   are `Ui::Nav(NavMsg)` handled in `app/nav.rs`; leaving the status viewer
   must clear `App::video`.
+- Paste-to-send (`app/paste.rs`): Ctrl+V / Shift+Insert is seen by the
+  global event listener while the composer's `text_input` pastes text on
+  its own. `arboard` (with `wayland-data-control`, or Wayland reads fail)
+  is read in `spawn_blocking`, and only when `operation::is_focused(COMPOSER_ID)`.
+  Order: file list > `file://`-only text > any text (stays a text paste) >
+  image. File managers also paste the paths as text: `strip_pasted_paths`
+  removes them. Picked and pasted media both go through `AttachPreview`;
+  its image handle is made in `update`.

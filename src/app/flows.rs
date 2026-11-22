@@ -622,3 +622,92 @@ async fn a_message_push_name_does_not_replace_the_saved_name_in_the_list() {
     .await;
     assert_eq!(h.app.chats.display_name(MARCOS), "Marcos Díaz");
 }
+
+fn pasted_screenshot() -> Box<super::paste::Staged> {
+    Box::new(super::paste::Staged::from_image(&super::paste::RawImage {
+        width: 40,
+        height: 30,
+        rgba: vec![120; 40 * 30 * 4],
+    }))
+}
+
+#[tokio::test]
+async fn a_pasted_image_opens_the_preview_and_sends_with_its_caption() {
+    use super::message::{Done, Message};
+    use crate::net::Content;
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(PABLO.into())).await;
+    let before = h.app.open.as_ref().map(|c| c.messages.len()).unwrap_or(0);
+    let t = h.app.update(Message::done(Done::Staged {
+        chat: PABLO.into(),
+        staged: Some(pasted_screenshot()),
+    }));
+    h.pump(t).await;
+    let preview = h.app.attach.as_ref().expect("preview open");
+    assert!(preview.handle.is_some(), "handle made in update");
+    h.ui(Ui::AttachCaption("  mira  ".into())).await;
+    h.ui(Ui::AttachSend).await;
+    assert!(h.app.attach.is_none());
+    let conv = h.app.open.as_ref().unwrap();
+    assert_eq!(conv.messages.len(), before + 1);
+    let last = conv.messages.back().unwrap();
+    assert!(last.from_me);
+    match &last.content {
+        Content::Image {
+            caption,
+            width,
+            height,
+            media,
+            ..
+        } => {
+            assert_eq!(caption.as_deref(), Some("mira"));
+            assert_eq!((width, height), (&40, &30));
+            assert_eq!(
+                media.as_ref().map(|m| m.mimetype.as_str()),
+                Some("image/jpeg")
+            );
+        }
+        other => panic!("not an image: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn the_preview_is_dropped_by_escape_and_by_a_chat_switch() {
+    use super::message::{Done, Message};
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(PABLO.into())).await;
+    let stage = |chat: &str| {
+        Message::done(Done::Staged {
+            chat: chat.into(),
+            staged: Some(pasted_screenshot()),
+        })
+    };
+    // Escape closes the preview, not the chat.
+    let t = h.app.update(stage(PABLO));
+    h.pump(t).await;
+    h.ui(Ui::CloseChat).await;
+    assert!(h.app.attach.is_none());
+    assert!(h.app.open.is_some());
+    // A paste that finishes after the user moved to another chat is ignored.
+    let t = h.app.update(stage(MARCOS));
+    h.pump(t).await;
+    assert!(h.app.attach.is_none());
+    // Opening another chat discards an open preview; nothing was sent.
+    let n = h.app.open.as_ref().unwrap().messages.len();
+    let t = h.app.update(stage(PABLO));
+    h.pump(t).await;
+    h.ui(Ui::AttachCancel).await;
+    assert!(h.app.attach.is_none());
+    assert_eq!(h.app.open.as_ref().unwrap().messages.len(), n);
+    let t = h.app.update(stage(PABLO));
+    h.pump(t).await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    assert!(h.app.attach.is_none());
+    // A text paste stages nothing.
+    let t = h.app.update(Message::done(Done::Staged {
+        chat: MARCOS.into(),
+        staged: None,
+    }));
+    h.pump(t).await;
+    assert!(h.app.attach.is_none());
+}
