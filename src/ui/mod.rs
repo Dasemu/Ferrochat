@@ -10,6 +10,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod status;
 pub mod theme;
+pub mod update;
 
 use chrono::{Datelike, Local, TimeZone};
 use iced::widget::{Space, button, canvas, center, column, container, row, stack, svg, text};
@@ -71,6 +72,11 @@ pub fn view(app: &App) -> El<'_> {
             container(conv).width(Length::Fill).height(Length::Fill),
         ]
         .into()
+    };
+    // The update bar sits above everything, like the official client's.
+    let base = match update::banner(app) {
+        Some(bar) => column![bar, base].into(),
+        None => base,
     };
     let mut layers = vec![base];
     if let Some(menu) = sidebar::context_menu(app) {

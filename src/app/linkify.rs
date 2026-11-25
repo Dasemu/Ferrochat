@@ -225,8 +225,8 @@ mod tests {
             ["https://www.rust-lang.org"]
         );
         assert_eq!(
-            urls("github.com/Dasemu/Ferrochat"),
-            ["https://github.com/Dasemu/Ferrochat"]
+            urls("github.com/FerroApps/Ferrochat"),
+            ["https://github.com/FerroApps/Ferrochat"]
         );
         assert_eq!(urls("http://localhost:8080/x"), ["http://localhost:8080/x"]);
     }

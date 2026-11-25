@@ -1,12 +1,15 @@
 //! Settings page: background (tray) and notification toggles.
 
-use iced::widget::{Space, button, column, container, row, text, toggler};
+use iced::widget::{Space, button, column, container, row, scrollable, text, toggler};
 use iced::{Alignment, Length};
 
 use super::icons::Icon;
 use super::theme::{self, INTER_MEDIUM, INTER_SEMIBOLD};
 use super::{El, icon};
 use crate::app::{App, Message, Setting, Ui};
+
+/// Id of the settings page scrollable.
+pub const SCROLL_ID: &str = "settings";
 
 /// The settings page, shown in place of the conversation.
 pub fn view(app: &App) -> El<'_> {
@@ -79,13 +82,25 @@ pub fn view(app: &App) -> El<'_> {
     .spacing(2);
 
     let body = container(
-        column![background, Space::new().height(16), notifications]
-            .width(Length::Fill)
-            .max_width(620),
+        column![
+            background,
+            Space::new().height(16),
+            notifications,
+            Space::new().height(16),
+            super::update::section(app),
+        ]
+        .width(Length::Fill)
+        .max_width(620),
     )
     .padding([20, 24])
     .center_x(Length::Fill);
 
+    // A stable id keeps the scroll position across redraws.
+    let body = scrollable(body)
+        .id(SCROLL_ID)
+        .direction(super::thin_scrollbar())
+        .style(theme::scrollbar(t))
+        .height(Length::Fill);
     container(column![header, body])
         .width(Length::Fill)
         .height(Length::Fill)

@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste|update-banner|update-settings> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -90,6 +90,12 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   (`app/lists.rs`). Never send the `favorites` app-state action (it carries
   the whole list and would overwrite the phone's).
 - App-level tests: `app::test_support::Harness` (real `App` + fake client).
+- Updater (`src/update/`, `app/updates.rs`, `ui/update.rs`, architecture §11.5): only
+  install.sh installs self-update; cargo installs get the command, others the release
+  page. Checks/installs run on detached threads (never `spawn_blocking`: quit waits for
+  it). No checks in mock/screenshot/debug unless `FERRO_UPDATE_FORCE=1`; tests point
+  `FERRO_RELEASE_API`/`endpoint_for` at a loopback HTTP server. Restart is spawned by
+  `main` after the instance lock is dropped. Keep the asset names in sync with release.yml.
 - Statuses are not chats (`net::social`, `app/status.rs`): diverted in
   `net/whatsapp.rs::translate`, own cache tables, 24 h + 1500-row bound. View
   receipts go through `WaClient::send_status_view`, which respects the

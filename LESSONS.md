@@ -222,6 +222,20 @@ next change.
   its history and sends `NotificationClosed` only on dismissal, so `wait_for_action` on the blocking pool
   froze Quit (found in Ferrocord v0.17.0 with gdb). Watch clicks on detached threads.
 
+## In-app updater
+
+* Run network work for the updater on a detached `std::thread` with a
+  oneshot back to iced, not `spawn_blocking`: iced drops its tokio runtime
+  on quit and waits for blocking tasks, so a stalled download would freeze
+  Quit (same root cause as the notification quit hang).
+* `ureq` 3 was already in the tree (whatsapp-rust, rustls + webpki roots);
+  with `max_redirects(0)` every redirect hop can be checked against the host
+  allowlist before it is followed.
+* Renaming over a running ELF is fine on Linux, but `current_exe()` then
+  points at a deleted file: detect the install method once at boot and
+  restart into the known target path, not `current_exe()`.
+* Release the single-instance lock before starting the new process, or the
+  new one sees "already running" and hands off to the dying old one.
 ## Calls
 
 * **Read the pinned crate before deciding something is impossible.** The
