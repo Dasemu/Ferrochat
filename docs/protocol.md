@@ -88,8 +88,9 @@ directory and plays it in the in-app viewer (§6.1). "Open externally"
 crate, extension from an allowlist). `extendedTextMessage` with a `title`
 and an http(s) `matchedText` becomes a text message with the sender's link
 preview (title, description, inline thumbnail); previews are never fetched
-on our side, like the official clients. `stickerMessage` is downloaded (cap 2 MB, 1 Mpx), decoded to RGBA
-and drawn statically; animated stickers show their first frame. Locations,
+on our side, like the official clients. `stickerMessage` is downloaded (cap 2 MB, 1 Mpx) and drawn
+without a bubble; animated WebP stickers are decoded frame by frame and play inline (§2.5).
+`videoMessage` with `gifPlayback` is a GIF: it autoplays muted and looped in its bubble (§2.5). Locations,
 contacts and polls show an "unsupported" placeholder; key distribution
 messages are not bubbles. Replies come from `contextInfo` (`stanzaId`,
 `participant`, `quotedMessage`) and are rendered as a quote above the text; a
@@ -113,6 +114,8 @@ click jumps to the original, loading the cache around it when needed.
 | Groups in common | `groups().get_participating`, filtered by the contact's PN / LID | when the drawer opens |
 | Block / unblock | `blocking().block / unblock`, `blocking().is_blocked` | after a confirmation in the drawer |
 | Mute / unmute | `chat_actions().mute_chat` (indefinite) / `unmute_chat` | optimistic, reverted on failure; mute durations other than "always" are not offered yet |
+| Sticker | `upload(MediaType::Sticker)` + `stickerMessage` | §2.5 |
+| GIF | `upload(MediaType::Video)` + `videoMessage { gifPlayback: true, gifAttribution }` | §2.5 |
 
 Mentions: `contextInfo.mentionedJid` is kept per message (cache column
 `mentions`, schema 6). An "@<digits>" in the text is shown as the name of
@@ -232,6 +235,79 @@ The participant count (everyone but us) comes from the library's group
 metadata; until it is known no group message advances past one tick. Direct
 chats are unchanged.
 
+### 2.5 Stickers and GIFs
+
+**Receiving.** A sticker is downloaded like an image; an animated WebP
+(`isAnimated`, or the `VP8X` animation flag) is decoded in the download task
+into at most 150 frames / 8 MB at <= 200 px (`app::anim::STICKER`, extra
+frames merged so the loop keeps its length). A GIF (`gifPlayback`) of up to
+16 MB is downloaded to the GIF shelf and decoded by the player helper's
+*frames mode* (`ferrochat-player --frames <w>x<h> <frames> <bytes> <file>`:
+picture track only, as fast as it can, evenly spaced frames within the
+budget, timed `P` messages, then exit; `media::gifv`), at most two at a
+time, each tried once per run. Both become an `app::anim::Anim` drawn by the
+self-playing `ui::anim_image` widget (ported from Ferrocord): it asks for a
+redraw only when its own next frame is due, on a shared 60 Hz grid, only
+while on screen and only while the window is focused. The app is never
+ticked, so a hidden or unfocused window costs no CPU. Decoded animations
+share a 48 MB LRU (`App::anims`). Clicking a GIF opens it in the video
+viewer.
+
+**Sending stickers.** The Stickers tab lists favourites and recent stickers
+(sent, and received ones once displayed; 48 kept). `SendSticker` re-uploads
+the WebP from the shelf with `MediaType::Sticker` and sends a
+`stickerMessage` (mimetype `image/webp`, size, `isAnimated`,
+`stickerSentTs`) through `send_message_with_options` like any media; no
+stanza is built by hand. "Create" turns a picture (PNG / JPEG / WebP / first
+frame of a GIF) into a 512x512 WebP: fitted, centred on transparency,
+lossless (`image` has no lossy WebP encoder); results above 300 kB are
+re-encoded with fewer colour levels, above 1 MB refused. A preview with
+"Send sticker" / "Cancel" comes first.
+
+**Favourites are local.** The phone's favourite stickers are app-state
+`favoriteSticker` mutations (`StickerAction`, collection `regular_low`).
+`whatsapp-rust` 0.7 drops them in `dispatch_app_state_mutation` (no event,
+no read API), so Ferrochat cannot show the phone's favourites, and it never
+writes that collection either (the "never overwrite the phone's app state"
+rule). Favourites made here (right-click a tile, or the message menu) live
+only in the cache (`favourite_stickers`).
+
+**Sending GIFs.** A GIF is an H.264 MP4 sent as `videoMessage` with
+`gifPlayback = true`, `gifAttribution` (`GIPHY` for search results, `NONE`
+otherwise), size, duration and a 96 px JPEG thumbnail, uploaded as
+`MediaType::Video`. Before sending, the helper probes the file (H.264 or a
+named "cannot be sent" message, size, duration, poster) and decodes the
+bubble animation. Sources:
+
+* recent GIFs (sent or received, 40 kept);
+* "Send a GIF from a file": a `.mp4` (<= 16 MB, H.264) as is; a `.gif` is
+  converted by the helper (`ferrochat-player --gif-to-mp4 <in> <out>`: the
+  `image` crate composites the frames, scaled to <= 480 px with even sides,
+  flattened on white, OpenH264 Constrained Baseline, one sample per GIF
+  frame with the GIF's own delays, `mp4` crate writer). The main binary
+  still links no codec;
+* GIF search (below).
+
+**GIF search: the user's own GIPHY key.** WhatsApp Desktop searches Tenor
+with WhatsApp's API key. Ferrochat must not borrow that key or fake
+WhatsApp's origin. Options considered: Tenor (needs a Google Cloud project
+key), GIPHY (free self-service keys at developers.giphy.com, MP4 and
+animated WebP renditions in every result) and Klipy (newer, smaller
+ecosystem). GIPHY is used: the user pastes a key in Settings > GIFs; it is
+stored in the OS keyring (`auth::secrets`, account `giphy-api-key`) and only
+sent to `api.giphy.com` (query parameter, so URLs are logged without their
+query). Without a key the GIF tab shows a one-line setup note; recent GIFs
+and GIF files still work. Requests run on detached threads with `ureq`
+(already in the tree), no redirects, GIPHY hosts only (`net::giphy`):
+search (`/v1/gifs/search`, 24 results, `rating=pg-13`) after a 450 ms
+pause in typing, tiles from `fixed_width_small.webp` (animated, <= 1 MB,
+decoded to <= 60 frames), and on click the `original` MP4 (or `fixed_width`
+when the original is over 15 MB). The tab says "Powered by GIPHY". Tiles
+live only while the drawer is open. A provider is one parser
+(`parse_search`) plus a host list, so Tenor or Klipy can be added the same
+way. `FERRO_GIPHY_API=http://127.0.0.1:<port>/...` points search at a
+loopback test server; `--mock` answers searches in-process.
+
 ## 3. What lands on disk
 
 | Path | Content | Protection |
@@ -249,6 +325,10 @@ chats are unchanged.
 | `~/Downloads/<name>` | Documents the user opened; photos saved or opened externally from the image viewer | Only on explicit click. |
 | (cache column `messages.thumb` of videos) | A poster frame (JPEG, <= 480 px) decoded by the player helper for videos (<= 16 MB) that arrived without an inline thumbnail; the video itself lands in the `videos/` cache above | Same file as the cache |
 | (cache key `recent_emoji`) | The emoji picker's recent emoji | Same file as the cache |
+| `$XDG_CACHE_HOME/ferrochat/stickers/<sha256>.webp` | Recent and favourite stickers (decrypted), for the Stickers tab | Directory 0700; files not in the lists are removed, 64 MB cap |
+| `$XDG_CACHE_HOME/ferrochat/gifs/<sha256>.mp4` + `.jpg` | Recent GIFs (decrypted MP4 + poster), for the GIF tab and inline playback | Directory 0700; files not in the list are removed, 200 MB cap. `--mock` uses `$TMPDIR/ferrochat-mock-shelf-<pid>`, removed on exit |
+| (cache keys `recent_stickers`, `favourite_stickers`, `recent_gifs`) | The picker's lists (file hash, size, duration) | Same file as the cache |
+| OS keyring, account `giphy-api-key` | The user's own GIPHY API key (optional) | Keyring only; never logged |
 
 The data directory is created with mode 0700 and every database file
 (including `-wal` / `-shm`) is set to 0600. Downloads are capped at 100 MB

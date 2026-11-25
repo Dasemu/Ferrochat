@@ -303,3 +303,36 @@ next change.
   once, never per event.
 * **No devices in tests.** Audio threads and the ringtone are skipped in
   `--mock`; the fake client stands in for the media engine.
+
+## Stickers and GIFs
+
+* **Check what the library dispatches before promising sync.** The phone's
+  favourite stickers are app-state `favoriteSticker` mutations, and the
+  schema is in `wacore-appstate`, but `whatsapp-rust` 0.7's
+  `dispatch_app_state_mutation` silently drops them (no event, no read API).
+  Favourites are therefore local, and nothing is written to that collection.
+* **Port the self-playing animation widget, not a tick.** Ferrocord's
+  `anim_image` asks for `request_redraw_at` only for its own next frame, on a
+  shared 60 Hz grid, only while visible: animated stickers and GIFs cost
+  nothing while the window is unfocused or closed, and `view` never runs
+  per frame.
+* **A GIF is an MP4, so decode it where the codecs are.** The helper already
+  had OpenH264 + the `mp4` crate; a `--frames` mode (decode as fast as
+  possible, keep evenly spaced frames within a byte budget, exit) and a
+  `--gif-to-mp4` mode (OpenH264's encoder is in the same static library,
+  the `mp4` crate has a writer) kept the main binary codec-free. OpenH264's
+  encoder rejects `UsageType::CameraVideoNonRealTime` ("Invalid usage type
+  = 2"); skipped frames must be off or the sample table gets holes.
+* **`image` cannot write animated WebP**, so mock animated stickers wrap
+  per-frame lossless VP8L bitstreams in `VP8X` / `ANIM` / `ANMF` chunks by
+  hand (`mock::animated_webp`). It only encodes lossless WebP: stickers made
+  from photos are posterized until they are a reasonable size.
+* **Hash keys tie the views together.** Using the hex SHA-256 of the file as
+  the shelf key makes it equal to the received copy's `cache_key`, so a sent
+  sticker's bubble shows at once and a sticker seen in a chat is the same
+  picker entry. The mock and fake clients now use real hashes too.
+* **Don't borrow another app's API key.** WhatsApp's GIF search uses its own
+  Tenor key; the honest option is the user's own GIPHY key in the keyring,
+  with recent GIFs and GIF files working without one.
+* The shared build host ran out of disk mid-build: `rm -rf
+  target/debug/incremental` and `CARGO_INCREMENTAL=0` got it going again.

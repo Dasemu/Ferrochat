@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste|update-banner|update-settings|emoji|stickers|gifs|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -139,3 +139,10 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   which needs the stored offer (`net::call::CallBook`). State machine: `call::Calls` (pure,
   tested); app glue `app/call.rs`. Video calls are NOT implemented: the video button must keep
   saying so. `--mock`/tests open no audio device. Each call is logged once (`call-<id>` bubble).
+- Stickers / GIFs (`app/picker.rs`, protocol §2.5): animations are `app::anim::Anim`s drawn by
+  `ui::anim_image` (self-playing, redraws only its own due frames, only visible + focused): never tick
+  the app for them. GIF bubbles are decoded by the helper's `--frames` mode and `.gif` files converted by
+  `--gif-to-mp4` (codecs stay in the helper). Shelf keys are hex SHA-256 = `MediaRef::cache_key`. Drawer
+  tiles are freed on close (`release_picker`). Sticker favourites are LOCAL: whatsapp-rust 0.7 drops the
+  phone's `favoriteSticker` mutations; never write that app state. GIF search = the user's own GIPHY key
+  (keyring `giphy-api-key`), never WhatsApp's Tenor key; network on detached threads (`media::detached`).
