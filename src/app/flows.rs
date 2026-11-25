@@ -942,3 +942,147 @@ async fn the_group_info_drawer_lists_members_with_admins_first() {
     h.ui(Ui::ToggleInfo).await;
     assert!(h.app.info.is_none());
 }
+
+// ------------------------------------------------------------ read state
+
+fn incoming(chat: &str, id: &str, ts: i64) -> crate::net::Message {
+    crate::net::Message {
+        id: id.into(),
+        chat: chat.into(),
+        sender: chat.into(),
+        sender_name: None,
+        from_me: false,
+        timestamp: ts,
+        content: crate::net::Content::Text(format!("hi {id}")),
+        status: crate::net::ReceiptStatus::Read,
+        expires_at: None,
+        reply: None,
+        edited: false,
+        mentions: Vec::new(),
+        reactions: Vec::new(),
+    }
+}
+
+async fn arrive(h: &mut Harness, m: crate::net::Message) {
+    h.net(Event::Messages {
+        messages: vec![m],
+        origin: crate::net::Origin::Live,
+    })
+    .await;
+}
+
+fn read_sent(h: &Harness, id: &str) -> Option<String> {
+    h.fake.log().into_iter().find_map(|s| match s {
+        Sent::Read { chat, ids } if ids.iter().any(|i| i == id) => Some(chat),
+        _ => None,
+    })
+}
+
+fn unread(h: &Harness, chat: &str) -> u32 {
+    h.app.chats.get(chat).map(|e| e.meta.unread).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn a_message_in_the_chat_being_read_is_read_at_once() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(PABLO.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    arrive(&mut h, incoming(PABLO, "R1", 2_000_000_000)).await;
+    assert_eq!(unread(&h, PABLO), 0);
+    assert_eq!(read_sent(&h, "R1").as_deref(), Some(PABLO));
+    assert!(h.app.open.as_ref().unwrap().unread.is_none(), "no divider");
+}
+
+#[tokio::test]
+async fn an_unfocused_window_keeps_the_open_chat_unread_until_it_comes_back() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let t = h.app.update(super::Message::Focus(false));
+    h.pump(t).await;
+    arrive(&mut h, incoming(MARCOS, "U1", 2_000_000_000)).await;
+    arrive(&mut h, incoming(MARCOS, "U2", 2_000_000_001)).await;
+    assert_eq!(unread(&h, MARCOS), 2);
+    assert!(read_sent(&h, "U1").is_none(), "nothing read while away");
+    let d = h.app.open.as_ref().unwrap().unread.clone().unwrap();
+    assert_eq!(d.first.as_deref(), Some("U1"));
+    assert_eq!(d.count, 2);
+    // Back: the badge clears (also in the cache) and receipts go out.
+    let t = h.app.update(super::Message::Focus(true));
+    h.pump(t).await;
+    assert_eq!(unread(&h, MARCOS), 0);
+    assert!(read_sent(&h, "U1").is_some() && read_sent(&h, "U2").is_some());
+    let row = h
+        .app
+        .store
+        .chat_rows()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.meta.id == MARCOS)
+        .unwrap();
+    assert_eq!(row.meta.unread, 0);
+}
+
+#[tokio::test]
+async fn scrolled_up_messages_stay_unread_until_the_bottom_is_reached() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    h.ui(Ui::Scrolled {
+        relative_y: 0.5,
+        offset_y: 600.0,
+    })
+    .await;
+    arrive(&mut h, incoming(MARCOS, "S1", 2_000_000_000)).await;
+    assert_eq!(unread(&h, MARCOS), 1);
+    assert!(read_sent(&h, "S1").is_none());
+    h.ui(Ui::Scrolled {
+        relative_y: 0.0,
+        offset_y: 0.0,
+    })
+    .await;
+    assert_eq!(unread(&h, MARCOS), 0);
+    assert!(read_sent(&h, "S1").is_some());
+}
+
+#[tokio::test]
+async fn a_history_chunk_does_not_mark_the_chat_being_read_unread() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    let mut meta = h.app.chats.get(MARCOS).unwrap().meta.clone();
+    meta.unread = 5;
+    h.net(Event::History {
+        chats: vec![meta.clone()],
+        names: Vec::new(),
+        progress: None,
+    })
+    .await;
+    assert_eq!(unread(&h, MARCOS), 0);
+    // Another chat keeps the phone's counter.
+    let mut other = h.app.chats.get(PABLO).unwrap().meta.clone();
+    other.unread = 4;
+    h.net(Event::History {
+        chats: vec![other],
+        names: Vec::new(),
+        progress: None,
+    })
+    .await;
+    assert_eq!(unread(&h, PABLO), 4);
+}
+
+#[tokio::test]
+async fn read_receipts_go_to_the_lid_a_message_came_from() {
+    let mut h = Harness::new().await;
+    h.net(Event::LidMappings(vec![(
+        "555000111@lid".into(),
+        MARCOS.into(),
+    )]))
+    .await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    arrive(&mut h, incoming("555000111@lid", "L1", 2_000_000_000)).await;
+    // Shown in the phone-number chat, receipted to the LID it came from.
+    assert!(h.app.open.as_ref().unwrap().get("L1").is_some());
+    assert_eq!(read_sent(&h, "L1").as_deref(), Some("555000111@lid"));
+    assert_eq!(unread(&h, MARCOS), 0);
+}

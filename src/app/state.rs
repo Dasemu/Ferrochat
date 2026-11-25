@@ -790,6 +790,50 @@ pub struct Conversation {
     /// A page load (older or newer) is in flight: scroll events that would
     /// ask again are ignored until it lands.
     pub loading: bool,
+    /// The "N unread messages" divider: the first unread message (once
+    /// known) and how many there are. Stays until the chat is left.
+    pub unread: Option<UnreadDivider>,
+}
+
+/// Where the "N unread messages" divider goes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadDivider {
+    /// First unread message; `None` until the page holding it is loaded.
+    pub first: Option<String>,
+    /// Unread messages counted.
+    pub count: usize,
+}
+
+/// Distance (pixels) from the newest end within which the conversation
+/// counts as scrolled to the bottom.
+pub const BOTTOM_SLACK: f32 = 48.0;
+
+/// Whether the user is looking at the newest messages of the open chat:
+/// window focused, the newest page loaded and scrolled to the bottom. Only
+/// then does an arriving message count as read (WhatsApp Desktop).
+pub fn is_reading(focused: bool, scroll_from_newest: f32, has_newer: bool) -> bool {
+    focused && !has_newer && scroll_from_newest <= BOTTOM_SLACK
+}
+
+/// The id of the oldest of the `count` newest incoming messages: where the
+/// unread divider goes.
+pub fn first_unread(msgs: &VecDeque<Message>, count: usize) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    msgs.iter()
+        .rev()
+        .filter(|m| !m.from_me)
+        .take(count)
+        .last()
+        .map(|m| m.id.clone())
+}
+
+/// The JID to address a receipt to: the one the message came from (a LID
+/// for LID-addressed chats and group members), not the phone number it was
+/// normalised to for display. Unknown: the JID itself.
+pub fn wire_jid<'a>(wire: &'a HashMap<String, String>, jid: &'a str) -> &'a str {
+    wire.get(jid).map_or(jid, String::as_str)
 }
 
 impl Conversation {
@@ -801,6 +845,7 @@ impl Conversation {
             has_more,
             has_newer: false,
             loading: false,
+            unread: None,
         };
         c.merge(msgs);
         c
@@ -1793,5 +1838,56 @@ mod mention_tests {
         assert_eq!(l.preview(&msg, &[]), "@Ana can you bring the cake?");
         msg.content = Content::Text("mail me at a@b.com, @x".into());
         assert_eq!(l.preview(&msg, &[]), "mail me at a@b.com, @x");
+    }
+}
+
+#[cfg(test)]
+mod read_state_tests {
+    use super::*;
+
+    #[test]
+    fn reading_needs_focus_the_newest_page_and_the_bottom() {
+        assert!(is_reading(true, 0.0, false));
+        assert!(is_reading(true, BOTTOM_SLACK, false));
+        assert!(!is_reading(false, 0.0, false));
+        assert!(!is_reading(true, BOTTOM_SLACK + 1.0, false));
+        assert!(!is_reading(true, 0.0, true));
+    }
+
+    #[test]
+    fn divider_goes_above_the_oldest_unread_incoming_message() {
+        let mk = |id: &str, from_me: bool| Message {
+            id: id.into(),
+            chat: "c".into(),
+            sender: "c".into(),
+            sender_name: None,
+            from_me,
+            timestamp: 1,
+            content: Content::Text(String::new()),
+            status: ReceiptStatus::Read,
+            expires_at: None,
+            reply: None,
+            edited: false,
+            mentions: Vec::new(),
+            reactions: Vec::new(),
+        };
+        let msgs: VecDeque<Message> = [
+            mk("a", false),
+            mk("b", false),
+            mk("me", true),
+            mk("c", false),
+        ]
+        .into();
+        assert_eq!(first_unread(&msgs, 2).as_deref(), Some("b"));
+        assert_eq!(first_unread(&msgs, 9).as_deref(), Some("a"));
+        assert_eq!(first_unread(&msgs, 0), None);
+    }
+
+    #[test]
+    fn wire_jids_fall_back_to_the_display_jid() {
+        let mut w = HashMap::new();
+        w.insert("1@s.whatsapp.net".to_string(), "9@lid".to_string());
+        assert_eq!(wire_jid(&w, "1@s.whatsapp.net"), "9@lid");
+        assert_eq!(wire_jid(&w, "2@s.whatsapp.net"), "2@s.whatsapp.net");
     }
 }

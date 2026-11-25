@@ -207,6 +207,9 @@ pub struct App {
     pub(crate) list_dialog: Option<ListDialog>,
     pub(crate) open: Option<Conversation>,
     pending_read: usize,
+    /// Display JID -> the JID messages came from (LID-addressed chats and
+    /// group members), so read receipts go where the message came from.
+    wire: HashMap<String, String>,
     pub(crate) composer: composer::Composer,
     /// Drafts of the chats that are not open.
     pub(crate) drafts: composer::Drafts,
@@ -503,6 +506,7 @@ impl App {
             list_dialog: None,
             open: None,
             pending_read: 0,
+            wire: HashMap::new(),
             composer: composer::Composer::new(),
             drafts: composer::Drafts::default(),
             emoji_open: false,
@@ -602,8 +606,7 @@ impl App {
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
                     Some((
-                        ScreenshotTarget::Composer
-                        | ScreenshotTarget::Emoji
+                        ScreenshotTarget::Emoji
                         | ScreenshotTarget::Viewer
                         | ScreenshotTarget::Info
                         | ScreenshotTarget::GroupInfo,
@@ -772,6 +775,8 @@ impl App {
             Message::Focus(f) => {
                 self.focused = f;
                 if f {
+                    // Unread messages of the open chat become read when the
+                    // window comes back (if the newest ones are on screen).
                     self.send_pending_reads()
                 } else {
                     Task::none()
@@ -989,6 +994,10 @@ impl App {
                     self.popup = None;
                 }
                 self.scroll_y = offset_y;
+                if self.pending_read > 0 && self.reading_chat().is_some() {
+                    // Scrolled back down to unread messages: they are read now.
+                    return self.send_pending_reads();
+                }
                 if relative_y < 0.02
                     && self
                         .open
@@ -1084,16 +1093,24 @@ impl App {
         if self.open.as_ref().is_some_and(|c| c.chat == chat) {
             return Task::none();
         }
-        self.pending_read = self
+        let unread = self
             .chats
             .get(&chat)
             .map(|e| e.meta.unread as usize)
             .unwrap_or(0);
-        self.chats.mark_read(&chat);
+        // Read once it is on screen (focused, at the bottom): until then the
+        // badge stays, like WhatsApp Desktop.
+        self.pending_read = unread;
         let paused = self.compose_stop();
         self.stash_draft();
         self.info = None;
-        self.open = Some(Conversation::new(chat.clone(), Vec::new(), false));
+        self.scroll_y = 0.0;
+        let mut conv = Conversation::new(chat.clone(), Vec::new(), false);
+        conv.unread = (unread > 0).then_some(state::UnreadDivider {
+            first: None,
+            count: unread,
+        });
+        self.open = Some(conv);
         match self.drafts.take(&chat) {
             Some(d) => self.composer.set_text(&d),
             None => self.composer.clear(),
@@ -1122,10 +1139,9 @@ impl App {
                 Err(e) => Message::done(Done::Stored(Err(e.to_string()))),
             },
         );
-        let persist = store_task(&self.store, {
-            let chat = chat.clone();
-            move |s| s.set_unread(&chat, 0)
-        });
+        // The cached counter is cleared with the badge, once the messages are
+        // on screen (`send_pending_reads`).
+        let persist = Task::none();
         Task::batch([load, persist, paused, presence, avatars])
     }
 
@@ -1628,12 +1644,35 @@ impl App {
         )
     }
 
+    /// The open chat, if the user is reading its newest messages.
+    pub fn reading_chat(&self) -> Option<&str> {
+        let c = self.open.as_ref()?;
+        state::is_reading(self.focused, self.scroll_y, c.has_newer).then_some(c.chat.as_str())
+    }
+
+    /// Unread messages of the open chat are on screen: clear the badge
+    /// (and its cached counter) and send read receipts the way the library
+    /// does, addressed to the JIDs the messages came from.
     fn send_pending_reads(&mut self) -> Task<Message> {
-        if !self.focused || self.pending_read == 0 {
+        if self.pending_read == 0 || self.reading_chat().is_none() {
             return Task::none();
         }
         let Some(conv) = &self.open else {
             return Task::none();
+        };
+        let had_badge = self
+            .chats
+            .get(&conv.chat)
+            .is_some_and(|e| e.meta.unread > 0);
+        let chat_id = conv.chat.clone();
+        self.chats.mark_read(&chat_id);
+        let clear = if had_badge {
+            store_task(&self.store, move |s| s.set_unread(&chat_id, 0))
+        } else {
+            Task::none()
+        };
+        let Some(conv) = &self.open else {
+            return clear;
         };
         let incoming: Vec<ChatMessage> = conv
             .messages
@@ -1645,18 +1684,22 @@ impl App {
             .collect();
         self.pending_read = 0;
         let Some(client) = self.client.clone() else {
-            return Task::none();
+            return clear;
         };
         let chat = conv.chat.clone();
         let batches = state::read_receipt_batches(&chat, &incoming);
-        Task::batch(batches.into_iter().map(|(sender, ids)| {
+        let wire_chat = state::wire_jid(&self.wire, &chat).to_string();
+        let mut tasks = vec![clear];
+        for (sender, ids) in batches {
             let client = client.clone();
-            let chat = chat.clone();
-            Task::perform(
+            let chat = wire_chat.clone();
+            let sender = sender.map(|s| state::wire_jid(&self.wire, &s).to_string());
+            tasks.push(Task::perform(
                 async move { client.mark_read(&chat, sender.as_deref(), &ids).await },
                 |_| Message::done(Done::Nothing),
-            )
-        }))
+            ));
+        }
+        Task::batch(tasks)
     }
 
     fn index_thumbs(&mut self, msgs: &[ChatMessage]) {
@@ -1791,6 +1834,11 @@ impl App {
                     c.id = self.lid_map.normalize(&c.id);
                 }
                 self.chats.apply_history(&chats, &names);
+                // A history chunk carries the phone's counter from when it was
+                // built: it must not mark the chat being read as unread.
+                if let Some(c) = self.reading_chat().map(str::to_string) {
+                    self.chats.mark_read(&c);
+                }
                 let rows = crate::net::push_names(&names);
                 let mut tasks = vec![
                     store_task(&self.store, move |s| {
@@ -2097,8 +2145,18 @@ impl App {
     /// messages are new (live or drained from the offline queue).
     fn on_messages(&mut self, mut messages: Vec<ChatMessage>, origin: Origin) -> Task<Message> {
         let own = self.own_jid.clone().unwrap_or_default();
+        if self.wire.len() > 4096 {
+            self.wire.clear();
+        }
         for m in &mut messages {
+            let (chat, sender) = (m.chat.clone(), m.sender.clone());
             self.lid_map.apply(m);
+            if m.chat != chat {
+                self.wire.insert(m.chat.clone(), chat);
+            }
+            if m.sender != sender {
+                self.wire.insert(m.sender.clone(), sender);
+            }
             if let Some(q) = &mut m.reply {
                 q.sender = self.lid_map.normalize(&q.sender);
             }
@@ -2150,10 +2208,13 @@ impl App {
         };
         let counts = origin != Origin::History;
         let pushed = self.chats.learn_push_names(&messages);
+        // Only a chat the user is reading (focused, at the bottom) takes
+        // new messages as read; otherwise they count, even in the open chat.
+        let reading = self.reading_chat().map(str::to_string);
         self.chats.apply_messages(
             &messages,
-            open_chat.as_deref(),
-            self.focused,
+            reading.as_deref(),
+            true,
             counts.then_some(&fresh),
         );
         self.index_thumbs(&messages);
@@ -2182,8 +2243,25 @@ impl App {
                     .iter()
                     .filter(|m| !m.from_me && fresh.contains(&m.id))
                     .count();
+                let first_new = mine
+                    .iter()
+                    .find(|m| !m.from_me && fresh.contains(&m.id))
+                    .map(|m| m.id.clone());
                 c.merge(mine);
-                if counts && self.focused {
+                if counts && incoming > 0 {
+                    if reading.is_none() {
+                        // Not on screen: the divider marks where they start
+                        // (a new run of unread messages moves it).
+                        match &mut c.unread {
+                            Some(d) if self.pending_read > 0 => d.count += incoming,
+                            _ => {
+                                c.unread = Some(state::UnreadDivider {
+                                    first: first_new,
+                                    count: incoming,
+                                })
+                            }
+                        }
+                    }
                     self.pending_read += incoming;
                 }
                 if origin == Origin::Live {
@@ -2276,6 +2354,11 @@ impl App {
                     } else {
                         c.merge(msgs);
                         c.has_more = has_more;
+                        if let Some(d) = &mut c.unread
+                            && d.first.is_none()
+                        {
+                            d.first = state::first_unread(&c.messages, d.count);
+                        }
                         let scene = self.scene_tasks();
                         return Task::batch([
                             operation::snap_to(
@@ -2579,13 +2662,6 @@ impl App {
                     staged: staged.map(Box::new),
                 })));
                 v.push(ui(Ui::AttachCaption("Look at this sunset".into())));
-            }
-            ScreenshotTarget::Composer => {
-                use iced::widget::text_editor::{Action, Edit};
-                v.push(ui(Ui::ComposerAction(Action::Edit(Edit::Paste(Arc::new(
-                    "Sounds good!\nI'll bring the cake \u{1F382}\nSee you at 8 \u{1F44B}\u{1F3FD}"
-                        .into(),
-                ))))));
             }
             ScreenshotTarget::Emoji => {
                 v.push(ui(Ui::Emoji("\u{1F602}")));

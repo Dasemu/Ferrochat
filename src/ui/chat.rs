@@ -213,6 +213,27 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
                 .into(),
             );
         }
+        if let Some(d) = conv
+            .unread
+            .as_ref()
+            .filter(|d| d.first.as_deref() == Some(msg.id.as_str()))
+        {
+            items.push(
+                container(
+                    text(format!(
+                        "{} unread message{}",
+                        d.count,
+                        if d.count == 1 { "" } else { "s" }
+                    ))
+                    .size(12.5)
+                    .color(p.text_primary),
+                )
+                .padding([5, 12])
+                .center_x(Length::Fill)
+                .style(theme::solid(p.bg_elevated.scale_alpha(0.7)))
+                .into(),
+            );
+        }
         let first_of_group =
             new_day || prev.is_none_or(|pm| pm.from_me != msg.from_me || pm.sender != msg.sender);
         items.push(bubble(app, msg, first_of_group, group));
