@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_3.sql"),
     include_str!("migration_4.sql"),
     include_str!("migration_5.sql"),
+    include_str!("migration_6.sql"),
 ];
 
 mod social;
@@ -182,8 +183,8 @@ impl Store {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO messages
                     (chat_id, id, sender, sender_name, from_me, ts, kind, content, thumb, status,
-                     expires_at, reply, edited, search)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     expires_at, reply, edited, search, mentions)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
             let mut react = tx.prepare_cached(
                 "INSERT INTO reactions (chat_id, msg_id, reactor, emoji, ts)
@@ -230,6 +231,7 @@ impl Store {
                             m.reply.as_ref().and_then(|q| serde_json::to_string(q).ok()),
                             m.edited,
                             search_text(&m.content),
+                            encode_mentions(&m.mentions),
                         ])?;
                         new_ids.push(m.id.clone());
                     }
@@ -321,7 +323,7 @@ impl Store {
         let (ts, id) = before.unwrap_or((i64::MAX, ""));
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited
+                    reply, edited, mentions
              FROM messages
              WHERE chat_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
              ORDER BY ts DESC, id DESC LIMIT ?4",
@@ -340,7 +342,7 @@ impl Store {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited
+                    reply, edited, mentions
              FROM messages WHERE chat_id = ?1 AND id = ?2",
         )?;
         let mut m = st.query_row(params![chat, id], row_to_message).optional()?;
@@ -356,7 +358,7 @@ impl Store {
         let mut st = conn.prepare_cached(
             "SELECT c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.muted,
                     m.chat_id, m.id, m.sender, m.sender_name, m.from_me, m.ts, m.content,
-                    m.thumb, m.status, m.expires_at, m.reply, m.edited
+                    m.thumb, m.status, m.expires_at, m.reply, m.edited, m.mentions
              FROM chats c
              LEFT JOIN messages m ON m.rowid = (
                 SELECT rowid FROM messages WHERE chat_id = c.id ORDER BY ts DESC, id DESC LIMIT 1
@@ -704,7 +706,7 @@ impl Store {
     ) -> Result<Window> {
         let conn = self.lock()?;
         let cols = "chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                    expires_at, reply, edited";
+                    expires_at, reply, edited, mentions";
         let mut older = conn
             .prepare_cached(&format!(
                 "SELECT {cols} FROM messages
@@ -746,7 +748,7 @@ impl Store {
         let mut rows = conn
             .prepare_cached(
                 "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                        expires_at, reply, edited
+                        expires_at, reply, edited, mentions
                  FROM messages
                  WHERE chat_id = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
                  ORDER BY ts ASC, id ASC LIMIT ?4",
@@ -999,7 +1001,25 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
             .and_then(|j| serde_json::from_str(&j).ok()),
         edited: r.get(o + 11)?,
         reactions: Vec::new(),
+        mentions: r
+            .get::<_, Option<String>>(o + 12)?
+            .map(|j| decode_mentions(&j))
+            .unwrap_or_default(),
     })
+}
+
+/// Mentioned JIDs as stored: a JSON array, NULL when there are none.
+fn encode_mentions(m: &[String]) -> Option<String> {
+    (!m.is_empty())
+        .then(|| serde_json::to_string(m).ok())
+        .flatten()
+}
+
+/// Reads stored mentions; garbage reads as none.
+fn decode_mentions(json: &str) -> Vec<String> {
+    let mut v: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+    v.truncate(crate::net::types::MAX_MENTIONS);
+    v
 }
 
 #[cfg(test)]
@@ -1023,8 +1043,24 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn mentions_round_trip_through_the_cache() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = msg("g@g.us", "1", 10, false, "@123456789012345 hi");
+        m.mentions = vec!["123456789012345@lid".into()];
+        let plain = msg("g@g.us", "2", 11, false, "no mentions");
+        s.insert_messages(&[m.clone(), plain]).unwrap();
+        let page = s.load_messages("g@g.us", None, 10).unwrap();
+        assert_eq!(page[0].mentions, m.mentions);
+        assert!(page[1].mentions.is_empty());
+        assert_eq!(s.chat_rows().unwrap()[0].last.as_ref().unwrap().id, "2");
+        assert!(decode_mentions("not json").is_empty());
+        assert_eq!(encode_mentions(&[]), None);
     }
 
     #[test]
@@ -1364,6 +1400,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         };
         s.insert_messages(std::slice::from_ref(&m)).unwrap();

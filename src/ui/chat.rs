@@ -7,11 +7,13 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, ContentFit, Length};
 
+use super::emoji_font::{emoji_font, emoji_text};
 use super::icons::Icon;
 use super::theme::{self, FerroTheme, INTER_MEDIUM};
 use super::{
     El, avatar_for, clock, day_separator, fill, gap, icon, last_seen_label, local_day, tail, ticks,
 };
+use crate::app::composer;
 use crate::app::live::typing_label;
 use crate::app::state::{Conversation, reaction_summary};
 use crate::app::{
@@ -25,13 +27,6 @@ use crate::net::{
 
 /// Quick reactions offered on hover (the official client's defaults).
 pub const QUICK_REACTIONS: &[&str] = &["👍", "❤️", "😂", "😮", "😢", "🙏"];
-
-/// Emoji offered by the picker (system emoji font renders them).
-pub const EMOJI: &[&str] = &[
-    "😀", "😂", "🥲", "😊", "😍", "😘", "😎", "🤔", "😅", "😭", "😡", "🥳", "😴", "🤗", "🙄", "😬",
-    "👍", "👎", "👏", "🙏", "💪", "👋", "🤝", "✌️", "👌", "❤️", "🧡", "💛", "💚", "💙", "💜", "🔥",
-    "✨", "🎉", "🎂", "☕", "🍕", "⚽", "✈️", "🌅", "📷", "📄", "✅", "❌", "💯",
-];
 
 /// Placeholder when no chat is open.
 pub fn empty(app: &App) -> El<'_> {
@@ -125,10 +120,7 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         row![
             avatar_for(app, &conv.chat, group, m.avatar_small),
             column![
-                text(name)
-                    .size(16)
-                    .color(p.text_primary)
-                    .shaping(text::Shaping::Advanced),
+                emoji_text(name, 16.0, p.text_primary, theme::INTER, false),
                 text(super::ellipsize(&subtitle, 80))
                     .size(13)
                     .color(subtitle_color)
@@ -262,7 +254,7 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         );
     }
     if app.emoji_open {
-        layers.push(emoji_panel(t));
+        layers.push(super::emoji_picker::view(app));
     }
     if let (Some((id, which)), Some(pos)) = (&app.popup, app.popup_pos)
         && let Some(msg) = conv.get(id)
@@ -469,28 +461,6 @@ fn quote_author(app: &App, q: &Quote) -> String {
     }
 }
 
-fn emoji_panel(t: &FerroTheme) -> El<'_> {
-    let p = t.palette;
-    let grid = iced::widget::grid(EMOJI.iter().map(|e| {
-        button(text(*e).size(24).shaping(text::Shaping::Advanced))
-            .padding(6)
-            .style(theme::icon_button(t, false))
-            .on_press(Message::Ui(Ui::Emoji(e)))
-            .into()
-    }))
-    .columns(15)
-    .spacing(2);
-    container(
-        container(grid)
-            .padding(10)
-            .width(Length::Fill)
-            .style(theme::solid(p.bg_elevated)),
-    )
-    .height(Length::Fill)
-    .align_y(Alignment::End)
-    .into()
-}
-
 /// Attachment preview (picked or pasted media): replaces the messages and
 /// the composer until the media is sent or discarded, like WhatsApp Desktop.
 fn attach_preview<'a>(app: &'a App, a: &'a crate::app::paste::AttachPreview) -> El<'a> {
@@ -588,21 +558,27 @@ fn composer(app: &App) -> El<'_> {
         .style(theme::solid(p.bg_elevated))
         .into();
     }
-    let has_text = !app.composer.trim().is_empty();
-    let input = text_input(
-        if app.editing.is_some() {
+    let has_text = !app.composer.is_blank();
+    // Enter sends, Shift+Enter breaks the line; the box grows with its text
+    // up to `composer::MAX_LINES` and then scrolls.
+    let (min_h, max_h) = composer::text_height_limits(app.window_size().height);
+    let input = iced::widget::text_editor(app.composer.content())
+        .id(COMPOSER_ID)
+        .placeholder(if app.editing.is_some() {
             "Edit message"
         } else {
             "Type a message"
-        },
-        &app.composer,
-    )
-    .id(COMPOSER_ID)
-    .on_input(|s| Message::Ui(Ui::Composer(s)))
-    .on_submit(Message::Ui(Ui::Send))
-    .size(m.text + 0.5)
-    .padding([9, 0])
-    .style(theme::input(t));
+        })
+        .on_action(|a| Message::Ui(Ui::ComposerAction(a)))
+        .key_binding(|kp| composer::key_binding(kp, Message::Ui(Ui::Send)))
+        .size(m.text + 0.5)
+        .line_height(text::LineHeight::Absolute(composer::LINE_HEIGHT.into()))
+        .padding(iced::Padding::from([composer::PADDING_Y, 0.0]))
+        .min_height(min_h)
+        .max_height(max_h)
+        .style(theme::editor(t));
+    // The tools stay level with the last line of a tall box.
+    let tool_pad = iced::Padding::ZERO.bottom(2.0);
     let field = container(
         row![
             button(icon(Icon::Plus, 24.0, p.text_secondary))
@@ -624,7 +600,8 @@ fn composer(app: &App) -> El<'_> {
             input,
         ]
         .spacing(4)
-        .align_y(Alignment::Center),
+        .padding(tool_pad)
+        .align_y(Alignment::End),
     )
     .padding([2, 8])
     .width(Length::Fill)
@@ -642,7 +619,7 @@ fn composer(app: &App) -> El<'_> {
             .on_press(Message::Ui(Ui::StartRecording))
             .into()
     };
-    container(row![field, action].spacing(10).align_y(Alignment::Center))
+    container(row![field, action].spacing(10).align_y(Alignment::End))
         .padding([8, 16])
         .style(theme::solid(p.bg_elevated))
         .into()
@@ -682,13 +659,13 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
         let who = app
             .chats
             .sender_name(&msg.sender, msg.sender_name.as_deref());
-        col = col.push(
-            text(who)
-                .size(12.5)
-                .font(INTER_MEDIUM)
-                .color(theme::sender_color(&msg.sender))
-                .shaping(text::Shaping::Advanced),
-        );
+        col = col.push(emoji_text(
+            who,
+            12.5,
+            theme::sender_color(&msg.sender),
+            INTER_MEDIUM,
+            false,
+        ));
     }
 
     if let Some(q) = &msg.reply
@@ -703,7 +680,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
         Content::Text(s) => {
             // Short messages keep the time on the same line, like the original.
             let short = s.chars().count() < 38 && !s.contains('\n') && msg.reply.is_none();
-            let txt = message_text(app, s, fg);
+            let txt = message_text(app, msg, s, fg);
             if short {
                 return finish(
                     app,
@@ -774,7 +751,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                 .on_press(Message::Ui(Ui::OpenLink(preview.url.clone())));
             col = col.push(card).push(Space::new().width(300));
             column![
-                message_text(app, body_text, fg),
+                message_text(app, msg, body_text, fg),
                 container(meta_row(t, msg)).align_right(Length::Fill)
             ]
             .spacing(1)
@@ -816,13 +793,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                 .on_press(Message::Ui(Ui::OpenImage(msg.id.clone())));
             let mut c = column![pic].spacing(4).width(w);
             if let Some(cap) = caption {
-                c = c.push(
-                    text(cap.as_str())
-                        .size(m.text)
-                        .color(fg)
-                        .wrapping(Wrapping::WordOrGlyph)
-                        .shaping(text::Shaping::Advanced),
-                );
+                c = c.push(message_text(app, msg, cap, fg));
             }
             c.push(container(meta_row(t, msg)).align_right(Length::Fill)).into()
         }
@@ -956,7 +927,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                 .on_press(Message::Ui(Ui::OpenVideo(msg.id.clone())));
             let mut c = column![card].spacing(4).width(w);
             if let Some(cap) = caption {
-                c = c.push(message_text(app, cap, fg));
+                c = c.push(message_text(app, msg, cap, fg));
             }
             c.push(container(meta_row(t, msg)).align_right(Length::Fill)).into()
         }
@@ -1189,7 +1160,7 @@ fn reaction_picker<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
         .map(|r| r.emoji.as_str());
     let row_el = row(QUICK_REACTIONS.iter().map(|e| {
         let selected = mine == Some(*e);
-        button(text(*e).size(24).shaping(text::Shaping::Advanced))
+        button(text(*e).size(24).font(emoji_font()))
             .padding([4, 6])
             .style(theme::icon_button(t, selected))
             .on_press(Message::Ui(Ui::React {
@@ -1280,7 +1251,7 @@ fn reaction_badge<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     let (counts, total) = reaction_summary(&msg.reactions);
     let mut r = row![].spacing(2).align_y(Alignment::Center);
     for (e, _) in counts.iter().take(3) {
-        r = r.push(text(e.clone()).size(14).shaping(text::Shaping::Advanced));
+        r = r.push(text(e.clone()).size(14).font(emoji_font()));
     }
     if total > 1 {
         r = r.push(text(total.to_string()).size(12).color(p.text_secondary));
@@ -1317,15 +1288,18 @@ fn quote_block<'a>(app: &'a App, msg: &'a ChatMessage, q: &'a Quote) -> El<'a> {
                 .font(INTER_MEDIUM)
                 .color(bar)
                 .shaping(text::Shaping::Advanced),
-            text(super::ellipsize(&q.preview, QUOTE_CHARS))
-                .size(13.5)
-                .color(if msg.from_me {
-                    p.bubble_out_meta
-                } else {
-                    p.text_secondary
-                })
-                .wrapping(Wrapping::WordOrGlyph)
-                .shaping(text::Shaping::Advanced),
+            text(super::ellipsize(
+                &app.chats.render_mentions(&q.preview, &[], &app.own_ids()),
+                QUOTE_CHARS,
+            ))
+            .size(13.5)
+            .color(if msg.from_me {
+                p.bubble_out_meta
+            } else {
+                p.text_secondary
+            })
+            .wrapping(Wrapping::WordOrGlyph)
+            .shaping(text::Shaping::Advanced),
         ]
         .spacing(2)
         .padding([6, 8]),
@@ -1357,10 +1331,13 @@ fn quote_sizer<'a>(app: &'a App, q: &'a Quote) -> El<'a> {
                 .font(INTER_MEDIUM)
                 .wrapping(Wrapping::None)
                 .shaping(text::Shaping::Advanced),
-            text(super::ellipsize(&q.preview, QUOTE_CHARS))
-                .size(13.5)
-                .wrapping(Wrapping::None)
-                .shaping(text::Shaping::Advanced),
+            text(super::ellipsize(
+                &app.chats.render_mentions(&q.preview, &[], &app.own_ids()),
+                QUOTE_CHARS,
+            ))
+            .size(13.5)
+            .wrapping(Wrapping::None)
+            .shaping(text::Shaping::Advanced),
         ]
         .padding(iced::Padding {
             left: 4.0 + 8.0,
@@ -1391,10 +1368,12 @@ fn link_host(url: &str) -> String {
     host.strip_prefix("www.").unwrap_or(host).to_string()
 }
 
-/// Message text: links are clickable, mentions show names and the active
-/// in-chat search term is highlighted.
-fn message_text<'a>(app: &'a App, s: &'a str, fg: Color) -> El<'a> {
+/// Message text: links are clickable, mentions show names (highlighted),
+/// emoji are drawn in colour and the active in-chat search term is
+/// highlighted.
+fn message_text<'a>(app: &'a App, msg: &'a ChatMessage, s: &'a str, fg: Color) -> El<'a> {
     use crate::app::linkify::{self, Token};
+    use crate::ui::emoji_font::{emoji_spans, emoji_text, has_emoji};
     use iced::widget::span;
     let m = app.theme.metrics;
     let p = app.theme.palette;
@@ -1415,6 +1394,9 @@ fn message_text<'a>(app: &'a App, s: &'a str, fg: Color) -> El<'a> {
                     .into();
             }
         }
+        if has_emoji(s) {
+            return emoji_text(s, m.text, fg, theme::INTER, true);
+        }
         return text(s)
             .size(m.text)
             .wrapping(Wrapping::WordOrGlyph)
@@ -1422,20 +1404,21 @@ fn message_text<'a>(app: &'a App, s: &'a str, fg: Color) -> El<'a> {
             .shaping(text::Shaping::Advanced)
             .into();
     }
+    let own: Vec<&str> = app.own_jid.as_deref().into_iter().collect();
     let mut spans: Vec<iced::widget::text::Span<'a, String, iced::Font>> = Vec::new();
     for tok in tokens {
         match tok {
             Token::Text(x) => match &term {
                 Some(term) => spans.extend(highlight_generic(x, term, p.notice_text)),
-                None => spans.push(span(x)),
+                None => spans.extend(emoji_spans(x, |sp| sp)),
             },
             Token::Url { text, href } | Token::Email { text, href } => {
                 spans.push(span(text).color(p.link).underline(true).link(href));
             }
-            Token::Mention { text, user } => match app.mention_name(user) {
-                Some(name) => spans.push(span(format!("@{name}")).color(p.link)),
-                None => spans.push(span(text)),
-            },
+            Token::Mention { user, .. } => {
+                let name = app.chats.mention_label(user, &msg.mentions, &own);
+                spans.extend(emoji_spans(&format!("@{name}"), |sp| sp.color(p.link)));
+            }
         }
     }
     iced::widget::rich_text::<String, Message, iced::Theme, iced::Renderer>(spans)
@@ -1564,14 +1547,9 @@ pub fn dialog<'a>(app: &'a App) -> Option<El<'a>> {
                 col = col.push(
                     row![
                         avatar_for(app, &r.reactor, false, 36.0),
-                        text(name)
-                            .size(15)
-                            .color(p.text_primary)
-                            .shaping(text::Shaping::Advanced)
+                        container(emoji_text(name, 15.0, p.text_primary, theme::INTER, false))
                             .width(Length::Fill),
-                        text(r.emoji.as_str())
-                            .size(22)
-                            .shaping(text::Shaping::Advanced),
+                        text(r.emoji.as_str()).size(22).font(emoji_font()),
                     ]
                     .spacing(12)
                     .align_y(Alignment::Center),
@@ -2035,6 +2013,7 @@ mod layout_tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
     }

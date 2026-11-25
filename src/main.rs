@@ -97,6 +97,8 @@ fn main() -> iced::Result {
     // is opened by `App::boot` (unless `--minimized`).
     let data_dir = cfg.data_dir.clone();
     let mock = cfg.mock;
+    // Colour emoji everywhere, the composer included (see `ui::emoji_font`).
+    ui::emoji_font::install();
     let result = iced::daemon(move || App::boot(cfg.clone()), App::update, ui::view_window)
         .title(App::title)
         .theme(App::iced_theme)

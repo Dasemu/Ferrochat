@@ -166,6 +166,7 @@ async fn sending_text_walks_the_receipt_state_machine() {
         expires_at: None,
         reply: None,
         edited: false,
+        mentions: Vec::new(),
         reactions: Vec::new(),
     };
     d.apply(Event::Messages {
@@ -314,6 +315,7 @@ async fn live_incoming_message_bumps_unread() {
         expires_at: None,
         reply: None,
         edited: false,
+        mentions: Vec::new(),
         reactions: Vec::new(),
     });
     drain(&mut stream, &mut d).await;
@@ -340,6 +342,7 @@ async fn offline_drain_counts_unread_once() {
         expires_at: None,
         reply: None,
         edited: false,
+        mentions: Vec::new(),
         reactions: Vec::new(),
     };
     client.simulate_offline_drain(vec![msg("OFF1"), msg("OFF2")]);

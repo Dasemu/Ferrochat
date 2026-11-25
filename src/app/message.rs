@@ -63,8 +63,8 @@ pub enum Ui {
     OpenChat(ChatId),
     /// Escape / back.
     CloseChat,
-    /// Composer edited.
-    Composer(String),
+    /// Composer edited (typing, cursor moves, paste, Shift+Enter).
+    ComposerAction(iced::widget::text_editor::Action),
     /// Enter / send button.
     Send,
     /// Paperclip.
@@ -81,6 +81,10 @@ pub enum Ui {
     ToggleEmoji,
     /// Emoji picked.
     Emoji(&'static str),
+    /// Emoji picker search box edited.
+    EmojiSearch(String),
+    /// Emoji picker category tab: scroll to its section.
+    EmojiCategory(crate::app::emoji::Category),
     /// Mic pressed: start recording.
     StartRecording,
     /// Stop recording; send or discard.

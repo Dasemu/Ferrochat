@@ -1,6 +1,8 @@
 //! Views. Pure functions `&App -> Element<Message>`.
 
 pub mod chat;
+pub mod emoji_font;
+pub mod emoji_picker;
 pub mod icons;
 pub mod login;
 pub mod measure;
@@ -315,8 +317,12 @@ pub fn tail<'a>(color: Color, outgoing: bool) -> El<'a> {
 
 /// Truncates to `n` characters with an ellipsis.
 pub fn ellipsize(s: &str, n: usize) -> String {
-    let mut out: String = s.chars().take(n).collect();
-    if s.chars().count() > n {
+    // By grapheme cluster: a cut inside a flag, keycap, skin tone or ZWJ
+    // sequence would leave half an emoji (two letters, a bare person).
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut g = s.graphemes(true);
+    let mut out: String = g.by_ref().take(n).collect();
+    if g.next().is_some() {
         out.push('…');
     }
     out
@@ -330,6 +336,15 @@ pub fn vstack<'a>(items: Vec<El<'a>>) -> El<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ellipsize_never_splits_an_emoji_sequence() {
+        let fam = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let flag = "\u{1F1EA}\u{1F1F8}";
+        assert_eq!(ellipsize(&format!("ab{fam}{flag}"), 3), format!("ab{fam}…"));
+        assert_eq!(ellipsize(&format!("a{flag}"), 2), format!("a{flag}"));
+        assert_eq!(ellipsize("hello", 10), "hello");
+    }
 
     #[test]
     fn ellipsis() {

@@ -247,6 +247,7 @@ impl B {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         });
     }
@@ -987,6 +988,7 @@ pub fn long_history(chat: &str, n: usize, until: i64) -> Vec<Message> {
                 expires_at: None,
                 reply: None,
                 edited: false,
+                mentions: Vec::new(),
                 reactions: Vec::new(),
             }
         })

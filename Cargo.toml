@@ -76,6 +76,12 @@ openh264 = { version = "0.9", optional = true }
 mp4 = { version = "0.14", optional = true }
 # Pure-Rust AAC decoder + MP4 audio demuxer (symphonia is already in the tree through rodio).
 symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"], optional = true }
+# Grapheme clusters, so keycaps, flags and ZWJ emoji are never split (already in the tree via iced).
+unicode-segmentation = "1"
+# Script type of cosmic-text's font fallback trait (Twemoji first); already in the tree via cosmic-text.
+unicode-script = "0.5"
+# Unicode emoji list with groups, names and shortcodes for the picker (data only, no deps); same crate as Ferrocord.
+emojis = "0.9"
 # Renders the app's SVG icon to ARGB32 tray pixmaps / the window icon (already in the tree via iced's svg).
 resvg = { version = "0.45", default-features = false }
 
@@ -84,6 +90,8 @@ resvg = { version = "0.45", default-features = false }
 ksni = { version = "0.3", default-features = false, features = ["async-io"] }
 
 [dev-dependencies]
+# Reads the bundled Twemoji's tables in tests (already in the tree via fontdb).
+ttf-parser = "0.25"
 # Runs `iced::Task`s headlessly so tests can drive the app against the fake client
 # (same crate version iced already uses; dev-only).
 iced_runtime = "0.14"

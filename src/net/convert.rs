@@ -367,6 +367,28 @@ pub fn context_info(msg: &wa::Message) -> Option<&wa::ContextInfo> {
         })
 }
 
+/// JIDs the message's text or caption mentions (`contextInfo.mentionedJid`),
+/// bare, deduplicated and bounded.
+pub fn mentions_from_wa(msg: &wa::Message) -> Vec<String> {
+    let Some(ci) = context_info(msg) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for j in ci.mentioned_jid.iter() {
+        if j.len() > 64 || !j.contains('@') {
+            continue;
+        }
+        let j = bare_jid(j);
+        if !out.contains(&j) {
+            out.push(j);
+        }
+        if out.len() == super::types::MAX_MENTIONS {
+            break;
+        }
+    }
+    out
+}
+
 /// The quoted message of a reply, if the message is one.
 pub fn quote_from_wa(msg: &wa::Message) -> Option<Quote> {
     let ci = context_info(msg)?;
@@ -509,6 +531,7 @@ pub fn message_from_envelope(env: &Envelope, msg: &wa::Message) -> Option<Messag
         }),
         edited: false,
         reactions: Vec::new(),
+        mentions: mentions_from_wa(msg),
     })
 }
 
@@ -625,6 +648,11 @@ pub fn message_from_web_info(
             .iter()
             .filter_map(|r| reaction_from_web(chat, r))
             .collect(),
+        mentions: wmi
+            .message
+            .as_option()
+            .map(mentions_from_wa)
+            .unwrap_or_default(),
     })
 }
 
@@ -1152,6 +1180,41 @@ mod parity_tests {
         assert_eq!(q.id, "ORIG");
         assert_eq!(q.sender, "34699000111@s.whatsapp.net");
         assert_eq!(q.preview, "where are you?");
+    }
+
+    #[test]
+    fn mentioned_jids_are_parsed_bare_deduplicated_and_bounded() {
+        let mk = |jids: Vec<String>| wa::Message {
+            extended_text_message: buffa_some(wa::message::ExtendedTextMessage {
+                text: Some("@123456789012345 hi".into()),
+                context_info: buffa_some(wa::ContextInfo {
+                    mentioned_jid: jids,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let msg = mk(vec![
+            "123456789012345@lid".into(),
+            "34600111222:3@s.whatsapp.net".into(),
+            "123456789012345@lid".into(),
+            "garbage".into(),
+        ]);
+        let m = message_from_envelope(&env(), &msg).unwrap();
+        assert_eq!(
+            m.mentions,
+            vec![
+                "123456789012345@lid".to_string(),
+                "34600111222@s.whatsapp.net".to_string()
+            ]
+        );
+        let many = mk((0..5000).map(|i| format!("{i}@lid")).collect());
+        assert_eq!(
+            mentions_from_wa(&many).len(),
+            crate::net::types::MAX_MENTIONS
+        );
+        assert!(mentions_from_wa(&build_text("plain")).is_empty());
     }
 
     #[test]

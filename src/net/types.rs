@@ -366,6 +366,9 @@ pub struct Message {
     pub edited: bool,
     /// Reactions, one per reactor, oldest first.
     pub reactions: Vec<Reaction>,
+    /// JIDs mentioned in the text (`contextInfo.mentionedJid`): PN or LID,
+    /// the text then carries "@<user part>".
+    pub mentions: Vec<String>,
 }
 
 impl fmt::Debug for Message {
@@ -388,6 +391,7 @@ impl fmt::Debug for Message {
             .field("reply", &self.reply)
             .field("edited", &self.edited)
             .field("reactions", &self.reactions.len())
+            .field("mentions", &self.mentions.len())
             .finish_non_exhaustive()
     }
 }
@@ -412,6 +416,10 @@ impl fmt::Debug for Quote {
 
 /// Longest quote preview kept (characters).
 pub const QUOTE_PREVIEW_MAX: usize = 160;
+
+/// Most mentioned JIDs kept per message (a group has at most ~1024
+/// members; anything longer is garbage).
+pub const MAX_MENTIONS: usize = 1024;
 
 impl Quote {
     /// Quote of `msg` as shown in the reply bubble.
@@ -1053,6 +1061,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
     }

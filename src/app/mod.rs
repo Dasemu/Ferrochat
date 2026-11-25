@@ -1,6 +1,8 @@
 //! App state and the single `update` mutation point.
 
 mod actions;
+pub mod composer;
+pub mod emoji;
 pub mod input;
 pub mod linkify;
 pub mod lists;
@@ -203,8 +205,12 @@ pub struct App {
     pub(crate) list_dialog: Option<ListDialog>,
     pub(crate) open: Option<Conversation>,
     pending_read: usize,
-    pub(crate) composer: String,
+    pub(crate) composer: composer::Composer,
+    /// Drafts of the chats that are not open.
+    pub(crate) drafts: composer::Drafts,
     pub(crate) emoji_open: bool,
+    /// Emoji picker search and recent emoji.
+    pub(crate) emoji: emoji::Picker,
     /// Attachment preview (picked or pasted media waiting for "send").
     pub(crate) attach: Option<paste::AttachPreview>,
     pub(crate) menu_open: bool,
@@ -430,6 +436,12 @@ impl App {
             }
         };
         let own_jid = store.kv("own_jid").ok().flatten();
+        let recent_emoji = store
+            .kv(emoji::RECENT_KEY)
+            .ok()
+            .flatten()
+            .map(|j| emoji::parse_recent(&j))
+            .unwrap_or_default();
         let _ = store.prune_expired(now_secs());
         let mut lid_map = LidMap::default();
         let mut chats = chats;
@@ -483,8 +495,13 @@ impl App {
             list_dialog: None,
             open: None,
             pending_read: 0,
-            composer: String::new(),
+            composer: composer::Composer::new(),
+            drafts: composer::Drafts::default(),
             emoji_open: false,
+            emoji: emoji::Picker {
+                recent: recent_emoji,
+                ..Default::default()
+            },
             attach: None,
             menu_open: false,
             qr: None,
@@ -573,6 +590,14 @@ impl App {
                     Some((ScreenshotTarget::Video, _)) => 9000,
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
+                    Some((
+                        ScreenshotTarget::Composer
+                        | ScreenshotTarget::Emoji
+                        | ScreenshotTarget::Viewer
+                        | ScreenshotTarget::Info
+                        | ScreenshotTarget::GroupInfo,
+                        _,
+                    )) => 5000,
                     // Scenes that wait for statuses, stars or communities.
                     Some((t, _)) if t.is_nav() => 6000,
                     _ => 2500,
@@ -791,6 +816,8 @@ impl App {
                 let mut task = Task::none();
                 if !consumed && !self.emoji_open && !self.menu_open {
                     task = self.compose_stop();
+                    self.stash_draft();
+                    self.composer.clear();
                     self.open = None;
                     self.hovered = None;
                 }
@@ -801,9 +828,10 @@ impl App {
                 }
                 return task;
             }
-            Ui::Composer(t) => {
-                self.composer = t;
-                return self.compose_input();
+            Ui::ComposerAction(action) => {
+                if self.composer.perform(action) {
+                    return self.compose_input();
+                }
             }
             Ui::Send => {
                 if self.editing.is_some() {
@@ -841,8 +869,18 @@ impl App {
             }
             Ui::AttachSend => return self.send_attachment(),
             Ui::AttachCancel => self.attach = None,
-            Ui::ToggleEmoji => self.emoji_open = !self.emoji_open,
-            Ui::Emoji(e) => self.composer.push_str(e),
+            Ui::ToggleEmoji => {
+                self.emoji_open = !self.emoji_open;
+                self.emoji.opened();
+                if !self.emoji_open {
+                    return operation::focus(COMPOSER_ID);
+                }
+            }
+            Ui::Emoji(e) => {
+                return self.pick_emoji(e);
+            }
+            Ui::EmojiSearch(q) => self.emoji.query = q,
+            Ui::EmojiCategory(c) => return self.scroll_picker_to(c),
             Ui::StartRecording => {
                 // Device I/O happens on the recorder's own thread.
                 self.recorder = Some(Recorder::start());
@@ -1022,8 +1060,12 @@ impl App {
             .unwrap_or(0);
         self.chats.mark_read(&chat);
         let paused = self.compose_stop();
+        self.stash_draft();
         self.open = Some(Conversation::new(chat.clone(), Vec::new(), false));
-        self.composer.clear();
+        match self.drafts.take(&chat) {
+            Some(d) => self.composer.set_text(&d),
+            None => self.composer.clear(),
+        }
         self.attach = None;
         self.reply_to = None;
         self.editing = None;
@@ -1068,6 +1110,7 @@ impl App {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
     }
@@ -1091,7 +1134,7 @@ impl App {
     }
 
     fn send_text(&mut self) -> Task<Message> {
-        let text = self.composer.trim().to_string();
+        let text = self.composer.text().trim().to_string();
         let Some(chat) = self.open.as_ref().map(|c| c.chat.clone()) else {
             return Task::none();
         };
@@ -1197,8 +1240,8 @@ impl App {
             return Task::none();
         }
         let staged = *staged;
-        if let Some(text) = paste::strip_pasted_paths(&self.composer, &staged.pasted_paths) {
-            self.composer = text;
+        if let Some(text) = paste::strip_pasted_paths(&self.composer.text(), &staged.pasted_paths) {
+            self.composer.set_text(&text);
         }
         if let Some(first) = staged.problems.first() {
             let more = staged.problems.len() - 1;
@@ -1511,6 +1554,8 @@ impl App {
     fn cleanup_session(&mut self) -> Task<Message> {
         self.client = None;
         self.open = None;
+        self.composer.clear();
+        self.drafts = composer::Drafts::default();
         self.chats = ChatList::default();
         self.images.clear();
         self.thumbs.clear();
@@ -2146,7 +2191,7 @@ impl App {
                         let (summary, body) = crate::notify::notification_text(
                             &sender,
                             group.as_deref(),
-                            &m.content.preview(),
+                            &self.preview(m),
                             mode,
                         );
                         (summary, body, Some(m.chat.clone()))
@@ -2488,6 +2533,19 @@ impl App {
                 })));
                 v.push(ui(Ui::AttachCaption("Look at this sunset".into())));
             }
+            ScreenshotTarget::Composer => {
+                use iced::widget::text_editor::{Action, Edit};
+                v.push(ui(Ui::ComposerAction(Action::Edit(Edit::Paste(Arc::new(
+                    "Sounds good!\nI'll bring the cake \u{1F382}\nSee you at 8 \u{1F44B}\u{1F3FD}"
+                        .into(),
+                ))))));
+            }
+            ScreenshotTarget::Emoji => {
+                v.push(ui(Ui::Emoji("\u{1F602}")));
+                v.push(ui(Ui::Emoji("\u{2764}\u{FE0F}")));
+                v.push(ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")));
+                v.push(ui(Ui::ToggleEmoji));
+            }
             ScreenshotTarget::Delete => {
                 if let Some(a) = find("Llevo yo el café") {
                     v.push(ui(Ui::AskDelete(a)));
@@ -2509,19 +2567,14 @@ impl App {
         v
     }
 
-    /// Display name of an `@<user>` mention in message text, from the saved,
-    /// business or push name of that number (or LID).
-    pub fn mention_name(&self, user: &str) -> Option<String> {
-        let pn = format!("{user}@s.whatsapp.net");
-        let jid = if self.chats.names.best(&pn).is_some() {
-            pn
-        } else {
-            self.lid_map.normalize(&format!("{user}@lid"))
-        };
-        if self.own_jid.as_deref() == Some(jid.as_str()) {
-            return Some("You".into());
-        }
-        self.chats.names.best(&jid).map(|(_, n)| n.to_string())
+    /// Our own JIDs, for "@You" mentions.
+    pub fn own_ids(&self) -> Vec<&str> {
+        self.own_jid.as_deref().into_iter().collect()
+    }
+
+    /// One-line preview of a message, mentions shown as "@Name".
+    pub fn preview(&self, m: &ChatMessage) -> String {
+        self.chats.preview(m, &self.own_ids())
     }
 
     /// Logical size of the main window.

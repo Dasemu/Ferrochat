@@ -133,6 +133,11 @@ impl NameBook {
         self.alias.insert(pn.to_string(), lid.to_string());
     }
 
+    /// The other id (LID or phone-number JID) of the same person, if known.
+    pub fn alias_of(&self, jid: &str) -> Option<&str> {
+        self.alias.get(jid).map(String::as_str)
+    }
+
     /// Every address-book name as `(jid, name)`.
     pub fn saved(&self) -> impl Iterator<Item = (&str, &str)> {
         self.saved.iter().map(|(j, n)| (j.as_str(), n.as_str()))
@@ -314,6 +319,81 @@ impl ChatList {
             Some(n) => Resolved::ChatName(n),
             None => Resolved::Number(fallback_name(jid)),
         }
+    }
+
+    /// The JID an "@<user>" in a message's text refers to: the mentioned
+    /// JID with that user part (`contextInfo.mentionedJid`), else a guess
+    /// for rows cached before mentions were stored: a LID we know, else the
+    /// phone number.
+    pub fn mention_target(&self, user: &str, mentions: &[String]) -> String {
+        if let Some(j) = mentions.iter().find(|j| j.split('@').next() == Some(user)) {
+            return j.clone();
+        }
+        let lid = format!("{user}@lid");
+        if self.names.alias_of(&lid).is_some() || self.names.best(&lid).is_some() {
+            return lid;
+        }
+        format!("{user}@s.whatsapp.net")
+    }
+
+    /// How a mention is shown, without the "@": "You", the saved, business
+    /// or push name (same order as [`resolve`](Self::resolve), over the LID
+    /// and its phone number), else the formatted phone number. A LID nobody
+    /// has named and whose number is unknown never shows as digits: it reads
+    /// "Unknown".
+    pub fn mention_label(&self, user: &str, mentions: &[String], own: &[&str]) -> String {
+        let jid = self.mention_target(user, mentions);
+        let other = self.names.alias_of(&jid).map(str::to_string);
+        if own
+            .iter()
+            .any(|o| *o == jid || other.as_deref() == Some(*o))
+        {
+            return "You".into();
+        }
+        let pn = if jid.ends_with("@lid") {
+            other.filter(|o| o.ends_with("@s.whatsapp.net"))
+        } else {
+            Some(jid.clone())
+        };
+        match self.resolve(&jid, None) {
+            Resolved::Saved(n) | Resolved::Business(n) | Resolved::Push(n) => n,
+            Resolved::ChatName(_) | Resolved::Number(_) => match pn {
+                Some(pn) => match self.resolve(&pn, None) {
+                    Resolved::Saved(n)
+                    | Resolved::Business(n)
+                    | Resolved::Push(n)
+                    | Resolved::ChatName(n) => n,
+                    Resolved::Number(_) => fallback_name(&pn),
+                },
+                None => "Unknown".into(),
+            },
+        }
+    }
+
+    /// `text` with every "@<user>" mention replaced by "@Name" (chat list
+    /// preview, notifications, quotes).
+    pub fn render_mentions(&self, text: &str, mentions: &[String], own: &[&str]) -> String {
+        use crate::app::linkify::{Token, tokenize};
+        if !text.contains('@') {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        for tok in tokenize(text) {
+            match tok {
+                Token::Mention { user, .. } => {
+                    out.push('@');
+                    out.push_str(&self.mention_label(user, mentions, own));
+                }
+                Token::Text(t) => out.push_str(t),
+                Token::Url { text, .. } | Token::Email { text, .. } => out.push_str(text),
+            }
+        }
+        out
+    }
+
+    /// One-line preview of a message with its mentions shown as names.
+    pub fn preview(&self, m: &Message, own: &[&str]) -> String {
+        self.render_mentions(&m.content.preview(), &m.mentions, own)
     }
 
     /// Diagnostics: how the one-to-one chats are named right now.
@@ -1014,6 +1094,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
     }
@@ -1607,5 +1688,110 @@ mod tests {
         );
         l.set_last("a", None);
         assert!(l.get("a").unwrap().last.is_none());
+    }
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+
+    const LID: &str = "123456789012345@lid";
+    const PN: &str = "34600111222@s.whatsapp.net";
+
+    fn list() -> ChatList {
+        ChatList::from_rows(Vec::new(), NameBook::default())
+    }
+
+    #[test]
+    fn lid_mention_uses_the_saved_name_of_its_phone_number() {
+        let mut l = list();
+        l.names.link(LID, PN);
+        l.set_name(PN, NameSource::Saved, "Ana García");
+        let mentions = vec![LID.to_string()];
+        assert_eq!(
+            l.mention_label("123456789012345", &mentions, &[]),
+            "Ana García"
+        );
+        assert_eq!(
+            l.render_mentions("hola @123456789012345!", &mentions, &[]),
+            "hola @Ana García!"
+        );
+    }
+
+    #[test]
+    fn name_order_is_saved_business_push() {
+        let mut l = list();
+        let mentions = vec![LID.to_string()];
+        l.set_name(LID, NameSource::Push, "Ani");
+        assert_eq!(l.mention_label("123456789012345", &mentions, &[]), "Ani");
+        l.set_name(LID, NameSource::Business, "Ana Shop");
+        assert_eq!(
+            l.mention_label("123456789012345", &mentions, &[]),
+            "Ana Shop"
+        );
+        l.names.link(LID, PN);
+        l.set_name(PN, NameSource::Saved, "Ana");
+        assert_eq!(l.mention_label("123456789012345", &mentions, &[]), "Ana");
+    }
+
+    #[test]
+    fn unnamed_mentions_fall_back_to_the_phone_number_never_the_lid() {
+        let mut l = list();
+        let mentions = vec![LID.to_string()];
+        // Unknown LID: no digits at all.
+        assert_eq!(
+            l.mention_label("123456789012345", &mentions, &[]),
+            "Unknown"
+        );
+        // Known number: formatted.
+        l.names.link(LID, PN);
+        assert_eq!(
+            l.mention_label("123456789012345", &mentions, &[]),
+            "+34 600 111 222"
+        );
+        // A phone-number mention without a name.
+        assert_eq!(
+            l.mention_label("34600111222", &[PN.to_string()], &[]),
+            "+34 600 111 222"
+        );
+    }
+
+    #[test]
+    fn own_mentions_read_you_and_rows_without_mentions_guess() {
+        let mut l = list();
+        l.names.link(LID, PN);
+        assert_eq!(
+            l.mention_label("123456789012345", &[LID.to_string()], &[PN]),
+            "You"
+        );
+        // Cached before mentions were stored: a LID we know is found.
+        l.set_name(PN, NameSource::Saved, "Ana");
+        assert_eq!(l.mention_label("123456789012345", &[], &[]), "Ana");
+        assert_eq!(l.mention_label("34600111222", &[], &[]), "Ana");
+    }
+
+    #[test]
+    fn chat_list_preview_shows_names() {
+        let mut l = list();
+        l.names.link(LID, PN);
+        l.set_name(PN, NameSource::Saved, "Ana");
+        let mut msg = Message {
+            id: "1".into(),
+            chat: "g@g.us".into(),
+            sender: PN.into(),
+            sender_name: None,
+            from_me: false,
+            timestamp: 1,
+            content: Content::Text("@123456789012345 can you bring the cake?".into()),
+            status: ReceiptStatus::Read,
+            expires_at: None,
+            reply: None,
+            edited: false,
+            mentions: vec![LID.into()],
+            reactions: Vec::new(),
+        };
+        assert_eq!(l.preview(&msg, &[]), "@Ana can you bring the cake?");
+        msg.content = Content::Text("mail me at a@b.com, @x".into());
+        assert_eq!(l.preview(&msg, &[]), "mail me at a@b.com, @x");
     }
 }

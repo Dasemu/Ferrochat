@@ -480,6 +480,7 @@ impl WaClient for FakeClient {
                             expires_at: None,
                             reply: None,
                             edited: false,
+                            mentions: Vec::new(),
                             reactions: Vec::new(),
                         }],
                         origin: Origin::Live,

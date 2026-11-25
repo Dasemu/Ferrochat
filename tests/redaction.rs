@@ -50,6 +50,7 @@ fn logs_do_not_leak_secrets() {
         expires_at: None,
         reply: None,
         edited: false,
+        mentions: Vec::new(),
         reactions: Vec::new(),
     };
     let doc = Content::Document {
