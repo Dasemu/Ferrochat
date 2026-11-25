@@ -53,6 +53,10 @@ pub enum ScreenshotTarget {
     HeaderMenu,
     /// Conversation with the attachment preview of a pasted image.
     Paste,
+    /// Call bubbles in a chat and an incoming call ringing.
+    Call,
+    /// A call in progress.
+    CallActive,
 }
 
 impl ScreenshotTarget {
@@ -117,6 +121,8 @@ impl ScreenshotTarget {
             "starred" => Some(Self::Starred),
             "header-menu" | "menu-header" => Some(Self::HeaderMenu),
             "paste" | "attach" => Some(Self::Paste),
+            "call" | "call-incoming" => Some(Self::Call),
+            "call-active" => Some(Self::CallActive),
             _ => None,
         }
     }
