@@ -96,6 +96,7 @@ fn logs_do_not_leak_secrets() {
         height: 1,
         thumbnail: None,
         media: None,
+        gif: false,
     };
     tracing::subscriber::with_default(subscriber, || {
         tracing::debug!(?quote, ?reaction, ?key, message = ?replying, video = ?video, "parity types");

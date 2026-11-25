@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|chat-menu|mute|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|chat-menu|mute|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|attach-video|attach-gif|drop|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -113,6 +113,15 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   image. File managers also paste the paths as text: `strip_pasted_paths`
   removes them. Picked and pasted media both go through `AttachPreview`;
   its image handle is made in `update`.
+- Sending video / GIF (`app/paste.rs`): `.mp4`/`.m4v` (and `.gif`, converted first) are staged as documents, then
+  `paste::finish_videos` runs the helper (`media::video::probe`, muted; `gif_to_mp4` = `ferrochat-player
+  --gif-to-mp4`) as a child process, never on the blocking pool; a failure keeps the document. All file
+  sources (paperclip, paste, drop) go through `paste::stage_paths` / `finish_videos`. The GIF encoder lives
+  in `src/bin/ferrochat-player/gif.rs` (OpenH264 encoder + `mp4` writer): the main binary still links no codec.
+  `Content::Video::gif` is `#[serde(default)]` (old rows = plain video); GIFs loop in the viewer (`VideoView::looping`).
+- Drag and drop (`app/drop.rs`): one `FileDropped` per file, gathered for `drop::GATHER` and staged together;
+  the overlay follows `FileHovered` / `FilesHoveredLeft`. winit 0.30 has no drag and drop on native Wayland
+  (works on X11 / XWayland, Windows, macOS).
 - Never park an unbounded wait on tokio's blocking pool: iced drops its runtime on quit and that waits for
   every `spawn_blocking` task (KDE keeps notifications open, so a click watch there hung Quit). Notification
   click watches run on detached threads (`notify::show`); `tests/notify_quit.rs` guards it.

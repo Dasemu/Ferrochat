@@ -60,6 +60,10 @@ automatic check off in Settings; it only asks GitHub for the latest release.
 |---|---|
 | ![](docs/screenshots/select.png) | ![](docs/screenshots/forward.png) |
 
+| Send a video | Send a GIF | Drag and drop |
+|---|---|---|
+| ![](docs/screenshots/attach-video.png) | ![](docs/screenshots/attach-gif.png) | ![](docs/screenshots/drop.png) |
+
 ## Features
 
 * QR-code pairing as a linked device (codes refresh automatically, reload
@@ -68,8 +72,11 @@ automatic check off in Settings; it only asks GitHub for the latest release.
   unread badges, pinned and muted markers, last-message preview with ticks.
 * History from WhatsApp's history sync, cached in SQLite; older pages load
   when scrolling up.
-* Send and receive text, photos, documents and voice notes (record with the
-  mic button, play back with a waveform).
+* Send and receive text, photos, videos, GIFs, documents and voice notes
+  (record with the mic button, play back with a waveform). MP4s go as
+  videos and GIFs are converted to silent MP4s like WhatsApp does; pick,
+  paste or drag and drop files onto the chat (drag and drop needs X11 /
+  XWayland, Windows or macOS: winit has none on native Wayland yet).
 * Read receipts, both ways: grey / blue ticks on your messages, read and
   played receipts sent when you open a chat or play a voice note.
 * Profile pictures for chats and contacts (bounded in-memory LRU plus a disk
@@ -83,7 +90,8 @@ automatic check off in Settings; it only asks GitHub for the latest release.
   "typing…" presence.
 * Search in the chat list (chats and cached messages) and inside a chat, with
   jump to the result.
-* Video (thumbnail and duration, opens in the system player) and stickers
+* Video (thumbnail and duration, plays in the app; GIFs are labelled and
+  loop) and stickers
   (WebP, static; animated ones show their first frame).
 * Group ticks turn blue only once every participant has read the message.
 * Desktop notifications (sender + preview, or sender only).
@@ -109,7 +117,8 @@ PipeWire, D-Bus, a Secret Service (KWallet or GNOME Keyring) and
 `xdg-open`. Videos play inside the app through a small helper,
 `ferrochat-player` (installed next to `ferrochat`) that needs no codec
 package: it decodes MP4 with H.264 (OpenH264, built from source and linked
-statically) and AAC (symphonia, pure Rust). Videos in other formats (H.265)
+statically) and AAC (symphonia, pure Rust); it also reads videos before
+they are sent and turns GIFs into MP4 (OpenH264's encoder). Videos in other formats (H.265)
 show which codec is missing and an "Open externally" button. Build with
 `--no-default-features` to leave the helper out. Linux (KDE Plasma / Wayland) is the primary
 target; Windows and macOS should build but are not tested.
