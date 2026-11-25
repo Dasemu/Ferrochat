@@ -8,9 +8,9 @@ use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::Event;
 use super::types::{
-    ChatFlag, ChatMeta, Content, LinkPreview, ListDef, ListKind, MediaKind, MediaRef, Message,
-    MsgKey, NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote, Reaction,
-    ReceiptStatus,
+    ChatFlag, ChatMeta, Content, LinkPreview, ListDef, ListKind, MUTE_FOREVER, MUTE_OFF, MediaKind,
+    MediaRef, Message, MsgKey, NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote,
+    Reaction, ReceiptStatus, mute_active,
 };
 
 /// Unwraps ephemeral / view-once / edited / caption wrappers (up to a few
@@ -330,11 +330,24 @@ pub fn pin_flag(a: &wa::sync_action_value::PinAction) -> ChatFlag {
     ChatFlag::Pinned(a.pinned.unwrap_or(false))
 }
 
-/// See [`archive_flag`]. A mute whose end time has passed counts as unmuted.
-pub fn mute_flag(a: &wa::sync_action_value::MuteAction, now_secs: i64) -> ChatFlag {
-    let end = a.mute_end_timestamp.unwrap_or(0);
-    // WhatsApp uses -1 for "forever"; the timestamp is in seconds.
-    ChatFlag::Muted(a.muted.unwrap_or(false) && (end <= 0 || end > now_secs))
+/// See [`archive_flag`]. The end time is kept as sent (an expired one
+/// simply no longer counts, see [`ChatMeta::is_muted`]).
+pub fn mute_flag(a: &wa::sync_action_value::MuteAction) -> ChatFlag {
+    if !a.muted.unwrap_or(false) {
+        return ChatFlag::Muted(MUTE_OFF);
+    }
+    ChatFlag::Muted(mute_end_secs(a.mute_end_timestamp.unwrap_or(MUTE_FOREVER)))
+}
+
+/// A protocol mute end (milliseconds in sync actions, seconds in older
+/// history blobs; `-1` or `0` = forever) as [`ChatMeta::mute_end`].
+pub fn mute_end_secs(raw: i64) -> i64 {
+    match raw {
+        r if r <= 0 => MUTE_FOREVER,
+        // Later than year 5000 in seconds: it is milliseconds.
+        r if r > 100_000_000_000 => r / 1000,
+        r => r,
+    }
 }
 
 /// The `contextInfo` of whichever body the message carries.
@@ -789,7 +802,14 @@ pub fn chat_from_conversation(conv: &wa::Conversation, now: i64) -> ChatMeta {
         last_ts,
         pinned: conv.pinned.unwrap_or_default() > 0,
         archived: conv.archived.unwrap_or(false),
-        muted: conv.mute_end_time.is_some_and(|t| t as i64 > now),
+        // `u64::MAX` (-1) means "forever"; an expired mute is not muted.
+        mute_end: match conv.mute_end_time.map(|t| t as i64) {
+            Some(t) if t != 0 => match mute_end_secs(t) {
+                end if mute_active(end, now) => end,
+                _ => MUTE_OFF,
+            },
+            _ => MUTE_OFF,
+        },
     }
 }
 
@@ -1810,11 +1830,20 @@ mod name_and_list_tests {
             mute_end_timestamp: Some(end),
             ..Default::default()
         };
-        assert_eq!(mute_flag(&mute(true, -1), 1000), ChatFlag::Muted(true));
-        assert_eq!(mute_flag(&mute(true, 2000), 1000), ChatFlag::Muted(true));
-        // The mute already expired.
-        assert_eq!(mute_flag(&mute(true, 500), 1000), ChatFlag::Muted(false));
-        assert_eq!(mute_flag(&mute(false, 0), 1000), ChatFlag::Muted(false));
+        assert_eq!(mute_flag(&mute(true, -1)), ChatFlag::Muted(MUTE_FOREVER));
+        // Sync actions count in milliseconds; the app keeps seconds.
+        assert_eq!(
+            mute_flag(&mute(true, 1_800_000_000_000)),
+            ChatFlag::Muted(1_800_000_000)
+        );
+        assert_eq!(mute_flag(&mute(false, 0)), ChatFlag::Muted(MUTE_OFF));
+        assert_eq!(mute_end_secs(1_800_000_000), 1_800_000_000);
+        assert_eq!(mute_end_secs(0), MUTE_FOREVER);
+        // An 8 hour mute set long ago is over.
+        assert!(!mute_active(
+            mute_end_secs(1_000_000_000_000),
+            1_800_000_000
+        ));
     }
 
     #[test]

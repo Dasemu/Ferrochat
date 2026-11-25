@@ -33,6 +33,8 @@ pub enum ScreenshotTarget {
     Lists,
     /// Chat list with a chat's right-click menu open.
     ChatMenu,
+    /// The "Mute notifications" duration dialog.
+    Mute,
     /// The in-app video player.
     Video,
     /// Status tab: recent and viewed updates.
@@ -81,6 +83,7 @@ impl ScreenshotTarget {
                 | Self::Archived
                 | Self::Lists
                 | Self::ChatMenu
+                | Self::Mute
                 | Self::StatusList
                 | Self::StatusViewer
                 | Self::Communities
@@ -124,6 +127,7 @@ impl ScreenshotTarget {
             "archived" => Some(Self::Archived),
             "lists" => Some(Self::Lists),
             "chat-menu" => Some(Self::ChatMenu),
+            "mute" => Some(Self::Mute),
             "video" => Some(Self::Video),
             "status" | "status-list" => Some(Self::StatusList),
             "status-viewer" => Some(Self::StatusViewer),

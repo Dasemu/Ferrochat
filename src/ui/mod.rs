@@ -98,6 +98,9 @@ pub fn view(app: &App) -> El<'_> {
     if let Some(d) = sidebar::list_dialog(app) {
         layers.push(d);
     }
+    if let Some(d) = sidebar::chat_dialog(app) {
+        layers.push(d);
+    }
     if let Some(d) = chat::dialog(app) {
         layers.push(d);
     }
