@@ -13,6 +13,7 @@ pub mod viewer;
 pub use actions::{PopupPos, popup_top, row_id};
 mod background;
 pub mod chat_actions;
+pub mod forward;
 pub use background::WindowGeom;
 #[cfg(test)]
 mod call_flows;
@@ -20,6 +21,8 @@ mod call_flows;
 mod chat_action_flows;
 #[cfg(test)]
 mod flows;
+#[cfg(test)]
+mod forward_flows;
 pub mod live;
 pub mod message;
 pub mod nav;
@@ -216,6 +219,10 @@ pub struct App {
     pub(crate) list_dialog: Option<ListDialog>,
     /// Mute / clear / delete chat dialog.
     pub(crate) chat_dialog: Option<chat_actions::ChatDialog>,
+    /// "Select messages" mode of the open conversation.
+    pub(crate) selection: Option<forward::Selection>,
+    /// "Forward message to" dialog.
+    pub(crate) forward: Option<forward::ForwardDialog>,
     pub(crate) open: Option<Conversation>,
     pending_read: usize,
     /// Display JID -> the JID messages came from (LID-addressed chats and
@@ -525,6 +532,8 @@ impl App {
             sidebar_menu: None,
             list_dialog: None,
             chat_dialog: None,
+            selection: None,
+            forward: None,
             open: None,
             pending_read: 0,
             wire: HashMap::new(),
@@ -850,6 +859,10 @@ impl App {
         if let Ui::Call(c) = ui {
             return self.on_call_ui(c);
         }
+        let ui = match self.on_ui_forward(ui) {
+            Ok(task) => return task,
+            Err(ui) => ui,
+        };
         let ui = match self.on_ui_extra(ui) {
             Ok(task) => return task,
             Err(ui) => ui,
@@ -881,6 +894,7 @@ impl App {
                     || std::mem::take(&mut self.settings_open)
                     || self.list_dialog.take().is_some()
                     || self.chat_dialog.take().is_some()
+                    || self.forward.take().is_some()
                     || self.sidebar_menu.take().is_some()
                     || self.dialog.take().is_some()
                     || self.attach.take().is_some()
@@ -892,6 +906,7 @@ impl App {
                     || self.viewer.take().is_some()
                     || self.info.take().is_some()
                     || self.chat_search.take().is_some()
+                    || self.selection.take().is_some()
                     || self.reply_to.take().is_some()
                     || (self.editing.is_some() && {
                         self.cancel_edit();
@@ -1135,6 +1150,7 @@ impl App {
         if self.open.as_ref().is_some_and(|c| c.chat == chat) {
             return Task::none();
         }
+        self.selection = None;
         let unread = self
             .chats
             .get(&chat)
@@ -1200,6 +1216,7 @@ impl App {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }
@@ -2754,6 +2771,18 @@ impl App {
             }
             ScreenshotTarget::Call => v.extend(call::scene(&c.chat, false)),
             ScreenshotTarget::CallActive => v.extend(call::scene(&c.chat, true)),
+            ScreenshotTarget::Select | ScreenshotTarget::Forward => {
+                if let (Some(a), Some(b)) = (find("Mira esto"), find("Llevo yo el café")) {
+                    v.push(ui(Ui::Forward(forward::Fwd::Select(b))));
+                    v.push(ui(Ui::Forward(forward::Fwd::Toggle(a))));
+                }
+                if target == ScreenshotTarget::Forward {
+                    v.push(ui(Ui::Forward(forward::Fwd::Selected)));
+                    for chat in ["34622222222@s.whatsapp.net", "120363000000000001@g.us"] {
+                        v.push(ui(Ui::Forward(forward::Fwd::Target(chat.into()))));
+                    }
+                }
+            }
             ScreenshotTarget::Delete => {
                 if let Some(a) = find("Llevo yo el café") {
                     v.push(ui(Ui::AskDelete(a)));

@@ -31,7 +31,8 @@ use super::convert::{self, Envelope, Uploaded};
 use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
     ChatState, CollectionResync, ContactInfo, Content, GroupInfo, ListDef, MUTE_OFF, MediaKind,
-    MediaRef, MsgKey, NameSource, Origin, OutgoingKind, OutgoingMedia, Quote, ResyncReport,
+    MediaRef, Message, MsgKey, NameSource, Origin, OutgoingKind, OutgoingMedia, Quote,
+    ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
@@ -178,6 +179,24 @@ impl WaClient for RealClient {
                 .await
                 .map_err(|e| Error::Net(e.to_string()))?;
             Ok(content)
+        })
+    }
+
+    fn forward<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        source: &'a Message,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let msg = convert::build_forward(&source.content, source.forwarded)
+                .ok_or_else(|| Error::Protocol("this message can't be forwarded".into()))?;
+            self.client
+                .send_message_with_options(jid, msg, SendOptions::default().with_message_id(id))
+                .await
+                .map_err(|e| Error::Net(e.to_string()))?;
+            Ok(())
         })
     }
 

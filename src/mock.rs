@@ -266,9 +266,17 @@ impl B {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         });
+    }
+
+    /// Marks the message pushed last as forwarded with this score.
+    fn forwarded(&mut self, score: u32) {
+        if let Some(m) = self.msgs.last_mut() {
+            m.forwarded = Some(score);
+        }
     }
 
     /// Id of the message pushed last.
@@ -574,6 +582,7 @@ pub fn mock_data(now: i64) -> MockData {
         text("Mira esto https://www.rust-lang.org/learn y también www.example.com."),
         Read,
     );
+    b.forwarded(0);
     b.push(
         lucia,
         None,
@@ -1007,6 +1016,7 @@ pub fn long_history(chat: &str, n: usize, until: i64) -> Vec<Message> {
                 expires_at: None,
                 reply: None,
                 edited: false,
+                forwarded: None,
                 mentions: Vec::new(),
                 reactions: Vec::new(),
             }
