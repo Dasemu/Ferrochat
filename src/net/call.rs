@@ -100,14 +100,11 @@ impl CallLog {
 
     /// One line for the chat list and notifications.
     pub fn preview(&self, incoming: bool) -> String {
-        let icon = if self.video { "🎥" } else { "📞" };
         match self.outcome {
-            CallOutcome::Answered => format!(
-                "{icon} {} ({})",
-                self.title(incoming),
-                talk_time(self.seconds)
-            ),
-            _ => format!("{icon} {}", self.title(incoming)),
+            CallOutcome::Answered => {
+                format!("{} ({})", self.title(incoming), talk_time(self.seconds))
+            }
+            _ => self.title(incoming),
         }
     }
 
@@ -771,7 +768,7 @@ mod tests {
         let l = log_from_message(&c);
         assert_eq!(l.outcome, CallOutcome::Answered);
         assert_eq!(l.seconds, 125);
-        assert_eq!(l.preview(false), "📞 Voice call (2 min)");
+        assert_eq!(l.preview(false), "Voice call (2 min)");
         let missed = wa::message::CallLogMessage {
             is_video: Some(true),
             call_outcome: Some(O::MISSED),

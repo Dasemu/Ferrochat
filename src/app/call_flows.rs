@@ -90,7 +90,7 @@ async fn unanswered_call_becomes_an_unread_missed_call_bubble() {
     assert_eq!(entry.meta.unread, before + 1);
     assert_eq!(
         entry.last.as_ref().unwrap().content.preview(),
-        "🎥 Missed video call"
+        "Missed video call"
     );
 }
 

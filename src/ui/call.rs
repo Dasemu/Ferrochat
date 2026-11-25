@@ -113,6 +113,7 @@ pub fn panel(app: &App) -> Option<El<'_>> {
         text(name).size(20).color(p.text_primary),
     ]
     .spacing(8)
+    .width(Length::Fill)
     .align_x(Alignment::Center);
     if c.group {
         col = col.push(
@@ -166,7 +167,7 @@ pub fn panel(app: &App) -> Option<El<'_>> {
     let card = container(col)
         .width(theme::CALL_PANEL_WIDTH)
         .padding(24)
-        .style(theme::bordered(p.bg_elevated, p.border));
+        .style(theme::bordered(p.bg_elevated, p.bg_selected));
     Some(
         container(card)
             .width(Length::Fill)

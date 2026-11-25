@@ -582,6 +582,8 @@ impl App {
                     Some((ScreenshotTarget::Video, _)) => 9000,
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
+                    // Call bubbles are stored, then the call rings.
+                    Some((ScreenshotTarget::Call | ScreenshotTarget::CallActive, _)) => 6000,
                     // Scenes that wait for statuses, stars or communities.
                     Some((t, _)) if t.is_nav() => 6000,
                     _ => 2500,
