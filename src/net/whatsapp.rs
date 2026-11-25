@@ -156,6 +156,7 @@ impl WaClient for RealClient {
             let mt = match media.kind {
                 OutgoingKind::Image { .. } => MediaType::Image,
                 OutgoingKind::Document => MediaType::Document,
+                OutgoingKind::Video { .. } => MediaType::Video,
                 OutgoingKind::Voice { .. } => MediaType::Audio,
             };
             let up = self

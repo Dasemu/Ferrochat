@@ -59,6 +59,12 @@ pub enum ScreenshotTarget {
     HeaderMenu,
     /// Conversation with the attachment preview of a pasted image.
     Paste,
+    /// Attachment preview of a picked MP4 (probed by the helper).
+    AttachVideo,
+    /// Attachment preview of a picked GIF (converted by the helper).
+    AttachGif,
+    /// Files dragged over the open conversation.
+    Drop,
     /// Conversation with the emoji drawer open.
     Emoji,
     /// The full-size image viewer.
@@ -144,6 +150,9 @@ impl ScreenshotTarget {
             "starred" => Some(Self::Starred),
             "header-menu" | "menu-header" => Some(Self::HeaderMenu),
             "paste" | "attach" => Some(Self::Paste),
+            "attach-video" => Some(Self::AttachVideo),
+            "attach-gif" => Some(Self::AttachGif),
+            "drop" => Some(Self::Drop),
             "emoji" | "emoji-picker" => Some(Self::Emoji),
             "viewer" | "image-viewer" => Some(Self::Viewer),
             "info" | "contact-info" => Some(Self::Info),

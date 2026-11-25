@@ -160,6 +160,11 @@ pub enum Content {
         thumbnail: Option<Vec<u8>>,
         /// Where to fetch the video.
         media: Option<MediaRef>,
+        /// A GIF (WhatsApp sends GIFs as silent MP4s with `gifPlayback`):
+        /// labelled "GIF" and looped. Rows cached before this field read as
+        /// plain videos.
+        #[serde(default)]
+        gif: bool,
     },
     /// A sticker (WebP). Rendered statically: animated ones show frame 1.
     Sticker {
@@ -196,9 +201,13 @@ impl Content {
             },
             Content::Document { file_name, .. } => format!("📄 {file_name}"),
             Content::Video {
-                caption, seconds, ..
+                caption,
+                seconds,
+                gif,
+                ..
             } => match caption {
-                Some(c) if !c.is_empty() => format!("🎥 {c}"),
+                Some(c) if !c.is_empty() => format!("{} {c}", if *gif { "GIF" } else { "🎥" }),
+                _ if *gif => "GIF".into(),
                 _ => format!("🎥 {}", format_duration(*seconds)),
             },
             Content::Sticker { .. } => "Sticker".into(),
@@ -1036,6 +1045,20 @@ pub enum OutgoingKind {
     },
     /// Any file.
     Document,
+    /// MP4 video (H.264) with what the helper read from it. GIFs are sent
+    /// as silent MP4s like WhatsApp does (`gif`).
+    Video {
+        /// Duration in seconds.
+        seconds: u32,
+        /// Pixel width.
+        width: u32,
+        /// Pixel height.
+        height: u32,
+        /// Small JPEG thumbnail of the first frame.
+        thumbnail: Vec<u8>,
+        /// Played as a looping, silent GIF.
+        gif: bool,
+    },
     /// Voice note (Ogg/Opus).
     Voice {
         /// Duration in seconds.
@@ -1067,6 +1090,21 @@ impl OutgoingMedia {
                 pages: None,
                 caption: self.caption.clone(),
                 media,
+            },
+            OutgoingKind::Video {
+                seconds,
+                width,
+                height,
+                thumbnail,
+                gif,
+            } => Content::Video {
+                caption: self.caption.clone(),
+                seconds: *seconds,
+                width: *width,
+                height: *height,
+                thumbnail: Some(thumbnail.clone()),
+                media,
+                gif: *gif,
             },
             OutgoingKind::Voice { seconds, waveform } => Content::Voice {
                 seconds: *seconds,
@@ -1289,8 +1327,19 @@ mod tests {
             height: 1,
             thumbnail: None,
             media: None,
+            gif: false,
         };
         assert_eq!(v.preview(), "🎥 1:15");
+        let g = Content::Video {
+            caption: None,
+            seconds: 3,
+            width: 1,
+            height: 1,
+            thumbnail: None,
+            media: None,
+            gif: true,
+        };
+        assert_eq!(g.preview(), "GIF");
         assert_eq!(v.kind_tag(), "video");
         let s = Content::Sticker {
             width: 1,

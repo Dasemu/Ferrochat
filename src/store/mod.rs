@@ -1181,6 +1181,7 @@ mod tests {
             height: 180,
             thumbnail: None,
             media: None,
+            gif: true,
         };
         s.insert_messages(&[m]).unwrap();
         s.set_thumb("c", "v", &[1, 2, 3]).unwrap();
@@ -1189,7 +1190,7 @@ mod tests {
         let got = s.message("c", "v").unwrap().unwrap();
         assert!(matches!(
             got.content,
-            Content::Video { thumbnail: Some(ref t), .. } if t == &[1, 2, 3]
+            Content::Video { thumbnail: Some(ref t), gif: true, .. } if t == &[1, 2, 3]
         ));
     }
 

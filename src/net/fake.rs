@@ -608,6 +608,7 @@ impl WaClient for FakeClient {
             let kind = match media.kind {
                 super::OutgoingKind::Image { .. } => super::MediaKind::Image,
                 super::OutgoingKind::Document => super::MediaKind::Document,
+                super::OutgoingKind::Video { .. } => super::MediaKind::Video,
                 super::OutgoingKind::Voice { .. } => super::MediaKind::Audio,
             };
             let mref = MediaRef {
