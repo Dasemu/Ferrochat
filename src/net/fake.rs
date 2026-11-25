@@ -15,8 +15,9 @@ use tokio::sync::mpsc;
 
 use super::social::{CommunityInfo, PhoneLookup, StatusItem};
 use super::types::{
-    ChatFlag, ChatState, CollectionResync, Content, ListDef, MediaRef, Message, MsgKey, NameSource,
-    Origin, OutgoingMedia, Quote, ReceiptStatus, ResyncReport,
+    ChatFlag, ChatMeta, ChatState, CollectionResync, ContactInfo, Content, GroupInfo, ListDef,
+    MediaRef, Message, MsgKey, NameSource, Origin, OutgoingMedia, Participant, Quote,
+    ReceiptStatus, ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::error::{Error, Result};
@@ -154,6 +155,22 @@ pub enum Sent {
         /// New state.
         pinned: bool,
     },
+    /// Contact / group info query.
+    InfoQuery(String),
+    /// Block / unblock.
+    Block {
+        /// Contact.
+        jid: String,
+        /// New state.
+        blocked: bool,
+    },
+    /// Mute / unmute.
+    Mute {
+        /// Chat.
+        chat: String,
+        /// New state.
+        muted: bool,
+    },
     /// List created or edited.
     SaveList(ListDef),
     /// List deleted.
@@ -242,6 +259,10 @@ pub struct FakeClient {
     communities: Vec<CommunityInfo>,
     registered: Vec<String>,
     next_group: Mutex<u32>,
+    /// Group metadata served by `group_info`, built from the mock history.
+    groups: HashMap<String, GroupInfo>,
+    /// Blocked contacts.
+    blocked: Mutex<std::collections::HashSet<String>>,
 }
 
 impl FakeClient {
@@ -505,6 +526,7 @@ impl WaClient for FakeClient {
                             expires_at: None,
                             reply: None,
                             edited: false,
+                            mentions: Vec::new(),
                             reactions: Vec::new(),
                         }],
                         origin: Origin::Live,
@@ -943,6 +965,89 @@ impl WaClient for FakeClient {
         });
     }
 
+    fn contact_info<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<ContactInfo>> {
+        Box::pin(async move {
+            self.record(Sent::InfoQuery(jid.into()));
+            Ok(ContactInfo {
+                about: Some(crate::mock::about_for(jid).to_string()),
+                business_name: None,
+            })
+        })
+    }
+
+    fn group_info<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<GroupInfo>> {
+        Box::pin(async move {
+            self.record(Sent::InfoQuery(chat.into()));
+            self.groups
+                .get(chat)
+                .cloned()
+                .ok_or_else(|| Error::Net("not a participant".into()))
+        })
+    }
+
+    fn common_groups<'a>(
+        &'a self,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<(String, String)>>> {
+        Box::pin(async move {
+            let mut out: Vec<(String, String)> = self
+                .groups
+                .iter()
+                .filter(|(_, g)| {
+                    g.participants.iter().any(|p| {
+                        ids.contains(&p.jid) || p.alias.as_ref().is_some_and(|a| ids.contains(a))
+                    })
+                })
+                .map(|(j, g)| (j.clone(), g.subject.clone()))
+                .collect();
+            out.sort_by(|a, b| a.1.cmp(&b.1));
+            Ok(out)
+        })
+    }
+
+    fn is_blocked<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            Ok(self
+                .blocked
+                .lock()
+                .map(|b| b.contains(jid))
+                .unwrap_or(false))
+        })
+    }
+
+    fn set_blocked<'a>(&'a self, jid: &'a str, blocked: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            if let Ok(mut b) = self.blocked.lock() {
+                if blocked {
+                    b.insert(jid.to_string());
+                } else {
+                    b.remove(jid);
+                }
+            }
+            self.record(Sent::Block {
+                jid: jid.into(),
+                blocked,
+            });
+            Ok(())
+        })
+    }
+
+    fn set_muted<'a>(&'a self, chat: &'a str, muted: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::Mute {
+                chat: chat.into(),
+                muted,
+            });
+            Ok(())
+        })
+    }
+
     fn logout(&self) -> BoxFuture<'_, Result<()>> {
         Box::pin(async move {
             self.record(Sent::Logout);
@@ -1007,6 +1112,8 @@ pub fn start(
         communities: data.communities.clone(),
         registered: data.registered.clone(),
         next_group: Mutex::new(0),
+        groups: mock_groups(&data.own_jid, &data.chats, &data.messages),
+        blocked: Mutex::new(std::collections::HashSet::new()),
     });
     let _ = tx.send(if opts.paired {
         Event::SessionFound
@@ -1078,4 +1185,39 @@ pub fn start(
     let stream =
         futures::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|e| (e, rx)) });
     (client, stream)
+}
+
+/// Group metadata for the mock groups: the senders seen in each group plus
+/// ourselves (owner and admin), with a description.
+fn mock_groups(own: &str, chats: &[ChatMeta], messages: &[Message]) -> HashMap<String, GroupInfo> {
+    let mut out = HashMap::new();
+    for c in chats.iter().filter(|c| c.id.ends_with("@g.us")) {
+        let mut participants = vec![Participant {
+            jid: own.to_string(),
+            alias: None,
+            admin: true,
+            owner: true,
+        }];
+        for m in messages.iter().filter(|m| m.chat == c.id && !m.from_me) {
+            if !participants.iter().any(|p| p.jid == m.sender) {
+                participants.push(Participant {
+                    jid: m.sender.clone(),
+                    alias: None,
+                    admin: participants.len() == 1,
+                    owner: false,
+                });
+            }
+        }
+        out.insert(
+            c.id.clone(),
+            GroupInfo {
+                subject: c.name.clone().unwrap_or_default(),
+                description: Some(crate::mock::group_description(&c.id).to_string()),
+                created: Some(1_690_000_000),
+                creator: Some(own.to_string()),
+                participants,
+            },
+        );
+    }
+    out
 }

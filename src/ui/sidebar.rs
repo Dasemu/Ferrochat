@@ -6,6 +6,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Length};
 
+use super::emoji_font::emoji_text;
 use super::icons::Icon;
 use super::theme::{self, INTER_MEDIUM, INTER_SEMIBOLD};
 use super::{El, avatar_for, badge, ellipsize, fill, gap, icon, list_time, ticks};
@@ -432,11 +433,13 @@ fn hit_row<'a>(app: &'a App, h: &'a crate::store::SearchHit, now: i64) -> El<'a>
     };
     let content = column![
         row![
-            text(ellipsize(&name, 34))
-                .size(16.5)
-                .color(p.text_primary)
-                .wrapping(Wrapping::None)
-                .shaping(text::Shaping::Advanced),
+            emoji_text(
+                ellipsize(&name, 34),
+                16.5,
+                p.text_primary,
+                theme::INTER,
+                false
+            ),
             fill(),
             text(list_time(h.ts, now)).size(12).color(p.text_secondary),
         ]
@@ -514,6 +517,21 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
                 .wrapping(Wrapping::None)
                 .shaping(text::Shaping::Advanced),
         );
+    } else if let Some(d) = app.drafts.get(&e.meta.id).filter(|_| !selected) {
+        // WhatsApp shows an unsent draft instead of the last message.
+        preview_row = preview_row.push(
+            text("Draft: ")
+                .size(m.text_small + 0.5)
+                .color(p.accent)
+                .wrapping(Wrapping::None),
+        );
+        preview_row = preview_row.push(emoji_text(
+            ellipsize(&d.replace('\n', " "), 36),
+            m.text_small + 0.5,
+            p.text_secondary,
+            theme::INTER,
+            false,
+        ));
     } else if let Some(l) = &e.last {
         if l.from_me {
             preview_row = preview_row.push(ticks(t, l.status, 16.0));
@@ -526,13 +544,13 @@ fn chat_row<'a>(app: &'a App, e: &'a ChatEntry, now: i64) -> El<'a> {
                     .wrapping(Wrapping::None),
             );
         }
-        preview_row = preview_row.push(
-            text(ellipsize(&l.content.preview(), 42))
-                .size(m.text_small + 0.5)
-                .color(p.text_secondary)
-                .wrapping(Wrapping::None)
-                .shaping(text::Shaping::Advanced),
-        );
+        preview_row = preview_row.push(emoji_text(
+            ellipsize(&app.preview(l), 42),
+            m.text_small + 0.5,
+            p.text_secondary,
+            theme::INTER,
+            false,
+        ));
     }
     preview_row = preview_row.push(fill());
     if e.meta.muted {

@@ -55,6 +55,25 @@ pub struct MockData {
     pub starred: Vec<crate::net::types::MsgKey>,
 }
 
+/// The "About" text a mock contact shows in the info drawer.
+pub fn about_for(jid: &str) -> &'static str {
+    match jid {
+        SHOWCASE_CHAT => "Viajando 🌍✈️ | café ☕",
+        "34622222222@s.whatsapp.net" => "Disponible",
+        _ => "Hey there! I am using WhatsApp.",
+    }
+}
+
+/// The description of a mock group.
+pub fn group_description(jid: &str) -> &'static str {
+    match jid {
+        "120363000000000001@g.us" => {
+            "Grupo de la familia 🏡 Cumpleaños, comidas y fotos de los peques."
+        }
+        _ => "Planes, fotos y avisos del grupo.",
+    }
+}
+
 /// A procedurally drawn portrait-like avatar (original artwork): a coloured
 /// disc background with a head and shoulders silhouette.
 pub fn avatar_png(seed: u32, group: bool) -> Vec<u8> {
@@ -247,6 +266,7 @@ impl B {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         });
     }
@@ -987,6 +1007,7 @@ pub fn long_history(chat: &str, n: usize, until: i64) -> Vec<Message> {
                 expires_at: None,
                 reply: None,
                 edited: false,
+                mentions: Vec::new(),
                 reactions: Vec::new(),
             }
         })

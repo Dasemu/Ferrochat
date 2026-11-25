@@ -6,7 +6,7 @@
 //! client are used.
 
 use iced::border::Radius;
-use iced::widget::{button, container, scrollable, text_input};
+use iced::widget::{button, container, scrollable, text_editor, text_input};
 use iced::{Background, Border, Color, Font, Shadow, Theme, font};
 
 /// Colour palette.
@@ -247,6 +247,11 @@ pub const FONT_REGULAR: &[u8] = include_bytes!("../../assets/fonts/Inter-Regular
 pub const FONT_MEDIUM: &[u8] = include_bytes!("../../assets/fonts/Inter-Medium.ttf");
 /// Inter SemiBold.
 pub const FONT_SEMIBOLD: &[u8] = include_bytes!("../../assets/fonts/Inter-SemiBold.ttf");
+
+/// Twemoji (graphics CC-BY 4.0 by Twitter and jdecked/twemoji, COLRv0 build
+/// Apache-2.0 by Mozilla / Sable), renamed "Ferrochat Twemoji" so no system
+/// face can shadow it. Loaded zero-copy by `emoji_font::install`.
+pub const TWEMOJI: &[u8] = include_bytes!("../../assets/fonts/Twemoji.ttf");
 
 /// Body font.
 pub const INTER: Font = Font::with_name("Inter");
@@ -538,6 +543,20 @@ pub fn input(t: &FerroTheme) -> impl Fn(&Theme, text_input::Status) -> text_inpu
         background: Background::Color(Color::TRANSPARENT),
         border: border(0.0),
         icon: p.text_secondary,
+        placeholder: p.text_secondary,
+        value: p.text_primary,
+        selection: Color { a: 0.4, ..p.accent },
+    }
+}
+
+/// The composer's multi-line editor (the container provides the background).
+pub fn editor(
+    t: &FerroTheme,
+) -> impl Fn(&Theme, text_editor::Status) -> text_editor::Style + use<> {
+    let p = t.palette;
+    move |_, _| text_editor::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: border(0.0),
         placeholder: p.text_secondary,
         value: p.text_primary,
         selection: Color { a: 0.4, ..p.accent },

@@ -1820,6 +1820,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "emojis"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589871e639330783bc20ad89d32ac1b049e02c273d96c907ca27478c8bc674a2"
+dependencies = [
+ "phf",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1992,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "ferrochat"
-version = "0.13.0"
+version = "0.13.1"
 dependencies = [
  "arboard",
  "async-channel",
@@ -2000,6 +2009,7 @@ dependencies = [
  "chrono",
  "diesel",
  "directories",
+ "emojis",
  "flate2",
  "futures",
  "getrandom 0.3.4",
@@ -2032,6 +2042,9 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ttf-parser",
+ "unicode-script",
+ "unicode-segmentation",
  "ureq",
  "url",
  "waproto",
@@ -4636,6 +4649,24 @@ dependencies = [
  "fixedbitset",
  "hashbrown 0.15.5",
  "indexmap",
+]
+
+[[package]]
+name = "phf"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c1562dc717473dbaa4c1f85a36410e03c047b2e7df7f45ee938fbef64ae7fadf"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e57fef6bc5981e38c2ce2d63bfa546861309f875b8a75f092d1d54ae2d64f266"
+dependencies = [
+ "siphasher",
 ]
 
 [[package]]

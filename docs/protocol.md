@@ -108,6 +108,18 @@ click jumps to the original, loading the cache around it when needed.
 | Presence | `presence().subscribe` when a DM is opened | the library announces us as available itself |
 | Profile pictures | `contacts().get_profile_picture(preview)` + one GET through the library's HTTP client | max 3 lookups at once, only for rows on screen |
 | Group size | `groups().query_info` (cached by the library) | for the aggregate ticks |
+| Contact info drawer | `contacts().get_user_info` (usync: status = "About", verified business name) | only when the drawer opens; privacy settings may hide the About text |
+| Group info drawer | `groups().get_metadata` (description, participants with admin type) | when the drawer opens |
+| Groups in common | `groups().get_participating`, filtered by the contact's PN / LID | when the drawer opens |
+| Block / unblock | `blocking().block / unblock`, `blocking().is_blocked` | after a confirmation in the drawer |
+| Mute / unmute | `chat_actions().mute_chat` (indefinite) / `unmute_chat` | optimistic, reverted on failure; mute durations other than "always" are not offered yet |
+
+Mentions: `contextInfo.mentionedJid` is kept per message (cache column
+`mentions`, schema 6). An "@<digits>" in the text is shown as the name of
+the mentioned JID: LID -> phone number through the learned pairs, then
+saved > business > push name, then the formatted number; an unnamed LID
+without a known number reads "@Unknown", never digits
+(`ChatList::mention_label`).
 
 The 10 s / 5 s typing timings and the 15 min / 2.5 day windows follow what
 WhatsApp Web does as far as we know; they are constants in `app/live.rs` and
@@ -234,7 +246,9 @@ chats are unchanged.
 | `~/.config/autostart/dev.ferro.ferrochat.desktop` | "Start at login" entry (`Exec=<binary> --minimized`) | Only when the user turns the toggle on; the toggle removes it |
 | `$XDG_DATA_HOME/ferrochat/ferrochat.sock` | Single-instance hand-off: accepts only the line `show` | Unix socket in the 0700 data directory, mode 0600, removed on exit |
 | `$XDG_STATE_HOME/ferrochat/log` (rotated at 5 MB) | Logs | Bodies, phone numbers, QR payloads, keys and file names are redacted (`Redacted`, `MaskedJid`, manual `Debug` impls; covered by `tests/redaction.rs`). |
-| `~/Downloads/<name>` | Documents the user opened | Only on explicit click. |
+| `~/Downloads/<name>` | Documents the user opened; photos saved or opened externally from the image viewer | Only on explicit click. |
+| (cache column `messages.thumb` of videos) | A poster frame (JPEG, <= 480 px) decoded by the player helper for videos (<= 16 MB) that arrived without an inline thumbnail; the video itself lands in the `videos/` cache above | Same file as the cache |
+| (cache key `recent_emoji`) | The emoji picker's recent emoji | Same file as the cache |
 
 The data directory is created with mode 0700 and every database file
 (including `-wal` / `-shm`) is set to 0600. Downloads are capped at 100 MB
@@ -402,6 +416,13 @@ decodes in-process (memory cannot be given back by closing the viewer).
   retroactively).
 * Group "read" ticks turn blue on the first participant's read receipt
   (WhatsApp waits for all participants).
+* Videos that arrive without `jpegThumbnail` (seen on history-synced media;
+  the library's default `HistorySyncConfig` does not ask for
+  `thumbnailSyncDaysLimit`) get a poster frame from the helper when they are
+  at most 16 MB; bigger ones keep the placeholder until played.
+* The info drawer has no "disappearing messages", encryption code,
+  "report" or "exit group" actions, and media visibility / per-chat
+  wallpaper are not offered; mute is "always" only.
 * Windows and macOS have no tray yet (stub): closing the window quits.
 * On Wayland the compositor may refuse to focus a window that is shown from
   the tray or a notification (xdg-activation); it then appears without focus.

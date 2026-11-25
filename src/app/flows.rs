@@ -711,3 +711,382 @@ async fn the_preview_is_dropped_by_escape_and_by_a_chat_switch() {
     h.pump(t).await;
     assert!(h.app.attach.is_none());
 }
+
+// ------------------------------------------------ composer, emoji, viewer
+
+fn type_text(s: &str) -> Vec<Ui> {
+    use iced::widget::text_editor::{Action, Edit};
+    s.chars()
+        .map(|c| {
+            Ui::ComposerAction(Action::Edit(if c == '\n' {
+                Edit::Enter
+            } else {
+                Edit::Insert(c)
+            }))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn shift_enter_lines_are_sent_as_one_message() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    // Shift+Enter is bound to the editor's own Enter (a newline).
+    for u in type_text("first line\nsecond line") {
+        h.ui(u).await;
+    }
+    assert_eq!(h.app.composer.text(), "first line\nsecond line");
+    h.ui(Ui::Send).await;
+    assert!(h.app.composer.is_blank());
+    assert!(h.fake.log().iter().any(|s| matches!(
+        s,
+        Sent::Text { chat, text, .. } if chat == MARCOS && text == "first line\nsecond line"
+    )));
+}
+
+#[tokio::test]
+async fn drafts_survive_switching_chats() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    for u in type_text("half\nwritten") {
+        h.ui(u).await;
+    }
+    h.ui(Ui::OpenChat(PABLO.into())).await;
+    assert!(h.app.composer.is_blank());
+    assert_eq!(h.app.drafts.get(MARCOS), Some("half\nwritten"));
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    assert_eq!(h.app.composer.text(), "half\nwritten");
+    assert!(h.app.drafts.get(MARCOS).is_none());
+}
+
+#[tokio::test]
+async fn picked_emoji_go_into_the_composer_and_the_recent_list() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    h.ui(Ui::ToggleEmoji).await;
+    assert!(h.app.emoji_open);
+    h.ui(Ui::Emoji("\u{1F44B}")).await;
+    h.ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")).await;
+    assert_eq!(h.app.composer.text(), "\u{1F44B}\u{1F1EA}\u{1F1F8}");
+    assert_eq!(
+        h.app.emoji.recent,
+        vec!["\u{1F1EA}\u{1F1F8}".to_string(), "\u{1F44B}".to_string()]
+    );
+    let stored = h.app.store.kv(super::emoji::RECENT_KEY).unwrap().unwrap();
+    assert_eq!(super::emoji::parse_recent(&stored), h.app.emoji.recent);
+    h.ui(Ui::EmojiSearch("pizza".into())).await;
+    assert_eq!(
+        h.app.emoji.sections()[0].emoji,
+        vec!["\u{1F355}".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn lid_mentions_show_names_in_the_chat_list_preview() {
+    let mut h = Harness::new().await;
+    let group = "120363000000000001@g.us";
+    h.net(Event::LidMappings(vec![(
+        "987654321098765@lid".into(),
+        MARCOS.into(),
+    )]))
+    .await;
+    let mut m = h
+        .app
+        .chats
+        .get(group)
+        .and_then(|e| e.last.clone())
+        .expect("group has a message");
+    m.id = "MENTION1".into();
+    m.timestamp += 10;
+    m.content = crate::net::Content::Text("@987654321098765 are you coming?".into());
+    m.mentions = vec!["987654321098765@lid".into()];
+    h.net(Event::Messages {
+        messages: vec![m],
+        origin: crate::net::Origin::Live,
+    })
+    .await;
+    let last = h.app.chats.get(group).and_then(|e| e.last.clone()).unwrap();
+    let name = h.app.chats.plain_name(MARCOS);
+    assert_eq!(h.app.preview(&last), format!("@{name} are you coming?"));
+    assert!(!h.app.preview(&last).contains("987654321098765"));
+}
+
+#[tokio::test]
+async fn the_image_viewer_opens_zooms_steps_and_frees_its_picture() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(SHOWCASE_CHAT.into())).await;
+    let ids = h.app.viewer_ids();
+    assert!(!ids.is_empty(), "the showcase chat has photos");
+    h.ui(Ui::OpenImage(ids[0].clone())).await;
+    assert!(h.app.viewer.is_some());
+    assert!(h.app.viewer_handle().is_some(), "full picture loaded");
+    h.ui(Ui::ViewerZoom {
+        factor: 2.0,
+        at: iced::Vector::ZERO,
+    })
+    .await;
+    assert_eq!(h.app.viewer.as_ref().unwrap().zoom, 2.0);
+    h.ui(Ui::ViewerStep(-1)).await;
+    assert_eq!(
+        h.app.viewer.as_ref().unwrap().id,
+        ids[0],
+        "no photo before the first"
+    );
+    if ids.len() > 1 {
+        h.ui(Ui::Arrow(1)).await;
+        let v = h.app.viewer.as_ref().unwrap();
+        assert_eq!(v.id, ids[1]);
+        assert_eq!(v.zoom, 1.0, "a new photo starts fitted");
+    }
+    // Esc closes it and drops the viewer's own copy.
+    h.ui(Ui::CloseChat).await;
+    assert!(h.app.viewer.is_none());
+    assert!(h.app.open.is_some(), "Esc closed only the viewer");
+}
+
+#[tokio::test]
+async fn a_video_without_inline_thumbnail_gets_a_cached_poster_frame() {
+    use crate::net::Content;
+    if crate::media::video::helper_path().is_none() {
+        eprintln!("skipped: the ferrochat-player helper is not built");
+        return;
+    }
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(SHOWCASE_CHAT.into())).await;
+    // The grey-placeholder case: a video that came without jpegThumbnail.
+    let id = {
+        let c = h.app.open.as_mut().unwrap();
+        let m = c
+            .messages
+            .iter_mut()
+            .find(|m| matches!(m.content, Content::Video { .. }))
+            .expect("showcase video");
+        if let Content::Video { thumbnail, .. } = &mut m.content {
+            *thumbnail = None;
+        }
+        m.id.clone()
+    };
+    h.app.thumbs.remove(&id);
+    let t = h.app.want_poster();
+    h.pump(t).await;
+    assert!(
+        h.app.thumbs.contains_key(&id),
+        "poster handle made in update"
+    );
+    // Cached: the poster is the stored thumbnail now, never extracted again.
+    let stored = h.app.store.message(SHOWCASE_CHAT, &id).unwrap().unwrap();
+    assert!(matches!(
+        stored.content,
+        Content::Video {
+            thumbnail: Some(_),
+            ..
+        }
+    ));
+    let t = h.app.want_poster();
+    h.pump(t).await;
+    assert!(h.app.posters_tried.contains(&id));
+}
+
+#[tokio::test]
+async fn the_header_opens_the_contact_info_drawer() {
+    use super::info::Load;
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(SHOWCASE_CHAT.into())).await;
+    h.ui(Ui::ToggleInfo).await;
+    let info = h.app.info.as_ref().expect("drawer open");
+    assert_eq!(info.chat, SHOWCASE_CHAT);
+    assert_eq!(
+        info.contact.ready().and_then(|c| c.about.as_deref()),
+        Some(mock::about_for(SHOWCASE_CHAT))
+    );
+    assert_eq!(info.blocked, Load::Ready(false));
+    assert!(matches!(info.common, Load::Ready(_)));
+    assert!(
+        info.counts.0 > 0,
+        "the showcase chat has photos and a video"
+    );
+    assert!(!info.recent.is_empty());
+    // Mute is optimistic and synced.
+    h.ui(Ui::ToggleMute(SHOWCASE_CHAT.into())).await;
+    assert!(h.app.chats.get(SHOWCASE_CHAT).unwrap().meta.muted);
+    assert!(h.fake.log().iter().any(|s| matches!(
+        s,
+        Sent::Mute { chat, muted: true } if chat == SHOWCASE_CHAT
+    )));
+    // Block asks first.
+    h.ui(Ui::AskBlock).await;
+    assert!(h.app.info.as_ref().unwrap().confirm_block);
+    h.ui(Ui::SetBlocked(true)).await;
+    let info = h.app.info.as_ref().unwrap();
+    assert_eq!(info.blocked, Load::Ready(true));
+    assert!(!info.confirm_block);
+    // The gallery lists the photos with thumbnails made in update.
+    h.ui(Ui::InfoGallery(Some(super::info::Tab::Media))).await;
+    let (_, items) = h.app.info.as_ref().unwrap().gallery.as_ref().unwrap();
+    assert!(items.iter().any(|i| i.thumb.is_some()));
+    // Esc goes back layer by layer: the drawer closes, the chat stays.
+    h.ui(Ui::CloseChat).await;
+    assert!(h.app.info.is_none());
+    assert!(h.app.open.is_some());
+}
+
+#[tokio::test]
+async fn the_group_info_drawer_lists_members_with_admins_first() {
+    let mut h = Harness::new().await;
+    let family = "120363000000000001@g.us";
+    h.ui(Ui::OpenChat(family.into())).await;
+    h.ui(Ui::ToggleInfo).await;
+    let info = h.app.info.as_ref().unwrap();
+    let g = info.group.ready().expect("metadata");
+    assert!(g.participants.len() >= 2);
+    assert!(g.participants[0].admin && g.participants[0].owner);
+    assert_eq!(g.participants[0].jid, OWN_JID);
+    assert!(g.description.is_some());
+    // A second click on the header closes it.
+    h.ui(Ui::ToggleInfo).await;
+    assert!(h.app.info.is_none());
+}
+
+// ------------------------------------------------------------ read state
+
+fn incoming(chat: &str, id: &str, ts: i64) -> crate::net::Message {
+    crate::net::Message {
+        id: id.into(),
+        chat: chat.into(),
+        sender: chat.into(),
+        sender_name: None,
+        from_me: false,
+        timestamp: ts,
+        content: crate::net::Content::Text(format!("hi {id}")),
+        status: crate::net::ReceiptStatus::Read,
+        expires_at: None,
+        reply: None,
+        edited: false,
+        mentions: Vec::new(),
+        reactions: Vec::new(),
+    }
+}
+
+async fn arrive(h: &mut Harness, m: crate::net::Message) {
+    h.net(Event::Messages {
+        messages: vec![m],
+        origin: crate::net::Origin::Live,
+    })
+    .await;
+}
+
+fn read_sent(h: &Harness, id: &str) -> Option<String> {
+    h.fake.log().into_iter().find_map(|s| match s {
+        Sent::Read { chat, ids } if ids.iter().any(|i| i == id) => Some(chat),
+        _ => None,
+    })
+}
+
+fn unread(h: &Harness, chat: &str) -> u32 {
+    h.app.chats.get(chat).map(|e| e.meta.unread).unwrap_or(0)
+}
+
+#[tokio::test]
+async fn a_message_in_the_chat_being_read_is_read_at_once() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(PABLO.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    arrive(&mut h, incoming(PABLO, "R1", 2_000_000_000)).await;
+    assert_eq!(unread(&h, PABLO), 0);
+    assert_eq!(read_sent(&h, "R1").as_deref(), Some(PABLO));
+    assert!(h.app.open.as_ref().unwrap().unread.is_none(), "no divider");
+}
+
+#[tokio::test]
+async fn an_unfocused_window_keeps_the_open_chat_unread_until_it_comes_back() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let t = h.app.update(super::Message::Focus(false));
+    h.pump(t).await;
+    arrive(&mut h, incoming(MARCOS, "U1", 2_000_000_000)).await;
+    arrive(&mut h, incoming(MARCOS, "U2", 2_000_000_001)).await;
+    assert_eq!(unread(&h, MARCOS), 2);
+    assert!(read_sent(&h, "U1").is_none(), "nothing read while away");
+    let d = h.app.open.as_ref().unwrap().unread.clone().unwrap();
+    assert_eq!(d.first.as_deref(), Some("U1"));
+    assert_eq!(d.count, 2);
+    // Back: the badge clears (also in the cache) and receipts go out.
+    let t = h.app.update(super::Message::Focus(true));
+    h.pump(t).await;
+    assert_eq!(unread(&h, MARCOS), 0);
+    assert!(read_sent(&h, "U1").is_some() && read_sent(&h, "U2").is_some());
+    let row = h
+        .app
+        .store
+        .chat_rows()
+        .unwrap()
+        .into_iter()
+        .find(|r| r.meta.id == MARCOS)
+        .unwrap();
+    assert_eq!(row.meta.unread, 0);
+}
+
+#[tokio::test]
+async fn scrolled_up_messages_stay_unread_until_the_bottom_is_reached() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    h.ui(Ui::Scrolled {
+        relative_y: 0.5,
+        offset_y: 600.0,
+    })
+    .await;
+    arrive(&mut h, incoming(MARCOS, "S1", 2_000_000_000)).await;
+    assert_eq!(unread(&h, MARCOS), 1);
+    assert!(read_sent(&h, "S1").is_none());
+    h.ui(Ui::Scrolled {
+        relative_y: 0.0,
+        offset_y: 0.0,
+    })
+    .await;
+    assert_eq!(unread(&h, MARCOS), 0);
+    assert!(read_sent(&h, "S1").is_some());
+}
+
+#[tokio::test]
+async fn a_history_chunk_does_not_mark_the_chat_being_read_unread() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    let mut meta = h.app.chats.get(MARCOS).unwrap().meta.clone();
+    meta.unread = 5;
+    h.net(Event::History {
+        chats: vec![meta.clone()],
+        names: Vec::new(),
+        progress: None,
+    })
+    .await;
+    assert_eq!(unread(&h, MARCOS), 0);
+    // Another chat keeps the phone's counter.
+    let mut other = h.app.chats.get(PABLO).unwrap().meta.clone();
+    other.unread = 4;
+    h.net(Event::History {
+        chats: vec![other],
+        names: Vec::new(),
+        progress: None,
+    })
+    .await;
+    assert_eq!(unread(&h, PABLO), 4);
+}
+
+#[tokio::test]
+async fn read_receipts_go_to_the_lid_a_message_came_from() {
+    let mut h = Harness::new().await;
+    h.net(Event::LidMappings(vec![(
+        "555000111@lid".into(),
+        MARCOS.into(),
+    )]))
+    .await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    let _ = h.app.update(super::Message::Focus(true));
+    arrive(&mut h, incoming("555000111@lid", "L1", 2_000_000_000)).await;
+    // Shown in the phone-number chat, receipted to the LID it came from.
+    assert!(h.app.open.as_ref().unwrap().get("L1").is_some());
+    assert_eq!(read_sent(&h, "L1").as_deref(), Some("555000111@lid"));
+    assert_eq!(unread(&h, MARCOS), 0);
+}

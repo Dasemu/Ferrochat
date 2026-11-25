@@ -372,6 +372,9 @@ pub struct Message {
     pub edited: bool,
     /// Reactions, one per reactor, oldest first.
     pub reactions: Vec<Reaction>,
+    /// JIDs mentioned in the text (`contextInfo.mentionedJid`): PN or LID,
+    /// the text then carries "@<user part>".
+    pub mentions: Vec<String>,
 }
 
 impl fmt::Debug for Message {
@@ -394,6 +397,7 @@ impl fmt::Debug for Message {
             .field("reply", &self.reply)
             .field("edited", &self.edited)
             .field("reactions", &self.reactions.len())
+            .field("mentions", &self.mentions.len())
             .finish_non_exhaustive()
     }
 }
@@ -418,6 +422,10 @@ impl fmt::Debug for Quote {
 
 /// Longest quote preview kept (characters).
 pub const QUOTE_PREVIEW_MAX: usize = 160;
+
+/// Most mentioned JIDs kept per message (a group has at most ~1024
+/// members; anything longer is garbage).
+pub const MAX_MENTIONS: usize = 1024;
 
 impl Quote {
     /// Quote of `msg` as shown in the reply bubble.
@@ -646,6 +654,72 @@ impl LidMap {
     /// True when empty.
     pub fn is_empty(&self) -> bool {
         self.lid_to_pn.is_empty()
+    }
+}
+
+/// What the contact info drawer shows about a person (usync query).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ContactInfo {
+    /// "About" text, if the contact's privacy settings let us see it.
+    pub about: Option<String>,
+    /// Verified business name, for business accounts.
+    pub business_name: Option<String>,
+}
+
+impl fmt::Debug for ContactInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContactInfo")
+            .field("about", &self.about.as_ref().map(|_| "<redacted>"))
+            .field("business", &self.business_name.is_some())
+            .finish()
+    }
+}
+
+/// One member of a group.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Participant {
+    /// JID (phone number when the group gives it, else the LID).
+    pub jid: String,
+    /// The other id of the same person, if the group gave both.
+    pub alias: Option<String>,
+    /// Group admin.
+    pub admin: bool,
+    /// Group creator / owner ("super admin").
+    pub owner: bool,
+}
+
+impl fmt::Debug for Participant {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Participant({}, admin={})",
+            crate::error::MaskedJid(&self.jid),
+            self.admin
+        )
+    }
+}
+
+/// Group metadata for the group info drawer (group metadata IQ).
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct GroupInfo {
+    /// Subject.
+    pub subject: String,
+    /// Description.
+    pub description: Option<String>,
+    /// Creation time, unix seconds.
+    pub created: Option<i64>,
+    /// Creator, if known.
+    pub creator: Option<String>,
+    /// Members: admins first, then by JID.
+    pub participants: Vec<Participant>,
+}
+
+impl fmt::Debug for GroupInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupInfo")
+            .field("participants", &self.participants.len())
+            .field("has_description", &self.description.is_some())
+            .finish_non_exhaustive()
     }
 }
 
@@ -1059,6 +1133,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
     }
