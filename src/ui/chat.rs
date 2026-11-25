@@ -1274,7 +1274,6 @@ fn hover_actions<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
 /// Six quick reactions.
 fn reaction_picker<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     let t = &app.theme;
-    let p = t.palette;
     let mine = app
         .own_jid
         .as_deref()
@@ -1295,15 +1294,7 @@ fn reaction_picker<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     .align_y(Alignment::Center);
     container(row_el)
         .padding([4, 8])
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 26.0)(th);
-            s.shadow = iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 8.0,
-            };
-            s
-        })
+        .style(theme::popup(t, 26.0))
         .into()
 }
 
@@ -1323,7 +1314,7 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
         )
         .width(Length::Fill)
         .padding([9, 18])
-        .style(theme::chat_row(t, false))
+        .style(theme::menu_item(t))
         .on_press(Message::Ui(on))
         .into()
     };
@@ -1362,15 +1353,7 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     col = col.push(item(Icon::Trash2, "Delete", Ui::AskDelete(id)));
     container(col.width(190))
         .padding([6, 0])
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 8.0)(th);
-            s.shadow = iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 10.0,
-            };
-            s
-        })
+        .style(theme::popup(t, 8.0))
         .into()
 }
 
@@ -1700,15 +1683,7 @@ pub fn dialog<'a>(app: &'a App) -> Option<El<'a>> {
     let card = container(body)
         .padding(24)
         .width(380)
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 12.0)(th);
-            s.shadow = iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 24.0,
-            };
-            s
-        });
+        .style(theme::rounded(p.bg_elevated, 12.0));
     Some(opaque(
         container(card)
             .center(Length::Fill)

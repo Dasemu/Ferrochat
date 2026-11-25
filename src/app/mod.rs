@@ -23,6 +23,8 @@ pub mod message;
 pub mod nav;
 pub mod paste;
 #[cfg(test)]
+mod paste_flows;
+#[cfg(test)]
 mod perf;
 pub mod picker;
 #[cfg(test)]
@@ -239,6 +241,9 @@ pub struct App {
     pub(crate) anim_epoch: Instant,
     /// Attachment preview (picked or pasted media waiting for "send").
     pub(crate) attach: Option<paste::AttachPreview>,
+    /// Reads the system clipboard for paste-to-send (blocking; a fake in
+    /// tests).
+    pub(crate) read_clipboard: fn() -> paste::Clipboard,
     pub(crate) menu_open: bool,
     pub(crate) qr: Option<image::Handle>,
     pub(crate) images: ByteLru<String, image::Handle>,
@@ -558,6 +563,7 @@ impl App {
             gif_inflight: 0,
             anim_epoch: Instant::now(),
             attach: None,
+            read_clipboard: paste::read_clipboard,
             menu_open: false,
             qr: None,
             images: ByteLru::new(IMAGE_BUDGET),
@@ -704,68 +710,7 @@ impl App {
             iced::window::close_requests().map(Message::CloseRequested),
             iced::window::close_events().map(Message::WindowClosed),
             Subscription::run(crate::ext::stream).map(Message::External),
-            iced::event::listen_with(|event, status, id| match event {
-                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
-                    input::set(position);
-                    None
-                }
-                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
-                iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
-                iced::Event::Window(iced::window::Event::Resized(size)) => {
-                    Some(Message::WindowResized(id, size))
-                }
-                iced::Event::Window(iced::window::Event::Moved(p)) => {
-                    Some(Message::WindowMoved(id, p))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                    ..
-                }) => Some(Message::Ui(Ui::CloseChat)),
-                // Paste: the composer's text input pastes text itself; this
-                // only looks for a copied image or files (see `app::paste`).
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                }) if paste::is_paste_shortcut(&key, physical_key, modifiers) => {
-                    Some(Message::Ui(Ui::Paste))
-                }
-                // Space pauses the video viewer, unless a text field took it.
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
-                    ..
-                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::VideoToggle)),
-                // Status viewer: arrows step through the updates.
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight),
-                    ..
-                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(1))),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
-                    ..
-                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(-1))),
-                // Image viewer zoom keys (no text field has them then).
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                }) if status == iced::event::Status::Ignored && !modifiers.control() => {
-                    match c.as_str() {
-                        "+" | "=" => Some(Message::Ui(Ui::ViewerZoom {
-                            factor: viewer::ZOOM_STEP,
-                            at: iced::Vector::ZERO,
-                        })),
-                        "-" => Some(Message::Ui(Ui::ViewerZoom {
-                            factor: 1.0 / viewer::ZOOM_STEP,
-                            at: iced::Vector::ZERO,
-                        })),
-                        "0" => Some(Message::Ui(Ui::ViewerResetZoom)),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }),
+            iced::event::listen_with(runtime_event),
         ];
         // Only once the helper runs: the stream takes the receiver on start.
         if let Some(v) = self
@@ -1324,8 +1269,10 @@ impl App {
     }
 
     /// Ctrl+V: if the composer has focus and the clipboard holds an image or
-    /// copied files (and no text), open the attachment preview. The text
-    /// input pastes text by itself; the clipboard is read off the UI thread.
+    /// copied files (see `paste::classify`), open the attachment preview.
+    /// The composer's `text_editor` pastes text by itself (it captures the
+    /// key event; `runtime_event` still sees it); the clipboard is read off
+    /// the UI thread.
     fn paste(&mut self) -> Task<Message> {
         if self.attach.is_some() || self.editing.is_some() || self.recording_since.is_some() {
             return Task::none();
@@ -1333,14 +1280,15 @@ impl App {
         let Some(chat) = self.open.as_ref().map(|c| c.chat.clone()) else {
             return Task::none();
         };
+        let read = self.read_clipboard;
         operation::is_focused(COMPOSER_ID).then(move |focused| {
             if !focused {
                 return Task::none();
             }
             let chat = chat.clone();
             Task::perform(
-                async {
-                    tokio::task::spawn_blocking(|| paste::stage(paste::read_clipboard()))
+                async move {
+                    tokio::task::spawn_blocking(move || paste::stage(read()))
                         .await
                         .ok()
                         .flatten()
@@ -1362,6 +1310,16 @@ impl App {
         }
         let staged = *staged;
         if let Some(text) = paste::strip_pasted_paths(&self.composer.text(), &staged.pasted_paths) {
+            self.composer.set_text(&text);
+        }
+        // A browser's "Copy image" also offers the image URL as text, which
+        // the composer pasted before the image was read: take it out again.
+        if let Some(pasted) = staged
+            .pasted_text
+            .as_deref()
+            .filter(|_| !staged.items.is_empty())
+            && let Some(text) = paste::strip_pasted_text(&self.composer.text(), pasted)
+        {
             self.composer.set_text(&text);
         }
         if let Some(first) = staged.problems.first() {
@@ -2859,6 +2817,75 @@ fn save_png(path: &std::path::Path, shot: &iced::window::Screenshot) -> Result<(
         let _ = std::fs::create_dir_all(dir);
     }
     img.save(path).map_err(|e| e.to_string())
+}
+
+/// Window events the app reacts to, whatever the widgets did with them.
+/// Paste is matched even when captured: the composer's `text_editor`
+/// captures Ctrl+V (it pastes text itself), and an image or copied files
+/// must still reach `App::paste`.
+fn runtime_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    id: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+            input::set(position);
+            None
+        }
+        iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
+        iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+        iced::Event::Window(iced::window::Event::Resized(size)) => {
+            Some(Message::WindowResized(id, size))
+        }
+        iced::Event::Window(iced::window::Event::Moved(p)) => Some(Message::WindowMoved(id, p)),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            ..
+        }) => Some(Message::Ui(Ui::CloseChat)),
+        // Paste: the composer's text input pastes text itself; this
+        // only looks for a copied image or files (see `app::paste`).
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        }) if paste::is_paste_shortcut(&key, physical_key, modifiers) => {
+            Some(Message::Ui(Ui::Paste))
+        }
+        // Space pauses the video viewer, unless a text field took it.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::VideoToggle)),
+        // Status viewer: arrows step through the updates.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight),
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(1))),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(-1))),
+        // Image viewer zoom keys (no text field has them then).
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(c),
+            modifiers,
+            ..
+        }) if status == iced::event::Status::Ignored && !modifiers.control() => match c.as_str() {
+            "+" | "=" => Some(Message::Ui(Ui::ViewerZoom {
+                factor: viewer::ZOOM_STEP,
+                at: iced::Vector::ZERO,
+            })),
+            "-" => Some(Message::Ui(Ui::ViewerZoom {
+                factor: 1.0 / viewer::ZOOM_STEP,
+                at: iced::Vector::ZERO,
+            })),
+            "0" => Some(Message::Ui(Ui::ViewerResetZoom)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]
