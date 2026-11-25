@@ -5,6 +5,7 @@
 //! `Connected` → history) and its receipt behaviour (sent → delivered →
 //! read after configurable delays).
 
+use sha2::Digest;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -548,15 +549,11 @@ impl WaClient for FakeClient {
                 return Err(Error::Net("fake upload failure".into()));
             }
             let path = format!("/fake/{id}");
-            let kind = match media.kind {
-                super::OutgoingKind::Image { .. } => super::MediaKind::Image,
-                super::OutgoingKind::Document => super::MediaKind::Document,
-                super::OutgoingKind::Voice { .. } => super::MediaKind::Audio,
-            };
+            let kind = media.kind.media_kind();
             let mref = MediaRef {
                 direct_path: path.clone(),
                 media_key: vec![1; 32],
-                file_sha256: id.as_bytes().to_vec(),
+                file_sha256: sha2::Sha256::digest(&media.bytes).to_vec(),
                 file_enc_sha256: vec![2; 32],
                 file_length: media.bytes.len() as u64,
                 kind,
