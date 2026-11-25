@@ -313,3 +313,76 @@ async fn the_first_frame_makes_a_poster() {
             .is_err()
     );
 }
+
+/// A small animated GIF with uneven delays and transparency.
+fn write_gif(path: &Path) {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    let f = std::fs::File::create(path).unwrap();
+    let mut enc = GifEncoder::new(f);
+    enc.set_repeat(Repeat::Infinite).unwrap();
+    for i in 0..10u32 {
+        let img = image::RgbaImage::from_fn(101, 61, |x, y| {
+            if x / 10 == i {
+                image::Rgba([255, 0, 0, 255])
+            } else if y < 5 {
+                image::Rgba([0, 0, 0, 0])
+            } else {
+                image::Rgba([0, 90, 200, 255])
+            }
+        });
+        let delay = image::Delay::from_numer_denom_ms(if i < 5 { 80 } else { 40 }, 1);
+        enc.encode_frame(image::Frame::from_parts(img, 0, 0, delay))
+            .unwrap();
+    }
+}
+
+#[test]
+fn a_gif_becomes_an_h264_mp4_that_plays_as_a_gif() {
+    use ferrochat::media::gifv::{self, FrameSpec};
+    let dir = tmp("gif");
+    let gif = dir.join("in.gif");
+    let mp4 = dir.join("out.mp4");
+    write_gif(&gif);
+    gifv::encode_gif_with(Path::new(HELPER), &gif, &mp4).expect("converted");
+    // Even sides, same duration (5 x 80 ms + 5 x 40 ms).
+    let probe = gifv::probe_with(Path::new(HELPER), &mp4).expect("probe");
+    assert_eq!((probe.width, probe.height), (100, 60));
+    assert!(
+        (560..=640).contains(&probe.duration_ms),
+        "{}",
+        probe.duration_ms
+    );
+    // The frames mode keeps every frame with its timing.
+    let spec = FrameSpec {
+        max_w: 80,
+        max_h: 80,
+        max_frames: 50,
+        max_bytes: 4 << 20,
+    };
+    let frames = gifv::decode_with(Path::new(HELPER), &mp4, spec).expect("frames");
+    assert_eq!(frames.len(), 10);
+    assert!(frames.iter().all(|f| f.0 <= 80 && f.1 <= 80));
+    let total: Duration = frames.iter().map(|f| f.3).sum();
+    assert!(total >= Duration::from_millis(550), "{total:?}");
+    // Not a GIF: a named failure, no output left behind.
+    let bad = dir.join("bad.gif");
+    std::fs::write(&bad, b"GIF89a junk").unwrap();
+    let out = dir.join("bad.mp4");
+    assert!(gifv::encode_gif_with(Path::new(HELPER), &bad, &out).is_err());
+    assert!(!out.exists());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn the_frames_mode_samples_the_phone_clip() {
+    use ferrochat::media::gifv::{self, FrameSpec};
+    let spec = FrameSpec {
+        max_w: 200,
+        max_h: 200,
+        max_frames: 30,
+        max_bytes: 8 << 20,
+    };
+    let frames = gifv::decode_with(Path::new(HELPER), &clip(), spec).expect("frames");
+    assert!(frames.len() >= 20, "{}", frames.len());
+    assert!(frames.iter().all(|f| f.0 <= 200 && f.1 <= 200));
+}

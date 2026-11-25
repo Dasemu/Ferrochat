@@ -109,7 +109,7 @@ impl App {
         self.own_jid.clone().unwrap_or_default()
     }
 
-    fn open_chat_id(&self) -> Option<String> {
+    pub(super) fn open_chat_id(&self) -> Option<String> {
         self.open.as_ref().map(|c| c.chat.clone())
     }
 

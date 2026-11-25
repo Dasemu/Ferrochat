@@ -3,7 +3,9 @@
 
 pub mod audio;
 pub mod avatar;
+pub mod gifv;
 pub mod image;
+pub mod sticker;
 pub mod video;
 pub mod video_proto;
 
@@ -25,6 +27,28 @@ pub const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 /// that came without an inline thumbnail (bigger ones keep the placeholder
 /// until played).
 pub const MAX_POSTER_VIDEO_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Runs blocking work that may take long (network, a helper process) on a
+/// detached thread and returns its result: never on tokio's blocking pool,
+/// whose shutdown would make Quit wait for it. `None` if the thread could
+/// not start or died.
+pub fn detached<T: Send + 'static, F: FnOnce() -> T + Send + 'static>(
+    name: &str,
+    f: F,
+) -> impl std::future::Future<Output = Option<T>> + use<T, F> {
+    let (tx, rx) = futures::channel::oneshot::channel();
+    let spawned = std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(move || {
+            let _ = tx.send(f());
+        });
+    async move {
+        match spawned {
+            Ok(_) => rx.await.ok(),
+            Err(_) => None,
+        }
+    }
+}
 
 /// Rejects downloads above [`MAX_DOWNLOAD_BYTES`].
 pub fn check_download_size(len: u64) -> Result<()> {
