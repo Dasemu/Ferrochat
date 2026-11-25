@@ -136,6 +136,7 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
             ]
             .spacing(1),
             fill(),
+            super::call::header_buttons(app, &conv.chat),
             button(icon(Icon::Search, m.icon, p.text_secondary))
                 .padding(8)
                 .style(theme::icon_button(t, app.chat_search.is_some()))
@@ -1001,6 +1002,7 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
         ]
         .width(Length::Shrink)
         .into(),
+        Content::Call(log) => super::call::log_body(app, msg, log, meta_row(t, msg)),
         Content::ViewOnce => row![
             icon(Icon::CircleDashed, 16.0, p.text_secondary),
             text("View once message: open it on your phone")

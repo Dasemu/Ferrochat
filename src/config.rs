@@ -57,6 +57,10 @@ pub enum ScreenshotTarget {
     UpdateBanner,
     /// Settings page with an update available (Updates section).
     UpdateSettings,
+    /// Call bubbles in a chat and an incoming call ringing.
+    Call,
+    /// A call in progress.
+    CallActive,
 }
 
 impl ScreenshotTarget {
@@ -124,6 +128,8 @@ impl ScreenshotTarget {
             "paste" | "attach" => Some(Self::Paste),
             "update-banner" => Some(Self::UpdateBanner),
             "update-settings" => Some(Self::UpdateSettings),
+            "call" | "call-incoming" => Some(Self::Call),
+            "call-active" => Some(Self::CallActive),
             _ => None,
         }
     }

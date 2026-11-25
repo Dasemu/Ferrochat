@@ -5,6 +5,7 @@
 pub mod app;
 pub mod auth;
 pub mod autostart;
+pub mod call;
 pub mod config;
 pub mod error;
 pub mod ext;

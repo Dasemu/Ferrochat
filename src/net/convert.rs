@@ -208,6 +208,9 @@ pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
     if m.poll_creation_message.is_set() {
         return Some(Content::Unsupported("poll".into()));
     }
+    if let Some(c) = m.call_log_messsage.as_option() {
+        return Some(Content::Call(super::call::log_from_message(c)));
+    }
     None
 }
 
@@ -591,7 +594,11 @@ pub fn message_from_web_info(
 ) -> Option<Message> {
     let key = wmi.key.as_option()?;
     let id = key.id.clone()?;
-    let content = content_from_wa(wmi.message.as_option()?)?;
+    let content = match wmi.message.as_option() {
+        Some(m) => content_from_wa(m)?,
+        // Missed calls are history stubs with no message body.
+        None => Content::Call(super::call::log_from_stub(wmi.message_stub_type?)?),
+    };
     let from_me = key.from_me.unwrap_or(false);
     let sender = if from_me {
         String::new()

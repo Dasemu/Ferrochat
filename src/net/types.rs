@@ -179,6 +179,8 @@ pub enum Content {
     ViewOnce,
     /// "This message was deleted".
     Deleted,
+    /// A call (missed, declined, answered ...), shown as a call bubble.
+    Call(super::call::CallLog),
 }
 
 impl Content {
@@ -207,6 +209,8 @@ impl Content {
             Content::Unsupported(kind) => format!("Unsupported message: {kind}"),
             Content::ViewOnce => "👁 View once message".into(),
             Content::Deleted => "🚫 This message was deleted".into(),
+            // Direction-neutral wording; the chat list adds "You:" for ours.
+            Content::Call(c) => c.preview(true),
         }
     }
 
@@ -243,6 +247,7 @@ impl Content {
             Content::Unsupported(_) => "unsupported",
             Content::ViewOnce => "view_once",
             Content::Deleted => "deleted",
+            Content::Call(_) => "call",
         }
     }
 }
@@ -261,6 +266,7 @@ impl fmt::Debug for Content {
             Content::Unsupported(k) => write!(f, "Unsupported({k})"),
             Content::ViewOnce => write!(f, "ViewOnce"),
             Content::Deleted => write!(f, "Deleted"),
+            Content::Call(c) => write!(f, "{c:?}"),
         }
     }
 }
