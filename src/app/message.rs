@@ -43,6 +43,8 @@ pub enum Message {
     WindowMoved(iced::window::Id, iced::Point),
     /// Quit the app (tray menu).
     Quit,
+    /// In-app updater.
+    Update(crate::update::UpdateMsg),
 }
 
 impl Message {
@@ -195,6 +197,8 @@ pub enum Ui {
     },
     /// Rail sections, panels, starred messages, communities, statuses.
     Nav(crate::app::nav::NavMsg),
+    /// Call buttons (see `app::call`).
+    Call(crate::app::call::CallUi),
     /// Search icon in the conversation header.
     ToggleChatSearch,
     /// In-chat search box edited.
@@ -524,4 +528,6 @@ pub enum Done {
     Nav(Box<crate::app::nav::NavDone>),
     /// Nothing to do.
     Nothing,
+    /// A call task finished.
+    Call(crate::app::call::CallDone),
 }

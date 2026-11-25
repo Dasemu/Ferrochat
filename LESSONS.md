@@ -221,3 +221,34 @@ next change.
   `Runtime::drop` waits for every `spawn_blocking` task with no timeout. KDE Plasma keeps notifications in
   its history and sends `NotificationClosed` only on dismissal, so `wait_for_action` on the blocking pool
   froze Quit (found in Ferrocord v0.17.0 with gdb). Watch clicks on detached threads.
+
+## In-app updater
+
+* Run network work for the updater on a detached `std::thread` with a
+  oneshot back to iced, not `spawn_blocking`: iced drops its tokio runtime
+  on quit and waits for blocking tasks, so a stalled download would freeze
+  Quit (same root cause as the notification quit hang).
+* `ureq` 3 was already in the tree (whatsapp-rust, rustls + webpki roots);
+  with `max_redirects(0)` every redirect hop can be checked against the host
+  allowlist before it is followed.
+* Renaming over a running ELF is fine on Linux, but `current_exe()` then
+  points at a deleted file: detect the install method once at boot and
+  restart into the known target path, not `current_exe()`.
+* Release the single-instance lock before starting the new process, or the
+  new one sees "already running" and hands off to the dying old one.
+## Calls
+
+* **Read the pinned crate before deciding something is impossible.** The
+  brief assumed WhatsApp call media would need reverse engineering; the
+  `whatsapp-rust` 0.7.0 already on disk ships a full VoIP media plane
+  behind the `voip` feature (call key, relay, SRTP, MLOW/Opus). Grepping the
+  registry source took minutes; the feature flag was the whole "port".
+* **Keep the library's own objects for actions that need them.** Decline
+  and answer take the `IncomingCall` offer (call key, relay, ringing
+  generation), so the real client stores ringing offers; the app only sees
+  call ids.
+* **One terminate, two events.** With `voip` on, an unanswered ringing call
+  produces both `IncomingCall(terminate)` and `MissedCall`; log by call id
+  once, never per event.
+* **No devices in tests.** Audio threads and the ringtone are skipped in
+  `--mock`; the fake client stands in for the media engine.

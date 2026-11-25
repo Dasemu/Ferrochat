@@ -53,6 +53,14 @@ pub enum ScreenshotTarget {
     HeaderMenu,
     /// Conversation with the attachment preview of a pasted image.
     Paste,
+    /// Chat list with the "new version available" banner.
+    UpdateBanner,
+    /// Settings page with an update available (Updates section).
+    UpdateSettings,
+    /// Call bubbles in a chat and an incoming call ringing.
+    Call,
+    /// A call in progress.
+    CallActive,
 }
 
 impl ScreenshotTarget {
@@ -73,6 +81,7 @@ impl ScreenshotTarget {
                 | Self::NewGroupName
                 | Self::Starred
                 | Self::HeaderMenu
+                | Self::UpdateBanner
         )
     }
 }
@@ -117,6 +126,10 @@ impl ScreenshotTarget {
             "starred" => Some(Self::Starred),
             "header-menu" | "menu-header" => Some(Self::HeaderMenu),
             "paste" | "attach" => Some(Self::Paste),
+            "update-banner" => Some(Self::UpdateBanner),
+            "update-settings" => Some(Self::UpdateSettings),
+            "call" | "call-incoming" => Some(Self::Call),
+            "call-active" => Some(Self::CallActive),
             _ => None,
         }
     }
@@ -175,7 +188,7 @@ pub const USAGE: &str = "\
 ferrochat - unofficial native WhatsApp desktop client
 
 USAGE:
-    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|archived|lists|chat-menu|video|status|status-viewer|communities|new-chat|new-group|new-group-name|starred|header-menu> <out.png>]
+    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|archived|lists|chat-menu|video|status|status-viewer|communities|new-chat|new-group|new-group-name|starred|header-menu|paste|update-banner|update-settings> <out.png>]
 
 OPTIONS:
     --mock                      Run with mock data and a fake protocol (no network)
@@ -191,6 +204,8 @@ ENVIRONMENT:
     FERROCHAT_CONFIG_DIR        Override the settings directory
     FERROCHAT_CACHE_DIR         Override the cache directory (avatars, videos)
     FERROCHAT_NOTIFY=sender     Notifications show the sender only
+    FERRO_RELEASE_API           Override the update check URL (testing)
+    FERRO_UPDATE_FORCE=1        Check for updates even in debug/mock runs
 ";
 
 impl Config {

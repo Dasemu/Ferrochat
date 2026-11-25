@@ -1,11 +1,11 @@
 [package]
 name = "ferrochat"
-version = "0.12.0"
+version = "0.12.2"
 edition = "2024"
 rust-version = "1.94"
 description = "Unofficial lightweight native WhatsApp desktop client written in Rust"
 license = "MIT"
-repository = "https://github.com/Dasemu/Ferrochat"
+repository = "https://github.com/FerroApps/Ferrochat"
 readme = "README.md"
 publish = false
 default-run = "ferrochat"
@@ -32,9 +32,11 @@ iced = { version = "0.14", features = ["tokio", "image", "advanced", "svg", "can
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
 futures = "0.3"
+# Channel type the whatsapp-rust VoIP facade takes for PCM endpoints (already in the tree through it).
+async-channel = "2"
 # WhatsApp multi-device protocol (pure Rust). Default features off so the
 # bundled plain SQLite is NOT linked: we link SQLCipher instead (see below).
-whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-runtime", "tokio-native", "tokio-transport", "ureq-client"] }
+whatsapp-rust = { version = "0.7", default-features = false, features = ["tokio-runtime", "tokio-native", "tokio-transport", "ureq-client", "voip"] }
 whatsapp-rust-sqlite-storage = { version = "0.7", default-features = false }
 libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher"] }
 diesel = { version = "2.3", default-features = false, features = ["sqlite"] }
@@ -76,6 +78,16 @@ openh264 = { version = "0.9", optional = true }
 mp4 = { version = "0.14", optional = true }
 # Pure-Rust AAC decoder + MP4 audio demuxer (symphonia is already in the tree through rodio).
 symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"], optional = true }
+# In-app updater (src/update/): HTTPS client already in the tree via whatsapp-rust (same features).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Updater: URL / redirect policy (already in the tree via ureq).
+url = "2"
+# Updater: release checksum (already in the tree via wacore).
+sha2 = "0.11"
+# Updater: release tarball gzip (already in the tree via png).
+flate2 = "1"
+# Updater: reads the release tarball (new; pure Rust, xattr feature off).
+tar = { version = "0.4", default-features = false }
 # Renders the app's SVG icon to ARGB32 tray pixmaps / the window icon (already in the tree via iced's svg).
 resvg = { version = "0.45", default-features = false }
 

@@ -66,6 +66,7 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `LabelEditUpdate` (app-state `label_edit`) | `ListEdit` | list created / renamed / deleted |
 | `LabelAssociationUpdate` (`label_jid`) | `ListChat` | chat added to / removed from a list |
 | `MarkChatAsReadUpdate` | `ChatRead` (read) / `ChatMarkedUnread` | badge cleared / one unread |
+| `IncomingCall`, `MissedCall`, `CallEndedElsewhere` | `Call(CallSignal)` | call panel, ringtone, call bubbles (§8) |
 
 Reactions, edits and "delete for me" events wait until the message batch that
 may contain their target is in the cache (`App::deferred`).
@@ -404,6 +405,76 @@ decodes in-process (memory cannot be given back by closing the viewer).
 * Windows and macOS have no tray yet (stub): closing the window quits.
 * On Wayland the compositor may refuse to focus a window that is shown from
   the tray or a notification (xdg-activation); it then appears without focus.
+
+## 8. Calls
+
+### 8.1 Feasibility (November 2026)
+
+| Question | Finding |
+|---|---|
+| Call signalling in `whatsapp-rust` 0.7.0? | Yes. `handlers/call.rs` parses every `<call>` child (`offer`, `offer_notice`, `preaccept`, `accept`, `reject`, `terminate`, `transport`, `relaylatency`, `video`, group roster/rekey actions) with `wacore::stanza::call::parse_call_stanza`, sends the generic `<ack>` and the `<receipt><offer/>` the caller waits for, and dispatches `Event::IncomingCall(IncomingCall)`. Offers replayed from the offline queue surface only as `Event::MissedCall { reason: Offline }`. |
+| Decline the way the official client does? | Yes: `Client::voip().reject(&offer)` builds the same `<call><reject call-id call-creator/></call>` as WhatsApp Web (`wacore::stanza::call::build_reject`) and clears the ringing state. Always available, no feature needed. |
+| Media (call key, relay, SRTP)? | **Yes, in the pinned crate.** The `voip` feature (`voip-mlow` + `voip-libopus`) enables `whatsapp_rust::voip`: `voip().accept(&offer).audio(mic, speaker).start()` sends `<preaccept>`, decrypts the Signal-encrypted call key, sends `<accept>`, connects to the WhatsApp relay over DTLS/SCTP (`webrtc-dtls`, `webrtc-sctp`) and runs the media engine (RTP, SRTP/WARP key derivation, MLOW / Opus at 16 kHz, 60 ms frames). `voip().call(&peer)` generates the call key, encrypts it to each of the peer's devices and sends the `<offer>`; the relay arrives in the server's offer ack. `voip().terminate(..)` hangs up. With the feature on, an unanswered ringing call also yields `Event::MissedCall { reason: Remote }` and another of our devices answering / declining yields `Event::CallEndedElsewhere`. |
+| Verified against real phones? | Upstream says native Opus (PT 120) was "verified against Android/Web implementations and with a live full-duplex Android call"; MLOW is the compatibility default (`agent_docs/voip_audio_codecs.md` in the crate). Ferrochat itself has **not** been tested with a real account yet. |
+| Video? | The library transports pre-encoded H.264 (Constrained Baseline, Annex-B access units, `CallHandle::start_video` / `accept_video`); camera capture, an H.264 encoder and a decoder are the application's job. Not implemented (§8.4). |
+| Group calls? | The library has group / call-link facades; not wired in Ferrochat (ring + Decline only). |
+| Upstream after 0.7.0 | `main` (2026-11-24) keeps improving VoIP (MLOW low-rate decoding, relay candidate fixes, group keyframe requests) but is unreleased and breaking (chrono removed, relay dialler split into `voip-relay-native`); Ferrochat stays on the crates.io release. |
+| Other open-source stacks | Baileys (TypeScript) and whatsmeow (Go) only parse call offers / terminations and reject calls; neither carries media. No reverse engineering or WhatsApp binaries were used here: everything goes through the library's public API. |
+
+**Verdict:** voice calls are feasible with the pinned library and are
+implemented; video needs camera capture plus an H.264 encoder/decoder and is
+not.
+
+### 8.2 Event mapping
+
+| Library event | `net::CallSignal` | App effect |
+|---|---|---|
+| `IncomingCall` `offer` / `offer_notice` | `Ringing { call_id, caller (caller_pn, else the sender), group, video }` | call panel "Incoming voice call", ringtone, notification, window shown |
+| `IncomingCall` `accept` | `PeerAccepted` | outgoing call: "Connecting…" |
+| `IncomingCall` `reject` | `PeerRejected { busy }` | outgoing call ends ("Declined"); `busy` (one device) is ignored |
+| `IncomingCall` `terminate` (not `*_elsewhere`) | `PeerEnded` | ringing → missed call; talking → ended with duration |
+| `MissedCall` | `Missed` | missed-call bubble (once per call id) |
+| `CallEndedElsewhere` | `Elsewhere { accepted }` | ringing stops; "Answered on another device" / declined bubble |
+| `CallEvent::RelayAllocated` / accept finished | `Connected` | timer starts |
+| `CallHandle::wait_ended` | `MediaEnded { error }` | call ends; relay failures toast |
+
+Transport, relay latency and video-state stanzas are handled inside the
+library. The pure state machine is `call::Calls` (`src/call/mod.rs`); the
+app glue is `app/call.rs`, the library glue `net/call.rs`.
+
+### 8.3 What we send
+
+| Action | Library call |
+|---|---|
+| Decline | `voip().reject(&offer)` |
+| Answer (1:1 voice, or a video offer answered as voice) | `voip().accept(&offer).audio(..).start()` |
+| Call (header phone button, or a click on a call bubble) | `voip().call(&peer).audio(..).start()` |
+| Hang up / cancel / 60 s without answer | `voip().terminate(call_id, peer, creator)` then `CallHandle::hangup` |
+| Mute | `CallHandle::set_muted` (the engine sends comfort noise) |
+
+Audio: `cpal` (through rodio) on its own threads, down-mixed and linearly
+resampled to 16 kHz mono, cut into 960-sample frames; received frames are
+resampled to the device rate with a 400 ms cap. The ringtone and ringback
+are synthesized (no recorded tones shipped). `--mock` and tests open no
+device. No echo cancellation: use headphones.
+
+Call bubbles are local messages `call-<call id>` (`Content::Call(CallLog)`)
+written through the normal message path: a missed incoming call is unread
+and notifies, the rest is history. History sync adds `callLogMesssage`
+messages and the `CALL_MISSED_*` stubs.
+
+### 8.4 Not implemented
+
+* **Video calls.** The video button explains it (toast) instead of
+  pretending; an incoming video call can be answered as voice only.
+  Needed: camera capture (PipeWire camera portal / V4L2), an H.264
+  Constrained Baseline encoder and a decoder (OpenH264 is only allowed in
+  the `ferrochat-player` helper, so this means a capture/encode helper
+  process), frame transport to the UI as `image::Handle`s, and the
+  in-call video layout. Estimate: 1–2 weeks plus testing with real phones.
+* **Group calls**: ring and Decline only ("answer on your phone").
+* **Second incoming call while busy**: not shown; logged as missed.
+* **Device pickers, echo cancellation, network-quality indicator.**
 
 ## UI reference
 

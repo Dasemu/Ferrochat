@@ -1,5 +1,6 @@
 //! Views. Pure functions `&App -> Element<Message>`.
 
+pub mod call;
 pub mod chat;
 pub mod icons;
 pub mod login;
@@ -9,6 +10,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod status;
 pub mod theme;
+pub mod update;
 
 use chrono::{Datelike, Local, TimeZone};
 use iced::widget::{Space, button, canvas, center, column, container, row, stack, svg, text};
@@ -71,6 +73,11 @@ pub fn view(app: &App) -> El<'_> {
         ]
         .into()
     };
+    // The update bar sits above everything, like the official client's.
+    let base = match update::banner(app) {
+        Some(bar) => column![bar, base].into(),
+        None => base,
+    };
     let mut layers = vec![base];
     if let Some(menu) = sidebar::context_menu(app) {
         layers.push(menu);
@@ -89,6 +96,9 @@ pub fn view(app: &App) -> El<'_> {
     }
     if let Some(d) = chat::dialog(app) {
         layers.push(d);
+    }
+    if let Some(c) = call::panel(app) {
+        layers.push(c);
     }
     if let Some(msg) = &app.toast {
         layers.push(toast(t, msg));

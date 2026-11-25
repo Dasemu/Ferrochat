@@ -5,6 +5,7 @@
 pub mod app;
 pub mod auth;
 pub mod autostart;
+pub mod call;
 pub mod config;
 pub mod error;
 pub mod ext;
@@ -18,3 +19,4 @@ pub mod settings;
 pub mod store;
 pub mod tray;
 pub mod ui;
+pub mod update;
