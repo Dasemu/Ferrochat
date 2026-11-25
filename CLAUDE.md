@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -107,3 +107,23 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
 - Never park an unbounded wait on tokio's blocking pool: iced drops its runtime on quit and that waits for
   every `spawn_blocking` task (KDE keeps notifications open, so a click watch there hung Quit). Notification
   click watches run on detached threads (`notify::show`); `tests/notify_quit.rs` guards it.
+- Composer is a `text_editor` (`app/composer.rs`): Enter sends via `key_binding` (`Binding::Custom`),
+  Shift+Enter is the editor's own `Binding::Enter`. `min_height`/`max_height` limit the TEXT, padding comes
+  on top: use `composer::text_height_limits`. Cursor columns are bytes. Text set programmatically is not
+  drawn in `--screenshot` captures (tiny-skia replays the frame): take composer shots with xdotool.
+- Emoji: bundled COLRv0 Twemoji renamed "Ferrochat Twemoji" (`ui::emoji_font`), installed zero-copy and first
+  in cosmic-text's fallback list (`emoji_font::install` in `main`), so even span-less text gets colour emoji.
+  Use `emoji_text`/`emoji_spans` (grapheme clusters) where the text font has the base glyph (keycaps, (c),
+  digits). Never ship WhatsApp's Apple-style emoji (brand asset), never rely on a system emoji font
+  (COLRv1 Noto draws blank/mono in swash). Picker data: `emojis` crate up to Unicode 17 (`app/emoji.rs`).
+- tiny-skia does not clip images: zoomed / covering pictures must sit UNDER opaque layers (image viewer
+  bar) or use `ContentFit::Contain` (info drawer thumbnails).
+- Mentions: show `ChatList::mention_label` / `render_mentions` (uses `Message::mentions`), never raw
+  "@<LID>" text. Previews go through `App::preview`.
+- Info drawer queries (`WaClient::contact_info/group_info/common_groups/is_blocked`) run only when it
+  opens; results are dropped if the drawer moved on (`app/info.rs`).
+- Read state: a message counts as read only while `App::reading_chat()` (focused, newest page, within
+  `BOTTOM_SLACK` of the bottom). `send_pending_reads` clears the badge + cached counter and sends
+  receipts to the wire JID (`App::wire`: LID the message came from). History chunks must not re-mark
+  the chat being read. Regression tests: `app::flows` read-state section.
+

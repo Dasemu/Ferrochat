@@ -221,3 +221,55 @@ next change.
   `Runtime::drop` waits for every `spawn_blocking` task with no timeout. KDE Plasma keeps notifications in
   its history and sends `NotificationClosed` only on dismissal, so `wait_for_action` on the blocking pool
   froze Quit (found in Ferrocord v0.17.0 with gdb). Watch clicks on detached threads.
+
+## Round 6: composer, emoji, mentions, viewer, info drawer
+
+* **Shift+Enter sent the message** because the composer was a `text_input`:
+  its `on_submit` fires on Enter whatever the modifiers and it cannot hold a
+  newline. A `text_editor` with a `key_binding` (plain Enter ->
+  `Binding::Custom(Send)`, Shift+Enter -> `Binding::Enter`) is the fix;
+  Ferrocord had the same migration. Its `min/max_height` exclude padding.
+* **Emoji**: the picker was a fixed 45-entry `grid` with no `scrollable`,
+  drawn with whatever system font had the glyph (mono fallbacks, tofu,
+  COLRv1 Noto drawn blank by swash). Bundling Twemoji as COLRv0 (2 MB,
+  colour vector layers swash renders) and putting it FIRST in cosmic-text's
+  common fallback list fixes every text widget at once; spans per grapheme
+  cluster are still needed where Inter has the base glyph (keycaps, "#",
+  (c)). Debug-build idle RSS in mock mode grew by about the font size
+  (zero-copy `fontdb::Source::Binary`). A test shapes all ~1900 picker emoji
+  and fails on any that is not exactly one glyph of the font.
+* **Don't reflow a picker under the pointer**: updating "Recent" while the
+  drawer is open moved the grid between two clicks; the shown list is a
+  snapshot taken when the drawer opens.
+* **"@123456789012345" previews** were the raw message text: the preview
+  never resolved mentions and the bubble guessed PN vs LID from the digits.
+  Keep `contextInfo.mentionedJid` and resolve through the LID <-> PN pairs;
+  never show a LID's digits (they are not a phone number).
+* **The old image viewer could not enlarge**: an `image` without explicit
+  size is laid out at its natural size (Shrink), and without the full file
+  it showed the 100 px inline thumbnail. A canvas viewer computes the fitted
+  rectangle itself, so zoom around the cursor and pan are a few lines. Keep
+  the full picture in the viewer's own slot when the shared LRU does not
+  have it, and drop it on close.
+* tiny-skia does not clip images (also inside a canvas frame): a zoomed
+  picture paints over its siblings; draw the bar as a later stack layer.
+* **"Click here for contact info" did nothing**: it was a fallback subtitle
+  string; the header had no handler and no info panel existed.
+* **Grey video placeholders**: the only preview source was the inline
+  `jpegThumbnail`, which history-synced videos can lack. A poster frame from
+  the helper (first `F` message, then drop the player), stored in the
+  thumbnail column, gives every small video a preview once.
+* `window::screenshot` captures do not show text inserted programmatically
+  into a `text_editor`; xdotool with `windowfocus --sync` (Xvfb has no WM)
+  drives the real flow.
+* **Erratic unread in the open chat** had three causes: (1) a message that
+  arrived while the window was unfocused raised the badge but was never
+  queued for reading (`pending_read` only grew while focused), and focusing
+  again cleared nothing, so the open chat stayed "unread"; (2) a history
+  chunk replaced the chat's metadata wholesale, unread counter included,
+  re-marking a chat the user was reading; (3) receipts went to the phone
+  number a LID-addressed message had been normalised to, not to the JID it
+  came from, so the phone could keep it unread. "Read" now means focused +
+  newest page + scrolled to the bottom (`state::is_reading`); receipts use
+  the wire JID (`App::wire`).
+
