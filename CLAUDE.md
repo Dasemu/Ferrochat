@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|paste|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|chat-menu|mute|reply|reactions|chat-search|list-search|delete|settings|paste|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -87,7 +87,10 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   B-frames (Main/High) fail to decode. Video frames are `image::Handle`s made in `update`, never
   in `view`; the video viewer replaces the whole view while open.
 - Chat flags / lists are optimistic: apply, persist, send, revert on failure
-  (`app/lists.rs`). Never send the `favorites` app-state action (it carries
+  (`app/lists.rs`, `app/chat_actions.rs`). Clear / delete chat are the exception:
+  sent first, applied when the phone has them. Mutes have an end
+  (`ChatMeta::mute_end`, seconds, -1 = always): read them through `App::is_muted` /
+  `ChatMeta::is_muted(now)`, never as a flag. Never send the `favorites` app-state action (it carries
   the whole list and would overwrite the phone's).
 - App-level tests: `app::test_support::Harness` (real `App` + fake client).
 - Updater (`src/update/`, `app/updates.rs`, `ui/update.rs`, architecture §11.5): only
