@@ -847,6 +847,10 @@ async fn the_image_viewer_opens_zooms_steps_and_frees_its_picture() {
 #[tokio::test]
 async fn a_video_without_inline_thumbnail_gets_a_cached_poster_frame() {
     use crate::net::Content;
+    if crate::media::video::helper_path().is_none() {
+        eprintln!("skipped: the ferrochat-player helper is not built");
+        return;
+    }
     let mut h = Harness::new().await;
     h.ui(Ui::OpenChat(SHOWCASE_CHAT.into())).await;
     // The grey-placeholder case: a video that came without jpegThumbnail.

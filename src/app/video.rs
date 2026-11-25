@@ -283,14 +283,29 @@ impl App {
         };
         self.posters_tried.insert(id.clone());
         self.poster_busy = true;
-        let dir = self.video_dir();
+        // Mock mode: a private temporary directory, removed right after (the
+        // viewer's mock directory is deleted when a viewer closes).
+        let scratch = self.cfg.mock.then(|| {
+            static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::env::temp_dir().join(format!("ferrochat-poster-{}-{n}", std::process::id()))
+        });
+        let dir = scratch.clone().unwrap_or_else(|| self.video_dir());
         Task::perform(
             async move {
-                let path = fetch_video_file(client, mref, dir).await?;
-                let (w, h, rgba) =
-                    crate::media::video::first_frame(&path, std::time::Duration::from_secs(15))
-                        .await
-                        .map_err(|f| f.detail())?;
+                let path = fetch_video_file(client, mref, dir).await;
+                let frame = match &path {
+                    Ok(p) => {
+                        crate::media::video::first_frame(p, std::time::Duration::from_secs(15))
+                            .await
+                            .map_err(|f| f.detail())
+                    }
+                    Err(e) => Err(e.clone()),
+                };
+                if let Some(d) = scratch {
+                    let _ = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(d)).await;
+                }
+                let (w, h, rgba) = frame?;
                 tokio::task::spawn_blocking(move || {
                     crate::media::image::poster_jpeg(w, h, rgba).map_err(|e| e.to_string())
                 })
