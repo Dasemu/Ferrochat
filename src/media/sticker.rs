@@ -243,7 +243,7 @@ pub fn fit_side(w: u32, h: u32, side: u32) -> (u32, u32) {
 /// lossless WebP of a photo shrinks a lot, cartoons barely change.
 pub fn posterize(px: &mut [u8], bits: u32) {
     let mask = !((1u8 << bits.min(7)) - 1);
-    for p in px.chunks_exact_mut(4) {
+    for p in px.as_chunks_mut::<4>().0 {
         for c in &mut p[..3] {
             *c &= mask;
         }

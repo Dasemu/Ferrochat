@@ -83,7 +83,7 @@ pub fn gif_to_mp4(input: &Path, output: &Path) -> Result<(u32, u32, u64), String
 /// RGBA -> RGB over a white background.
 fn flatten_on_white(rgba: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rgba.len() / 4 * 3);
-    for p in rgba.chunks_exact(4) {
+    for p in rgba.as_chunks::<4>().0 {
         let a = u32::from(p[3]);
         for c in &p[..3] {
             out.push(((u32::from(*c) * a + 255 * (255 - a) + 127) / 255) as u8);
