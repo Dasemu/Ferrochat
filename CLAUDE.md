@@ -104,3 +104,9 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   image. File managers also paste the paths as text: `strip_pasted_paths`
   removes them. Picked and pasted media both go through `AttachPreview`;
   its image handle is made in `update`.
+- Calls (`docs/protocol.md` §8): `whatsapp-rust` feature `voip` (MLOW + libopus, webrtc DTLS/SCTP)
+  does signalling, call key, relay and SRTP; we only feed 16 kHz 960-sample PCM frames
+  (`call::audio`). Never build `<call>` stanzas by hand: decline is `voip().reject(&offer)`,
+  which needs the stored offer (`net::call::CallBook`). State machine: `call::Calls` (pure,
+  tested); app glue `app/call.rs`. Video calls are NOT implemented: the video button must keep
+  saying so. `--mock`/tests open no audio device. Each call is logged once (`call-<id>` bubble).

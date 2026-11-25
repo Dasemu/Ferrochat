@@ -217,3 +217,20 @@ next change.
   reorder buffer (9 of 90 frames decoded).
 * **Count unread chats, not messages**, and keep `status@broadcast` and
   channels out of the chat list: status updates arrive as messages.
+
+## Calls
+
+* **Read the pinned crate before deciding something is impossible.** The
+  brief assumed WhatsApp call media would need reverse engineering; the
+  `whatsapp-rust` 0.7.0 already on disk ships a full VoIP media plane
+  behind the `voip` feature (call key, relay, SRTP, MLOW/Opus). Grepping the
+  registry source took minutes; the feature flag was the whole "port".
+* **Keep the library's own objects for actions that need them.** Decline
+  and answer take the `IncomingCall` offer (call key, relay, ringing
+  generation), so the real client stores ringing offers; the app only sees
+  call ids.
+* **One terminate, two events.** With `voip` on, an unanswered ringing call
+  produces both `IncomingCall(terminate)` and `MissedCall`; log by call id
+  once, never per event.
+* **No devices in tests.** Audio threads and the ringtone are skipped in
+  `--mock`; the fake client stands in for the media engine.
