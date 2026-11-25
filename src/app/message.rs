@@ -43,6 +43,8 @@ pub enum Message {
     WindowMoved(iced::window::Id, iced::Point),
     /// Quit the app (tray menu).
     Quit,
+    /// In-app updater.
+    Update(crate::update::UpdateMsg),
 }
 
 impl Message {

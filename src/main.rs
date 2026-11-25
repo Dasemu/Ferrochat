@@ -112,5 +112,9 @@ fn main() -> iced::Result {
     if !mock {
         ferrochat::instance::cleanup(&data_dir);
     }
+    // "Restart now" after an update: the lock and socket are released first,
+    // so the new process starts as the first instance.
+    drop(_instance_lock);
+    ferrochat::update::restart::run_pending();
     result
 }

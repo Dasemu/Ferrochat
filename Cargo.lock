@@ -2010,6 +2010,7 @@ dependencies = [
  "diesel",
  "directories",
  "emojis",
+ "flate2",
  "futures",
  "getrandom 0.3.4",
  "hex",
@@ -2034,7 +2035,9 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "symphonia",
+ "tar",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2042,6 +2045,8 @@ dependencies = [
  "ttf-parser",
  "unicode-script",
  "unicode-segmentation",
+ "ureq",
+ "url",
  "waproto",
  "whatsapp-rust",
  "whatsapp-rust-sqlite-storage",
@@ -2070,6 +2075,16 @@ name = "fiat-crypto"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "64cd1e32ddd350061ae6edb1b082d7c54915b5c672c389143b9a63403a109f24"
+
+[[package]]
+name = "filetime"
+version = "0.2.30"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1255e7a9f1902190d4c10a75f2f7f495d3d3ce13e9ba26e6c48683a0f4dbed7"
+dependencies = [
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -6186,6 +6201,16 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8eab9a99a024a169fe8a903cf9d4a3b3601109bcc13bd9e3c6fff259138626c4"
 dependencies = [
+ "libc",
+]
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
  "libc",
 ]
 

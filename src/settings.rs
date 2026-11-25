@@ -19,6 +19,8 @@ pub struct Settings {
     pub start_minimized: bool,
     /// No desktop notifications at all.
     pub muted: bool,
+    /// Look for a new release at start and every few hours.
+    pub check_updates: bool,
 }
 
 impl Default for Settings {
@@ -27,6 +29,7 @@ impl Default for Settings {
             close_to_tray: true,
             start_minimized: false,
             muted: false,
+            check_updates: true,
         }
     }
 }
@@ -64,7 +67,7 @@ mod tests {
     #[test]
     fn defaults_close_to_tray_on() {
         let s = Settings::default();
-        assert!(s.close_to_tray && !s.start_minimized && !s.muted);
+        assert!(s.close_to_tray && !s.start_minimized && !s.muted && s.check_updates);
     }
 
     #[test]
@@ -74,6 +77,7 @@ mod tests {
             close_to_tray: false,
             start_minimized: true,
             muted: true,
+            check_updates: false,
         };
         s.save(&dir).unwrap();
         assert_eq!(Settings::load(&dir), s);
