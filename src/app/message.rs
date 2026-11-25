@@ -81,6 +81,8 @@ pub enum Ui {
     AttachCancel,
     /// Emoji panel toggle.
     ToggleEmoji,
+    /// The drawer's GIF and Stickers tabs, GIPHY key settings.
+    Picker(crate::app::picker::PickerUi),
     /// Emoji picked.
     Emoji(&'static str),
     /// Emoji picker search box edited.
@@ -325,14 +327,15 @@ pub enum Setting {
 pub enum Fetched {
     /// Raw bytes (images, documents).
     Bytes(Arc<Vec<u8>>),
-    /// A decoded sticker frame.
-    Rgba {
-        /// Width.
-        width: u32,
-        /// Height.
-        height: u32,
-        /// RGBA pixels.
-        pixels: Arc<Vec<u8>>,
+    /// A decoded sticker: a still (RGBA) or an animation, plus its entry
+    /// for the recent-stickers list once it is on the shelf.
+    Sticker {
+        /// Static sticker, `(width, height, rgba)`.
+        still: Option<(u32, u32, Arc<Vec<u8>>)>,
+        /// Animated sticker.
+        anim: Option<Arc<crate::app::anim::Anim>>,
+        /// Recent-list entry.
+        seen: Option<crate::media::sticker::ShelfItem>,
     },
 }
 
@@ -340,7 +343,7 @@ impl std::fmt::Debug for Fetched {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Fetched::Bytes(b) => write!(f, "Bytes({})", b.len()),
-            Fetched::Rgba { width, height, .. } => write!(f, "Rgba({width}x{height})"),
+            Fetched::Sticker { anim, .. } => write!(f, "Sticker(animated={})", anim.is_some()),
         }
     }
 }
@@ -532,6 +535,8 @@ pub enum Done {
     },
     /// Voice note encoded and ready to send.
     Prepared(Option<Result<Box<OutgoingMedia>, String>>),
+    /// Stickers / GIFs (`app/picker.rs`).
+    Picker(Box<crate::app::picker::PickerDone>),
     /// Picked or pasted media prepared for the attachment preview
     /// (`None` = dialog cancelled or a plain text paste).
     Staged {

@@ -111,6 +111,7 @@ impl App {
     }
 
     pub(super) fn quit(&mut self) -> Task<Message> {
+        super::picker::remove_mock_shelf(&self.cfg);
         iced::exit()
     }
 

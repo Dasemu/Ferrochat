@@ -218,6 +218,8 @@ pub fn spawn_with(
                             duration_ms,
                             state,
                         },
+                        // Frames-mode output; the playback mode never sends it.
+                        Msg::Picture { .. } => continue,
                         Msg::Failed { missing, text } => {
                             announced = true;
                             Event::Failed(if missing {

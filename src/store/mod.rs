@@ -1122,6 +1122,7 @@ mod tests {
             height: 180,
             thumbnail: None,
             media: None,
+            gif: false,
         };
         s.insert_messages(&[m]).unwrap();
         s.set_thumb("c", "v", &[1, 2, 3]).unwrap();

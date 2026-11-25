@@ -11,11 +11,19 @@
 //!
 //! Failures name the step that failed (open, container, codec, decode) so
 //! the viewer can say what happened.
+//!
+//! Two more modes serve GIFs (`ferrochat::media::gifv`):
+//! `--frames <w>x<h> <frames> <bytes> <file>` decodes the picture track as
+//! fast as it can and writes evenly spaced, timed pictures (inline GIF
+//! playback, then exit), and `--gif-to-mp4 <in.gif> <out.mp4>` converts a
+//! GIF into the H.264 MP4 WhatsApp sends as a GIF.
 
 #[cfg(unix)]
 mod audio;
 #[cfg(unix)]
 mod demux;
+#[cfg(unix)]
+mod encode;
 #[cfg(unix)]
 mod yuv;
 
@@ -38,6 +46,7 @@ mod player {
     use std::sync::mpsc::{self, RecvTimeoutError};
     use std::time::{Duration, Instant};
 
+    use ferrochat::media::gifv::{ENCODE_FLAG, FRAMES_FLAG, FrameSpec, Sampler};
     use ferrochat::media::video_proto::{self as proto, Cmd, Msg, PlayState};
     use openh264::decoder::{DecodedYUV, Decoder, DecoderConfig, Flush};
     use openh264::formats::YUVSource;
@@ -57,10 +66,26 @@ mod player {
 
     type Out = BufWriter<std::fs::File>;
 
+    enum Mode {
+        Play(String),
+        Frames(String, FrameSpec),
+        Encode(String, String),
+    }
+
     pub fn run() {
-        let Some(path) = std::env::args().nth(1) else {
-            eprintln!("usage: ferrochat-player <file>");
-            std::process::exit(2);
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let mode = match args.as_slice() {
+            [flag, b, n, bytes, path] if flag == FRAMES_FLAG => {
+                match FrameSpec::parse(b, n, bytes) {
+                    Some(spec) => Mode::Frames(path.clone(), spec),
+                    None => usage(),
+                }
+            }
+            [flag, input, output] if flag == ENCODE_FLAG => {
+                Mode::Encode(input.clone(), output.clone())
+            }
+            [path] if !path.starts_with("--") => Mode::Play(path.clone()),
+            _ => usage(),
         };
         // stdout as a plain file: no line buffering for binary frames.
         let out_file = match io::stdout()
@@ -74,8 +99,28 @@ mod player {
         let mut out: Out = BufWriter::with_capacity(1 << 20, out_file);
         // A hostile file must never take the app down, and a bug in a
         // demuxer must still end with a message instead of silence.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            Player::open(Path::new(&path)).and_then(|p| p.run(&mut out))
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &mode {
+            Mode::Play(path) => Player::open(Path::new(path)).and_then(|p| p.run(&mut out)),
+            Mode::Frames(path, spec) => run_frames(Path::new(path), *spec, &mut out),
+            Mode::Encode(input, output) => {
+                match super::encode::gif_to_mp4(Path::new(input), Path::new(output)) {
+                    Ok((width, height, duration_ms)) => {
+                        send(
+                            &mut out,
+                            &Msg::Ready {
+                                width,
+                                height,
+                                duration_ms,
+                            },
+                        );
+                        Ok(())
+                    }
+                    Err(e) => {
+                        let _ = std::fs::remove_file(output);
+                        Err(fail(e))
+                    }
+                }
+            }
         }));
         let failure = match result {
             Ok(Ok(())) => return,
@@ -84,6 +129,88 @@ mod player {
         };
         send(&mut out, &failure);
         std::process::exit(1);
+    }
+
+    fn usage() -> ! {
+        eprintln!(
+            "usage: ferrochat-player <file>\n       \
+             ferrochat-player --frames <w>x<h> <frames> <bytes> <file>\n       \
+             ferrochat-player --gif-to-mp4 <in.gif> <out.mp4>"
+        );
+        std::process::exit(2);
+    }
+
+    /// Frames mode: the picture track only, decoded as fast as possible,
+    /// with the pictures the [`Sampler`] keeps written as timed pictures.
+    fn run_frames(path: &Path, spec: FrameSpec, out: &mut Out) -> Result<(), Msg> {
+        if !path.is_file() {
+            return Err(fail("the video file is missing"));
+        }
+        let (duration_ms, _) = demux::duration_ms(path).map_err(track_failure)?;
+        let Some(mut v) = open_video(path, spec.max_w as usize, spec.max_h as usize)? else {
+            return Err(fail("the file has no picture track"));
+        };
+        let (w, h) = (v.out_w as u32, v.out_h as u32);
+        let frame_bytes = u64::from(w) * u64::from(h) * 4;
+        let Some(mut sampler) = Sampler::new(spec, duration_ms, frame_bytes) else {
+            return Err(fail("the frames do not fit the memory budget"));
+        };
+        send(
+            out,
+            &Msg::Ready {
+                width: w,
+                height: h,
+                duration_ms,
+            },
+        );
+        loop {
+            v.fill()?;
+            let Some((t, px)) = v.ready.take() else {
+                break;
+            };
+            if sampler.keep(t.max(0) as u64)
+                && proto::write_picture(out, t.max(0) as u64, w, h, &px).is_err()
+            {
+                std::process::exit(0);
+            }
+            if sampler.done() {
+                break;
+            }
+        }
+        if out.flush().is_err() {
+            std::process::exit(0);
+        }
+        Ok(())
+    }
+
+    /// The H.264 track of `path` with a decoder whose pictures fit
+    /// `max_w` x `max_h`. `Ok(None)` when the file has no video.
+    fn open_video(path: &Path, max_w: usize, max_h: usize) -> Result<Option<Video>, Msg> {
+        let Some(track) = VideoTrack::open(path).map_err(track_failure)? else {
+            return Ok(None);
+        };
+        let (dw, dh) = track.rotation.display(track.width, track.height);
+        let (out_w, out_h) = yuv::fit(dw, dh, max_w, max_h);
+        if out_w == 0 || out_h == 0 {
+            return Err(fail("the video has no picture size"));
+        }
+        let mut decoder = new_decoder()?;
+        let _ = decoder.decode(&track.header);
+        let matrix = Matrix::for_height(track.height);
+        Ok(Some(Video {
+            track,
+            decoder,
+            next: 0,
+            pending: PendingTimes::default(),
+            ready: None,
+            out_w,
+            out_h,
+            matrix,
+            bad: 0,
+            flushed: false,
+            tail: std::collections::VecDeque::new(),
+            buf: Vec::with_capacity(1 << 16),
+        }))
     }
 
     fn send(out: &mut Out, m: &Msg) {
@@ -292,33 +419,7 @@ mod player {
                 return Err(fail("the video file is missing"));
             }
             let (duration_ms, _) = demux::duration_ms(path).map_err(track_failure)?;
-            let video = match VideoTrack::open(path).map_err(track_failure)? {
-                Some(track) => {
-                    let (dw, dh) = track.rotation.display(track.width, track.height);
-                    let (out_w, out_h) = yuv::fit(dw, dh, MAX_W, MAX_H);
-                    if out_w == 0 || out_h == 0 {
-                        return Err(fail("the video has no picture size"));
-                    }
-                    let mut decoder = new_decoder()?;
-                    let _ = decoder.decode(&track.header);
-                    let matrix = Matrix::for_height(track.height);
-                    Some(Video {
-                        track,
-                        decoder,
-                        next: 0,
-                        pending: PendingTimes::default(),
-                        ready: None,
-                        out_w,
-                        out_h,
-                        matrix,
-                        bad: 0,
-                        flushed: false,
-                        tail: std::collections::VecDeque::new(),
-                        buf: Vec::with_capacity(1 << 16),
-                    })
-                }
-                None => None,
-            };
+            let video = open_video(path, MAX_W, MAX_H)?;
             let audio = match AudioTrack::open(path) {
                 Ok(a) => a,
                 Err(e) => {

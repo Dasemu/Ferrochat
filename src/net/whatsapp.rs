@@ -31,7 +31,7 @@ use super::convert::{self, Envelope, Uploaded};
 use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
     ChatState, CollectionResync, ContactInfo, Content, GroupInfo, ListDef, MediaKind, MediaRef,
-    MsgKey, NameSource, Origin, OutgoingKind, OutgoingMedia, Quote, ResyncReport,
+    MsgKey, NameSource, Origin, OutgoingMedia, Quote, ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
@@ -152,11 +152,8 @@ impl WaClient for RealClient {
     ) -> BoxFuture<'a, Result<Content>> {
         Box::pin(async move {
             let jid = parse_jid(chat)?;
-            let mt = match media.kind {
-                OutgoingKind::Image { .. } => MediaType::Image,
-                OutgoingKind::Document => MediaType::Document,
-                OutgoingKind::Voice { .. } => MediaType::Audio,
-            };
+            // Stickers upload as `MediaType::Sticker`, GIFs as video.
+            let mt = media_type(media.kind.media_kind());
             let up = self
                 .client
                 .upload(media.bytes.clone(), mt, UploadOptions::default())

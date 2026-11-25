@@ -1,6 +1,6 @@
 //! Settings page: background (tray) and notification toggles.
 
-use iced::widget::{Space, button, column, container, row, scrollable, text, toggler};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_input, toggler};
 use iced::{Alignment, Length};
 
 use super::icons::Icon;
@@ -87,6 +87,8 @@ pub fn view(app: &App) -> El<'_> {
             Space::new().height(16),
             notifications,
             Space::new().height(16),
+            gifs(app),
+            Space::new().height(16),
             super::update::section(app),
         ]
         .width(Length::Fill)
@@ -106,6 +108,68 @@ pub fn view(app: &App) -> El<'_> {
         .height(Length::Fill)
         .style(theme::solid(p.bg_panel))
         .into()
+}
+
+/// "GIFs": the user's own GIPHY key for GIF search (kept in the keyring).
+fn gifs(app: &App) -> El<'_> {
+    use crate::app::picker::{KeyState, PickerUi};
+    let t = &app.theme;
+    let p = t.palette;
+    let status = match &app.picker.key {
+        KeyState::Present(_) => "A GIPHY API key is saved in your system keyring.".to_string(),
+        KeyState::Missing => {
+            "No key saved: the GIF tab offers recent GIFs and GIF files only.".into()
+        }
+        KeyState::Error(e) => format!("The keyring could not be read: {e}"),
+        KeyState::Unknown | KeyState::Loading => String::new(),
+    };
+    let mut actions = row![
+        text_input("Paste your GIPHY API key", &app.picker.key_input)
+            .on_input(|k| Message::Ui(Ui::Picker(PickerUi::KeyInput(k))))
+            .on_submit(Message::Ui(Ui::Picker(PickerUi::SaveKey)))
+            .secure(true)
+            .size(14)
+            .padding([8, 12])
+            .style(theme::input(t))
+            .width(Length::Fill),
+        button(text("Save").size(14).font(INTER_MEDIUM))
+            .padding([8, 16])
+            .style(theme::primary_button(t))
+            .on_press(Message::Ui(Ui::Picker(PickerUi::SaveKey))),
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
+    if app.picker.has_key() {
+        actions = actions.push(
+            button(text("Remove").size(14))
+                .padding([8, 12])
+                .style(theme::link_button(t))
+                .on_press(Message::Ui(Ui::Picker(PickerUi::RemoveKey))),
+        );
+    }
+    column![
+        section(app, "GIFs"),
+        container(
+            column![
+                text("GIF search (GIPHY)").size(15).color(p.text_primary),
+                text(
+                    "WhatsApp's own GIF search uses a key only WhatsApp may use, so Ferrochat \
+                     searches GIPHY with a free key of your own: create an app at \
+                     developers.giphy.com and paste its API key here. Searches go from this \
+                     computer straight to GIPHY."
+                )
+                .size(13)
+                .color(p.text_secondary),
+                actions,
+                text(status).size(13).color(p.text_secondary),
+            ]
+            .spacing(8),
+        )
+        .padding([12, 20])
+        .style(theme::rounded(p.bg_sidebar, 8.0)),
+    ]
+    .spacing(2)
+    .into()
 }
 
 fn section<'a>(app: &'a App, title: &'static str) -> El<'a> {

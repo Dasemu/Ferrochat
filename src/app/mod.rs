@@ -1,6 +1,7 @@
 //! App state and the single `update` mutation point.
 
 mod actions;
+pub mod anim;
 pub mod call;
 pub mod composer;
 pub mod emoji;
@@ -23,6 +24,9 @@ pub mod nav;
 pub mod paste;
 #[cfg(test)]
 mod perf;
+pub mod picker;
+#[cfg(test)]
+mod picker_flows;
 #[cfg(test)]
 mod social_flows;
 pub mod state;
@@ -222,6 +226,17 @@ pub struct App {
     pub(crate) emoji_open: bool,
     /// Emoji picker search and recent emoji.
     pub(crate) emoji: emoji::Picker,
+    /// The drawer's GIF and Stickers tabs (`app/picker.rs`).
+    pub(crate) picker: picker::MediaPicker,
+    /// Decoded animations of animated stickers and GIFs (bubbles).
+    pub(crate) anims: ByteLru<String, Arc<anim::Anim>>,
+    /// GIF bubbles whose animation was requested in this run.
+    gif_tried: HashSet<String>,
+    /// GIF decodes running.
+    gif_inflight: usize,
+    /// Shared start time of every animation (they stay in step across
+    /// view rebuilds).
+    pub(crate) anim_epoch: Instant,
     /// Attachment preview (picked or pasted media waiting for "send").
     pub(crate) attach: Option<paste::AttachPreview>,
     pub(crate) menu_open: bool,
@@ -497,6 +512,14 @@ impl App {
         let window = App::initial_mode(&cfg, settings.close_to_tray);
         let geom = WindowGeom::initial(cfg.screenshot.is_some());
         let updater = App::new_updater(&cfg);
+        let mut picker = picker::MediaPicker::load(&store);
+        if cfg.mock {
+            let shelf = crate::media::sticker::Shelf::new(picker::mock_shelf_root());
+            let (stickers, gifs) = picker::seed_mock(&shelf);
+            picker.favourites = stickers.iter().take(1).cloned().collect();
+            picker.recent_stickers = stickers;
+            picker.recent_gifs = gifs;
+        }
         let app = Self {
             theme: FerroTheme::new(!cfg.light_theme),
             cfg,
@@ -529,6 +552,11 @@ impl App {
                 recent: recent_emoji,
                 ..Default::default()
             },
+            picker,
+            anims: ByteLru::new(picker::ANIM_BUDGET),
+            gif_tried: HashSet::new(),
+            gif_inflight: 0,
+            anim_epoch: Instant::now(),
             attach: None,
             menu_open: false,
             qr: None,
@@ -628,6 +656,8 @@ impl App {
                     Some((ScreenshotTarget::Video, _)) => 9000,
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
+                    // Search debounce, mock tiles, GIF frames from the helper.
+                    Some((ScreenshotTarget::Stickers | ScreenshotTarget::Gifs, _)) => 7000,
                     Some((
                         ScreenshotTarget::Emoji
                         | ScreenshotTarget::Viewer
@@ -775,7 +805,12 @@ impl App {
 
     /// The only mutation point. Pushes the tray model afterwards.
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        let task = self.update_inner(message);
+        let mut task = self.update_inner(message);
+        self.release_picker();
+        if self.settings_open && matches!(self.picker.key, picker::KeyState::Unknown) {
+            // The GIFs section shows whether a key is saved.
+            task = Task::batch([task, self.load_gif_key()]);
+        }
         self.sync_tray();
         task
     }
@@ -949,10 +984,13 @@ impl App {
             Ui::ToggleEmoji => {
                 self.emoji_open = !self.emoji_open;
                 self.emoji.opened();
+                let load = self.picker_toggled();
                 if !self.emoji_open {
-                    return operation::focus(COMPOSER_ID);
+                    return Task::batch([load, operation::focus(COMPOSER_ID)]);
                 }
+                return load;
             }
+            Ui::Picker(p) => return self.on_picker(p),
             Ui::Emoji(e) => {
                 return self.pick_emoji(e);
             }
@@ -1397,7 +1435,10 @@ impl App {
             return Task::none();
         };
         let key = mref.cache_key();
-        if self.images.contains(&key) || self.downloading.contains(&key) {
+        if self.images.contains(&key)
+            || self.anims.contains(&key)
+            || self.downloading.contains(&key)
+        {
             return Task::none();
         }
         if self.downloading.len() >= crate::media::MAX_CONCURRENT_DOWNLOADS {
@@ -1418,23 +1459,22 @@ impl App {
             return Task::none();
         }
         self.downloading.insert(key.clone());
+        if mref.kind == net::MediaKind::Sticker {
+            // WebP: decoded (every frame of an animated one) off the UI
+            // thread and kept on the sticker shelf for the picker.
+            let shelf = self.shelf();
+            return Task::perform(
+                async move {
+                    let r = picker::fetch_sticker(client, mref, shelf).await;
+                    (key, r)
+                },
+                |(key, result)| Message::done(Done::Downloaded { key, result }),
+            );
+        }
         Task::perform(
             async move {
                 let r = async {
                     let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
-                    if mref.kind == net::MediaKind::Sticker {
-                        // WebP: decode the first frame off the UI thread.
-                        let (w, h, px) = tokio::task::spawn_blocking(move || {
-                            crate::media::image::decode_sticker(&bytes).map_err(|e| e.to_string())
-                        })
-                        .await
-                        .map_err(|e| e.to_string())??;
-                        return Ok(Fetched::Rgba {
-                            width: w,
-                            height: h,
-                            pixels: Arc::new(px),
-                        });
-                    }
                     let bytes = Arc::new(bytes);
                     if mref.kind == net::MediaKind::Image {
                         // Header-only probe: refuse oversized images and
@@ -1782,6 +1822,7 @@ impl App {
             .map(|id| self.request_media(id, crate::media::MAX_AUTO_IMAGE_PIXELS, false))
             .collect();
         tasks.push(self.want_poster());
+        tasks.push(self.want_gif_anims());
         Task::batch(tasks)
     }
 
@@ -2462,15 +2503,9 @@ impl App {
                         let owned = Arc::try_unwrap(bytes).unwrap_or_else(|a| (*a).clone());
                         self.images.put(key, image::Handle::from_bytes(owned), size);
                     }
-                    Ok(Fetched::Rgba {
-                        width,
-                        height,
-                        pixels,
-                    }) => {
-                        let size = pixels.len();
-                        let owned = Arc::try_unwrap(pixels).unwrap_or_else(|a| (*a).clone());
-                        self.images
-                            .put(key, image::Handle::from_rgba(width, height, owned), size);
+                    Ok(Fetched::Sticker { still, anim, seen }) => {
+                        let t = self.on_sticker_fetched(key, still, anim, seen);
+                        return Task::batch([t, self.pump_downloads()]);
                     }
                     Err(e) => tracing::warn!(error = %e, "media download failed"),
                 }
@@ -2531,6 +2566,7 @@ impl App {
             Done::Prepared(Some(Ok(media))) => return self.send_media(*media),
             Done::Prepared(Some(Err(e))) => self.toast(e),
             Done::Prepared(None) => {}
+            Done::Picker(d) => return self.on_picker_done(*d),
             Done::Staged { chat, staged } => return self.on_staged(chat, staged),
             Done::DocumentOpened(Ok((path, dangerous))) => {
                 if dangerous {
@@ -2635,6 +2671,7 @@ impl App {
                     Ok(p) => eprintln!("screenshot written to {}", p.display()),
                     Err(e) => eprintln!("screenshot failed: {e}"),
                 }
+                picker::remove_mock_shelf(&self.cfg);
                 return iced::exit();
             }
         }
@@ -2706,6 +2743,24 @@ impl App {
                 v.push(ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")));
                 v.push(ui(Ui::ToggleEmoji));
             }
+            ScreenshotTarget::Stickers => {
+                // The animated sticker and the GIF above the drawer.
+                if let Some(id) = c
+                    .messages
+                    .iter()
+                    .find(|m| matches!(m.content, Content::Sticker { animated: true, .. }))
+                    .map(|m| m.id.clone())
+                {
+                    v.push(ui(Ui::JumpTo(id)));
+                }
+                v.push(ui(Ui::ToggleEmoji));
+                v.push(ui(Ui::Picker(picker::PickerUi::Tab(picker::Tab::Stickers))));
+            }
+            ScreenshotTarget::Gifs => {
+                v.push(ui(Ui::ToggleEmoji));
+                v.push(ui(Ui::Picker(picker::PickerUi::Tab(picker::Tab::Gifs))));
+                v.push(ui(Ui::Picker(picker::PickerUi::Query("party".into()))));
+            }
             ScreenshotTarget::Info | ScreenshotTarget::GroupInfo => v.push(ui(Ui::ToggleInfo)),
             ScreenshotTarget::Viewer => {
                 if let Some(id) = c
@@ -2754,6 +2809,13 @@ impl App {
     /// Logical size of the main window.
     pub fn window_size(&self) -> iced::Size {
         self.geom.size
+    }
+
+    /// Whether animated stickers and GIFs play: only while the window is
+    /// focused (an unfocused or hidden window asks for no redraws at all).
+    /// Screenshots capture whatever frame is due.
+    pub fn media_playing(&self) -> bool {
+        self.focused || self.cfg.screenshot.is_some()
     }
 
     /// Current playback / recording status (for tests).
