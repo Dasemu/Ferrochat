@@ -235,8 +235,8 @@ next change.
   colour vector layers swash renders) and putting it FIRST in cosmic-text's
   common fallback list fixes every text widget at once; spans per grapheme
   cluster are still needed where Inter has the base glyph (keycaps, "#",
-  (c)). Debug-build idle RSS in mock mode grew by about the font size
-  (zero-copy `fontdb::Source::Binary`). A test shapes all ~1900 picker emoji
+  (c)). The font is loaded zero-copy (`fontdb::Source::Binary`); debug-build
+  idle RSS in mock mode with it is ~101 MB, first frame ~64 ms. A test shapes all ~1900 picker emoji
   and fails on any that is not exactly one glyph of the font.
 * **Don't reflow a picker under the pointer**: updating "Recent" while the
   drawer is open moved the grid between two clicks; the shown list is a
