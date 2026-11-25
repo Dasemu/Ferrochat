@@ -84,10 +84,10 @@ fn take_waiter_slot() -> bool {
     false
 }
 
-/// Shows a notification. Blocking (D-Bus round trip, and until the
-/// notification is dismissed when `on_click` is given): call from
-/// `spawn_blocking`. Clicking the notification runs `on_click`. Failures are
-/// logged, never fatal.
+/// Shows a notification. Blocking for the D-Bus round trip only: call from
+/// `spawn_blocking`. Waiting for a click happens on a detached thread, never
+/// on the blocking pool. Clicking the notification runs `on_click`.
+/// Failures are logged, never fatal.
 pub fn show(summary: &str, body: &str, on_click: Option<OnClick>) {
     let mut n = notify_rust::Notification::new();
     n.appname("Ferrochat")
@@ -106,15 +106,27 @@ pub fn show(summary: &str, body: &str, on_click: Option<OnClick>) {
         }
         match n.show() {
             Ok(handle) if wait => {
+                // The wait lasts until the notification is closed, which on
+                // KDE Plasma (notification history) can be never. It must
+                // not run on tokio's blocking pool: dropping the runtime at
+                // quit waits for every blocking task, so the app would hang
+                // on exit. A detached thread just dies with the process.
                 let mut cb = on_click;
-                handle.wait_for_action(|action| {
-                    if action == "default"
-                        && let Some(f) = cb.take()
-                    {
-                        f();
-                    }
-                });
-                WAITING.fetch_sub(1, Ordering::SeqCst);
+                let spawned = std::thread::Builder::new()
+                    .name("notify-click".into())
+                    .spawn(move || {
+                        handle.wait_for_action(|action| {
+                            if action == "default"
+                                && let Some(f) = cb.take()
+                            {
+                                f();
+                            }
+                        });
+                        WAITING.fetch_sub(1, Ordering::SeqCst);
+                    });
+                if spawned.is_err() {
+                    WAITING.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Ok(_) => {}
             Err(e) => {
