@@ -143,6 +143,8 @@ pub enum Icon {
     MicOff,
     /// `video-off`
     VideoOff,
+    /// `forward`
+    Forward,
 }
 
 impl Icon {
@@ -215,6 +217,7 @@ impl Icon {
             Icon::PhoneOutgoing => include_bytes!("../../assets/icons/phone-outgoing.svg"),
             Icon::MicOff => include_bytes!("../../assets/icons/mic-off.svg"),
             Icon::VideoOff => include_bytes!("../../assets/icons/video-off.svg"),
+            Icon::Forward => include_bytes!("../../assets/icons/forward.svg"),
         }
     }
 

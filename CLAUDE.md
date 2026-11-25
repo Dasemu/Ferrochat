@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|chat-menu|mute|reply|reactions|chat-search|list-search|delete|settings|paste|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|chat-menu|mute|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -127,6 +127,12 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   (COLRv1 Noto draws blank/mono in swash). Picker data: `emojis` crate up to Unicode 17 (`app/emoji.rs`).
 - tiny-skia does not clip images: zoomed / covering pictures must sit UNDER opaque layers (image viewer
   bar) or use `ContentFit::Contain` (info drawer thumbnails).
+- Forwarding (`app/forward.rs`, `ui/forward.rs`): `WaClient::forward` rebuilds the body from the cached
+  `Content` (`convert::build_forward` + the library's `prepare_for_forward`), so media is relayed, not
+  re-uploaded; `Message::forwarded` is the forwarding score (`None` = not forwarded). Copies of one
+  forward get ids from `forward::ordered_ids` (same second, sorted by id) and are sent one after the
+  other. Selection mode covers each row with a click catcher; never send a forward for
+  `!Message::can_forward()`.
 - Mentions: show `ChatList::mention_label` / `render_mentions` (uses `Message::mentions`), never raw
   "@<LID>" text. Previews go through `App::preview`.
 - Info drawer queries (`WaClient::contact_info/group_info/common_groups/is_blocked`) run only when it

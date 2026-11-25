@@ -49,6 +49,14 @@ pub trait WaClient: Send + Sync {
         id: &'a str,
         media: OutgoingMedia,
     ) -> BoxFuture<'a, Result<Content>>;
+    /// Forwards a message (`source`, as cached) to `chat` with a
+    /// caller-chosen id. Media is relayed from the same CDN blob.
+    fn forward<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        source: &'a Message,
+    ) -> BoxFuture<'a, Result<()>>;
     /// Downloads and decrypts a media blob.
     fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>>;
     /// Sends read receipts. `sender` is required for group messages.

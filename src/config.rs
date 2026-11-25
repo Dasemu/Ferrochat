@@ -25,6 +25,10 @@ pub enum ScreenshotTarget {
     ListSearch,
     /// Conversation with the "delete message" dialog.
     Delete,
+    /// Conversation in "Select messages" mode with two messages ticked.
+    Select,
+    /// The "Forward message to" dialog with two chats ticked.
+    Forward,
     /// Settings page (background / tray toggles).
     Settings,
     /// Chat list showing the archived chats.
@@ -123,6 +127,8 @@ impl ScreenshotTarget {
             "chat-search" => Some(Self::ChatSearch),
             "list-search" => Some(Self::ListSearch),
             "delete" => Some(Self::Delete),
+            "select" => Some(Self::Select),
+            "forward" => Some(Self::Forward),
             "settings" => Some(Self::Settings),
             "archived" => Some(Self::Archived),
             "lists" => Some(Self::Lists),
