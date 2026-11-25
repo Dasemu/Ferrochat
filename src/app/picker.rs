@@ -126,6 +126,9 @@ pub struct MediaPicker {
     /// GIF search box.
     pub query: String,
     generation: u32,
+    /// Orders list saves: they run on the blocking pool, so an older snapshot
+    /// could otherwise land after a newer one and undo it.
+    saves: Arc<SaveOrder>,
     /// GIPHY key.
     pub key: KeyState,
     /// Search results of the current query.
@@ -142,6 +145,35 @@ pub struct MediaPicker {
     pub busy: Option<String>,
     /// Settings: the key being typed.
     pub key_input: String,
+}
+
+/// Sequence numbers of list saves; only a newer snapshot may overwrite.
+#[derive(Debug, Default)]
+struct SaveOrder {
+    next: std::sync::atomic::AtomicU64,
+    written: std::sync::Mutex<u64>,
+}
+
+impl SaveOrder {
+    fn ticket(&self) -> u64 {
+        self.next.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1
+    }
+
+    /// Runs `write` unless a newer snapshot was already written; the lock
+    /// keeps concurrent saves from interleaving.
+    fn write_if_newest(
+        &self,
+        ticket: u64,
+        write: impl FnOnce() -> crate::error::Result<()>,
+    ) -> crate::error::Result<()> {
+        let mut written = self.written.lock().unwrap_or_else(|e| e.into_inner());
+        if ticket < *written {
+            return Ok(());
+        }
+        write()?;
+        *written = ticket;
+        Ok(())
+    }
 }
 
 impl MediaPicker {
@@ -946,10 +978,14 @@ impl App {
         let keep_stickers = MediaPicker::keep(&[&p.recent_stickers, &p.favourites]);
         let keep_gifs = MediaPicker::keep(&[&p.recent_gifs]);
         let shelf = self.shelf();
+        let order = Arc::clone(&p.saves);
+        let ticket = order.ticket();
         let save = store_task(&self.store, move |s| {
-            s.set_kv(shelf::RECENT_STICKERS_KEY, &rs)?;
-            s.set_kv(shelf::FAVOURITE_STICKERS_KEY, &fs)?;
-            s.set_kv(shelf::RECENT_GIFS_KEY, &rg)
+            order.write_if_newest(ticket, || {
+                s.set_kv(shelf::RECENT_STICKERS_KEY, &rs)?;
+                s.set_kv(shelf::FAVOURITE_STICKERS_KEY, &fs)?;
+                s.set_kv(shelf::RECENT_GIFS_KEY, &rg)
+            })
         });
         let prune = blocking(
             move || {
@@ -1310,6 +1346,26 @@ pub fn seed_mock(shelf: &Shelf) -> (Vec<ShelfItem>, Vec<ShelfItem>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_older_list_save_never_overwrites_a_newer_one() {
+        let order = SaveOrder::default();
+        let (old, new) = (order.ticket(), order.ticket());
+        let mut writes = Vec::new();
+        order
+            .write_if_newest(new, || {
+                writes.push("new");
+                Ok(())
+            })
+            .unwrap();
+        order
+            .write_if_newest(old, || {
+                writes.push("old");
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(writes, ["new"]);
+    }
 
     #[test]
     fn closing_the_drawer_frees_the_tiles() {
