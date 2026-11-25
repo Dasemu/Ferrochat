@@ -217,3 +217,7 @@ next change.
   reorder buffer (9 of 90 frames decoded).
 * **Count unread chats, not messages**, and keep `status@broadcast` and
   channels out of the chat list: status updates arrive as messages.
+- **Quit can hang on the blocking pool.** iced ends `daemon::run` by dropping its tokio runtime, and
+  `Runtime::drop` waits for every `spawn_blocking` task with no timeout. KDE Plasma keeps notifications in
+  its history and sends `NotificationClosed` only on dismissal, so `wait_for_action` on the blocking pool
+  froze Quit (found in Ferrocord v0.17.0 with gdb). Watch clicks on detached threads.
