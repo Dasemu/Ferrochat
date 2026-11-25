@@ -168,8 +168,29 @@ pub enum Sent {
     Mute {
         /// Chat.
         chat: String,
-        /// New state.
-        muted: bool,
+        /// Mute end (see `ChatMeta::mute_end`).
+        end: i64,
+    },
+    /// Chat marked read / unread.
+    MarkChat {
+        /// Chat.
+        chat: String,
+        /// Read.
+        read: bool,
+        /// Newest message id sent as the message range.
+        last: Option<String>,
+    },
+    /// Chat cleared.
+    ClearChat {
+        /// Chat.
+        chat: String,
+        /// Starred messages kept.
+        keep_starred: bool,
+    },
+    /// Chat deleted.
+    DeleteChat {
+        /// Chat.
+        chat: String,
     },
     /// List created or edited.
     SaveList(ListDef),
@@ -1035,15 +1056,66 @@ impl WaClient for FakeClient {
         })
     }
 
-    fn set_muted<'a>(&'a self, chat: &'a str, muted: bool) -> BoxFuture<'a, Result<()>> {
+    fn set_mute<'a>(&'a self, chat: &'a str, end: i64) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             if self.opts.fail_sends {
                 return Err(Error::Net("fake send failure".into()));
             }
             self.record(Sent::Mute {
                 chat: chat.into(),
-                muted,
+                end,
             });
+            Ok(())
+        })
+    }
+
+    fn mark_chat_read<'a>(
+        &'a self,
+        chat: &'a str,
+        read: bool,
+        last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::MarkChat {
+                chat: chat.into(),
+                read,
+                last: last.map(|(k, _)| k.id.clone()),
+            });
+            Ok(())
+        })
+    }
+
+    fn clear_chat<'a>(
+        &'a self,
+        chat: &'a str,
+        keep_starred: bool,
+        _last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::ClearChat {
+                chat: chat.into(),
+                keep_starred,
+            });
+            Ok(())
+        })
+    }
+
+    fn delete_chat<'a>(
+        &'a self,
+        chat: &'a str,
+        _last: Option<&'a (MsgKey, i64)>,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            self.record(Sent::DeleteChat { chat: chat.into() });
             Ok(())
         })
     }
