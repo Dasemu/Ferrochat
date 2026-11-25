@@ -370,6 +370,116 @@ pub fn context_info(msg: &wa::Message) -> Option<&wa::ContextInfo> {
         })
 }
 
+/// Longest group description / about text kept (WhatsApp allows 2048 /
+/// 139 characters; anything longer is cut).
+pub const MAX_INFO_TEXT: usize = 4096;
+
+fn cap_text(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.chars().take(MAX_INFO_TEXT).collect())
+}
+
+/// Group metadata → the info drawer's view of it: admins first (owner on
+/// top), then members, each by phone number when the group gave one.
+pub fn group_info(meta: &whatsapp_rust::features::GroupMetadata) -> super::types::GroupInfo {
+    let mut participants: Vec<super::types::Participant> = meta
+        .participants
+        .iter()
+        .take(4096)
+        .map(|p| {
+            let jid = bare_jid(&p.jid.to_string());
+            let pn = p
+                .phone_number
+                .as_ref()
+                .map(|j| bare_jid(&j.to_string()))
+                .filter(|j| j.ends_with("@s.whatsapp.net"));
+            let lid = p
+                .lid
+                .as_ref()
+                .map(|j| bare_jid(&j.to_string()))
+                .or_else(|| jid.ends_with("@lid").then(|| jid.clone()));
+            let main = pn.clone().unwrap_or_else(|| jid.clone());
+            let alias = if pn.is_some() { lid } else { None }.filter(|a| *a != main);
+            super::types::Participant {
+                jid: main,
+                alias,
+                admin: p.is_admin(),
+                owner: p.is_super_admin(),
+            }
+        })
+        .collect();
+    participants.sort_by(|a, b| {
+        b.owner
+            .cmp(&a.owner)
+            .then(b.admin.cmp(&a.admin))
+            .then(a.jid.cmp(&b.jid))
+    });
+    super::types::GroupInfo {
+        subject: meta.subject.chars().take(200).collect(),
+        description: meta.description.as_deref().and_then(cap_text),
+        created: meta.creation_time.and_then(|t| i64::try_from(t).ok()),
+        creator: meta
+            .creator_pn
+            .as_ref()
+            .or(meta.creator.as_ref())
+            .map(|j| bare_jid(&j.to_string())),
+        participants,
+    }
+}
+
+/// About text and verified business name from a usync answer.
+pub fn contact_info(about: Option<&str>, verified_name: Option<&str>) -> super::types::ContactInfo {
+    super::types::ContactInfo {
+        about: about.and_then(cap_text),
+        business_name: verified_name.and_then(cap_text),
+    }
+}
+
+/// Subjects of the groups among `groups` that `user` (PN or LID JID, plus
+/// its other id) is a member of, sorted by name.
+pub fn common_groups(
+    groups: &std::collections::HashMap<whatsapp_rust::Jid, whatsapp_rust::features::GroupMetadata>,
+    ids: &[String],
+) -> Vec<(String, String)> {
+    let users: Vec<&str> = ids.iter().filter_map(|j| j.split('@').next()).collect();
+    let mut out: Vec<(String, String)> = groups
+        .iter()
+        .filter(|(_, m)| {
+            m.participants.iter().any(|p| {
+                [Some(&p.jid), p.phone_number.as_ref(), p.lid.as_ref()]
+                    .into_iter()
+                    .flatten()
+                    .any(|j| users.contains(&j.user.as_str()))
+            })
+        })
+        .map(|(j, m)| (bare_jid(&j.to_string()), m.subject.clone()))
+        .collect();
+    out.sort_by_key(|g| g.1.to_lowercase());
+    out
+}
+
+/// JIDs the message's text or caption mentions (`contextInfo.mentionedJid`),
+/// bare, deduplicated and bounded.
+pub fn mentions_from_wa(msg: &wa::Message) -> Vec<String> {
+    let Some(ci) = context_info(msg) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = Vec::new();
+    for j in ci.mentioned_jid.iter() {
+        if j.len() > 64 || !j.contains('@') {
+            continue;
+        }
+        let j = bare_jid(j);
+        if !out.contains(&j) {
+            out.push(j);
+        }
+        if out.len() == super::types::MAX_MENTIONS {
+            break;
+        }
+    }
+    out
+}
+
 /// The quoted message of a reply, if the message is one.
 pub fn quote_from_wa(msg: &wa::Message) -> Option<Quote> {
     let ci = context_info(msg)?;
@@ -512,6 +622,7 @@ pub fn message_from_envelope(env: &Envelope, msg: &wa::Message) -> Option<Messag
         }),
         edited: false,
         reactions: Vec::new(),
+        mentions: mentions_from_wa(msg),
     })
 }
 
@@ -632,6 +743,11 @@ pub fn message_from_web_info(
             .iter()
             .filter_map(|r| reaction_from_web(chat, r))
             .collect(),
+        mentions: wmi
+            .message
+            .as_option()
+            .map(mentions_from_wa)
+            .unwrap_or_default(),
     })
 }
 
@@ -1159,6 +1275,41 @@ mod parity_tests {
         assert_eq!(q.id, "ORIG");
         assert_eq!(q.sender, "34699000111@s.whatsapp.net");
         assert_eq!(q.preview, "where are you?");
+    }
+
+    #[test]
+    fn mentioned_jids_are_parsed_bare_deduplicated_and_bounded() {
+        let mk = |jids: Vec<String>| wa::Message {
+            extended_text_message: buffa_some(wa::message::ExtendedTextMessage {
+                text: Some("@123456789012345 hi".into()),
+                context_info: buffa_some(wa::ContextInfo {
+                    mentioned_jid: jids,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let msg = mk(vec![
+            "123456789012345@lid".into(),
+            "34600111222:3@s.whatsapp.net".into(),
+            "123456789012345@lid".into(),
+            "garbage".into(),
+        ]);
+        let m = message_from_envelope(&env(), &msg).unwrap();
+        assert_eq!(
+            m.mentions,
+            vec![
+                "123456789012345@lid".to_string(),
+                "34600111222@s.whatsapp.net".to_string()
+            ]
+        );
+        let many = mk((0..5000).map(|i| format!("{i}@lid")).collect());
+        assert_eq!(
+            mentions_from_wa(&many).len(),
+            crate::net::types::MAX_MENTIONS
+        );
+        assert!(mentions_from_wa(&build_text("plain")).is_empty());
     }
 
     #[test]
@@ -1811,6 +1962,65 @@ mod community_tests {
             parent_group_jid: parent.cloned(),
             ..Default::default()
         }
+    }
+
+    fn member(
+        jid: &str,
+        pn: Option<&str>,
+        kind: whatsapp_rust::features::ParticipantType,
+    ) -> whatsapp_rust::features::GroupParticipant {
+        whatsapp_rust::features::GroupParticipant {
+            jid: jid.parse().expect("jid"),
+            phone_number: pn.map(|p| p.parse().expect("jid")),
+            lid: None,
+            username: None,
+            participant_type: kind,
+            details: None,
+        }
+    }
+
+    #[test]
+    fn group_metadata_lists_admins_first_by_phone_number() {
+        use whatsapp_rust::features::ParticipantType as T;
+        let id: Jid = "120363001@g.us".parse().expect("jid");
+        let mut meta = group(&id, "Familia", None);
+        meta.description = Some("  hola  ".into());
+        meta.creation_time = Some(1_700_000_000);
+        meta.participants = vec![
+            member("222@lid", Some("34600000002@s.whatsapp.net"), T::Member),
+            member("111@lid", None, T::Admin),
+            member("34600000003@s.whatsapp.net", None, T::SuperAdmin),
+        ];
+        let g = group_info(&meta);
+        assert_eq!(g.subject, "Familia");
+        assert_eq!(g.description.as_deref(), Some("hola"));
+        assert_eq!(g.created, Some(1_700_000_000));
+        let jids: Vec<&str> = g.participants.iter().map(|p| p.jid.as_str()).collect();
+        assert_eq!(
+            jids,
+            [
+                "34600000003@s.whatsapp.net",
+                "111@lid",
+                "34600000002@s.whatsapp.net"
+            ]
+        );
+        assert!(g.participants[0].owner && g.participants[0].admin);
+        assert!(g.participants[1].admin && !g.participants[1].owner);
+        assert_eq!(g.participants[2].alias.as_deref(), Some("222@lid"));
+        // Groups in common: by phone number or LID.
+        let mut groups = HashMap::new();
+        groups.insert(id.clone(), meta);
+        let other: Jid = "120363002@g.us".parse().expect("jid");
+        groups.insert(other.clone(), group(&other, "Otro", None));
+        assert_eq!(
+            common_groups(&groups, &["34600000002@s.whatsapp.net".into()]),
+            vec![("120363001@g.us".to_string(), "Familia".to_string())]
+        );
+        assert_eq!(common_groups(&groups, &["111@lid".into()]).len(), 1);
+        assert!(common_groups(&groups, &["999@lid".into()]).is_empty());
+        let c = contact_info(Some("  "), Some("Shop"));
+        assert_eq!(c.about, None);
+        assert_eq!(c.business_name.as_deref(), Some("Shop"));
     }
 
     #[test]

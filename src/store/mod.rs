@@ -21,6 +21,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_3.sql"),
     include_str!("migration_4.sql"),
     include_str!("migration_5.sql"),
+    include_str!("migration_6.sql"),
 ];
 
 mod social;
@@ -159,6 +160,54 @@ impl Store {
         Ok(())
     }
 
+    /// Counts for the info drawer: `(photos and videos, links, documents)`.
+    pub fn media_counts(&self, chat: &str) -> Result<(usize, usize, usize)> {
+        let conn = self.lock()?;
+        let mut st = conn.prepare_cached(
+            "SELECT
+                COALESCE(SUM(kind IN ('image', 'video')), 0),
+                COALESCE(SUM(kind = 'link'), 0),
+                COALESCE(SUM(kind = 'document'), 0)
+             FROM messages WHERE chat_id = ?1",
+        )?;
+        let (a, b, c): (i64, i64, i64) =
+            st.query_row(params![chat], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let n = |v: i64| usize::try_from(v).unwrap_or(0);
+        Ok((n(a), n(b), n(c)))
+    }
+
+    /// The newest messages of `chat` whose kind is one of `kinds`, newest
+    /// first (the info drawer's gallery, links and documents).
+    pub fn messages_of_kind(
+        &self,
+        chat: &str,
+        kinds: &[&str],
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let conn = self.lock()?;
+        let mut st = conn.prepare_cached(
+            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
+                    reply, edited, mentions
+             FROM messages
+             WHERE chat_id = ?1 AND kind IN (SELECT value FROM json_each(?2))
+             ORDER BY ts DESC, id DESC LIMIT ?3",
+        )?;
+        let kinds = serde_json::to_string(kinds).map_err(|e| Error::Protocol(e.to_string()))?;
+        let rows = st
+            .query_map(params![chat, kinds, limit.min(500) as i64], row_to_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Stores a poster frame as the thumbnail of a message that has none.
+    pub fn set_thumb(&self, chat: &str, id: &str, thumb: &[u8]) -> Result<()> {
+        self.lock()?.execute(
+            "UPDATE messages SET thumb = ?3 WHERE chat_id = ?1 AND id = ?2 AND thumb IS NULL",
+            params![chat, id, thumb],
+        )?;
+        Ok(())
+    }
+
     /// Sets the unread counter of a chat.
     pub fn set_unread(&self, chat: &str, unread: u32) -> Result<()> {
         self.lock()?.execute(
@@ -182,8 +231,8 @@ impl Store {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO messages
                     (chat_id, id, sender, sender_name, from_me, ts, kind, content, thumb, status,
-                     expires_at, reply, edited, search)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     expires_at, reply, edited, search, mentions)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
             let mut react = tx.prepare_cached(
                 "INSERT INTO reactions (chat_id, msg_id, reactor, emoji, ts)
@@ -230,6 +279,7 @@ impl Store {
                             m.reply.as_ref().and_then(|q| serde_json::to_string(q).ok()),
                             m.edited,
                             search_text(&m.content),
+                            encode_mentions(&m.mentions),
                         ])?;
                         new_ids.push(m.id.clone());
                     }
@@ -321,7 +371,7 @@ impl Store {
         let (ts, id) = before.unwrap_or((i64::MAX, ""));
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited
+                    reply, edited, mentions
              FROM messages
              WHERE chat_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
              ORDER BY ts DESC, id DESC LIMIT ?4",
@@ -340,7 +390,7 @@ impl Store {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited
+                    reply, edited, mentions
              FROM messages WHERE chat_id = ?1 AND id = ?2",
         )?;
         let mut m = st.query_row(params![chat, id], row_to_message).optional()?;
@@ -356,7 +406,7 @@ impl Store {
         let mut st = conn.prepare_cached(
             "SELECT c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.muted,
                     m.chat_id, m.id, m.sender, m.sender_name, m.from_me, m.ts, m.content,
-                    m.thumb, m.status, m.expires_at, m.reply, m.edited
+                    m.thumb, m.status, m.expires_at, m.reply, m.edited, m.mentions
              FROM chats c
              LEFT JOIN messages m ON m.rowid = (
                 SELECT rowid FROM messages WHERE chat_id = c.id ORDER BY ts DESC, id DESC LIMIT 1
@@ -704,7 +754,7 @@ impl Store {
     ) -> Result<Window> {
         let conn = self.lock()?;
         let cols = "chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                    expires_at, reply, edited";
+                    expires_at, reply, edited, mentions";
         let mut older = conn
             .prepare_cached(&format!(
                 "SELECT {cols} FROM messages
@@ -746,7 +796,7 @@ impl Store {
         let mut rows = conn
             .prepare_cached(
                 "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                        expires_at, reply, edited
+                        expires_at, reply, edited, mentions
                  FROM messages
                  WHERE chat_id = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
                  ORDER BY ts ASC, id ASC LIMIT ?4",
@@ -999,7 +1049,25 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
             .and_then(|j| serde_json::from_str(&j).ok()),
         edited: r.get(o + 11)?,
         reactions: Vec::new(),
+        mentions: r
+            .get::<_, Option<String>>(o + 12)?
+            .map(|j| decode_mentions(&j))
+            .unwrap_or_default(),
     })
+}
+
+/// Mentioned JIDs as stored: a JSON array, NULL when there are none.
+fn encode_mentions(m: &[String]) -> Option<String> {
+    (!m.is_empty())
+        .then(|| serde_json::to_string(m).ok())
+        .flatten()
+}
+
+/// Reads stored mentions; garbage reads as none.
+fn decode_mentions(json: &str) -> Vec<String> {
+    let mut v: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+    v.truncate(crate::net::types::MAX_MENTIONS);
+    v
 }
 
 #[cfg(test)]
@@ -1023,8 +1091,87 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
+    }
+
+    #[test]
+    fn mentions_round_trip_through_the_cache() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = msg("g@g.us", "1", 10, false, "@123456789012345 hi");
+        m.mentions = vec!["123456789012345@lid".into()];
+        let plain = msg("g@g.us", "2", 11, false, "no mentions");
+        s.insert_messages(&[m.clone(), plain]).unwrap();
+        let page = s.load_messages("g@g.us", None, 10).unwrap();
+        assert_eq!(page[0].mentions, m.mentions);
+        assert!(page[1].mentions.is_empty());
+        assert_eq!(s.chat_rows().unwrap()[0].last.as_ref().unwrap().id, "2");
+        assert!(decode_mentions("not json").is_empty());
+        assert_eq!(encode_mentions(&[]), None);
+    }
+
+    #[test]
+    fn a_poster_frame_is_kept_as_the_video_thumbnail() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = msg("c", "v", 10, false, "");
+        m.content = Content::Video {
+            caption: None,
+            seconds: 3,
+            width: 320,
+            height: 180,
+            thumbnail: None,
+            media: None,
+        };
+        s.insert_messages(&[m]).unwrap();
+        s.set_thumb("c", "v", &[1, 2, 3]).unwrap();
+        // An inline thumbnail that is already there is never replaced.
+        s.set_thumb("c", "v", &[9]).unwrap();
+        let got = s.message("c", "v").unwrap().unwrap();
+        assert!(matches!(
+            got.content,
+            Content::Video { thumbnail: Some(ref t), .. } if t == &[1, 2, 3]
+        ));
+    }
+
+    #[test]
+    fn media_counts_and_galleries_per_chat() {
+        let s = Store::open_in_memory().unwrap();
+        let mut img = msg("c", "i", 10, false, "");
+        img.content = Content::Image {
+            caption: None,
+            width: 1,
+            height: 1,
+            thumbnail: Some(vec![1]),
+            media: None,
+        };
+        let mut doc = msg("c", "d", 11, false, "");
+        doc.content = Content::Document {
+            file_name: "a.pdf".into(),
+            mimetype: "application/pdf".into(),
+            size: 1,
+            pages: None,
+            caption: None,
+            media: None,
+        };
+        let text = msg("c", "t", 12, false, "hi");
+        let other = msg("o", "x", 13, false, "hi");
+        s.insert_messages(&[img, doc, text, other]).unwrap();
+        assert_eq!(s.media_counts("c").unwrap(), (1, 0, 1));
+        assert_eq!(s.media_counts("none").unwrap(), (0, 0, 0));
+        let g = s.messages_of_kind("c", &["image", "video"], 10).unwrap();
+        assert_eq!(g.len(), 1);
+        assert!(matches!(
+            g[0].content,
+            Content::Image {
+                thumbnail: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            s.messages_of_kind("c", &["document"], 10).unwrap()[0].id,
+            "d"
+        );
     }
 
     #[test]
@@ -1364,6 +1511,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         };
         s.insert_messages(std::slice::from_ref(&m)).unwrap();

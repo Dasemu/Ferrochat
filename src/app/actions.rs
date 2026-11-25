@@ -205,7 +205,13 @@ impl App {
             Ui::JumpLatest => self.jump_latest(),
             other => match self.on_ui_video(other) {
                 Ok(t) => t,
-                Err(other) => return self.on_ui_lists(other),
+                Err(other) => match self.on_ui_viewer(other) {
+                    Ok(t) => t,
+                    Err(other) => match self.on_ui_info(other) {
+                        Ok(t) => t,
+                        Err(other) => return self.on_ui_lists(other),
+                    },
+                },
             },
         })
     }
@@ -363,9 +369,50 @@ impl App {
             return Task::none();
         };
         self.reply_to = None;
-        self.composer = t.clone();
+        self.composer.set_text(t);
         self.editing = Some(m.id);
         operation::focus(COMPOSER_ID)
+    }
+
+    /// Keeps the composer text of the open chat as its draft.
+    pub(super) fn stash_draft(&mut self) {
+        if self.editing.is_some() {
+            return;
+        }
+        if let Some(chat) = self.open.as_ref().map(|c| c.chat.clone()) {
+            self.drafts.save(&chat, self.composer.text());
+        }
+    }
+
+    /// An emoji was picked: insert it at the cursor and remember it.
+    pub(super) fn pick_emoji(&mut self, e: &str) -> Task<Message> {
+        self.composer.insert(e);
+        crate::app::emoji::push_recent(&mut self.emoji.recent, e);
+        let json = serde_json::to_string(&self.emoji.recent).unwrap_or_default();
+        Task::batch([
+            store_task(&self.store, move |s| {
+                s.set_kv(crate::app::emoji::RECENT_KEY, &json)
+            }),
+            self.compose_input(),
+        ])
+    }
+
+    /// Category tab: scroll the picker grid to that section.
+    pub(super) fn scroll_picker_to(&mut self, c: crate::app::emoji::Category) -> Task<Message> {
+        use crate::app::emoji;
+        self.emoji.query.clear();
+        let m = self.theme.metrics;
+        let pane = self.window_size().width - m.rail_width - m.sidebar_width;
+        let sections = self.emoji.sections();
+        let y = emoji::section_offset(
+            &sections,
+            c,
+            emoji::columns(pane),
+            emoji::CELL,
+            emoji::HEADER,
+        )
+        .unwrap_or(0.0);
+        operation::scroll_to(emoji::SCROLL_ID, operation::AbsoluteOffset { x: 0.0, y })
     }
 
     pub(super) fn cancel_edit(&mut self) {
@@ -379,7 +426,7 @@ impl App {
         let Some(id) = self.editing.take() else {
             return Task::none();
         };
-        let text = self.composer.trim().to_string();
+        let text = self.composer.text().trim().to_string();
         self.composer.clear();
         let Some(chat) = self.open_chat_id() else {
             return Task::none();
@@ -945,7 +992,7 @@ impl App {
         if self.editing.is_some() {
             return Task::none();
         }
-        let non_empty = !self.composer.trim().is_empty();
+        let non_empty = !self.composer.is_blank();
         match self.compose.on_input(&chat, non_empty, Instant::now()) {
             Some(e) => self.emit_chat_state(e),
             None => Task::none(),

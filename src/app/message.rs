@@ -65,8 +65,8 @@ pub enum Ui {
     OpenChat(ChatId),
     /// Escape / back.
     CloseChat,
-    /// Composer edited.
-    Composer(String),
+    /// Composer edited (typing, cursor moves, paste, Shift+Enter).
+    ComposerAction(iced::widget::text_editor::Action),
     /// Enter / send button.
     Send,
     /// Paperclip.
@@ -83,6 +83,10 @@ pub enum Ui {
     ToggleEmoji,
     /// Emoji picked.
     Emoji(&'static str),
+    /// Emoji picker search box edited.
+    EmojiSearch(String),
+    /// Emoji picker category tab: scroll to its section.
+    EmojiCategory(crate::app::emoji::Category),
     /// Mic pressed: start recording.
     StartRecording,
     /// Stop recording; send or discard.
@@ -100,6 +104,44 @@ pub enum Ui {
     OpenImage(String),
     /// Close the image viewer.
     CloseViewer,
+    /// Zoom the viewer by `factor` around `at` (offset from the centre).
+    ViewerZoom {
+        /// Multiplier (> 1 zooms in).
+        factor: f32,
+        /// Point kept under the cursor, relative to the window centre.
+        at: iced::Vector,
+    },
+    /// "0" / double click: back to the fitted picture.
+    ViewerResetZoom,
+    /// Drag of the zoomed picture.
+    ViewerPan {
+        /// Pointer movement.
+        delta: iced::Vector,
+        /// Fitted picture size at zoom 1 (for clamping).
+        fitted: (f32, f32),
+    },
+    /// Previous (-1) / next (+1) photo of the chat.
+    ViewerStep(i32),
+    /// "Save as…".
+    ViewerSave,
+    /// "Open externally".
+    ViewerOpenExternal,
+    /// Left / Right arrow: the photo viewer or the status viewer steps.
+    Arrow(i32),
+    /// Conversation header clicked: open / close the info drawer.
+    ToggleInfo,
+    /// Close the info drawer.
+    CloseInfo,
+    /// Open a gallery tab of the info drawer (`None` = back).
+    InfoGallery(Option<crate::app::info::Tab>),
+    /// Mute / unmute a chat.
+    ToggleMute(ChatId),
+    /// "Block" pressed: ask first.
+    AskBlock,
+    /// Block confirmation dismissed.
+    CancelBlock,
+    /// Block (`true`) / unblock the contact of the drawer.
+    SetBlocked(bool),
     /// Conversation scrolled; load older when near the top.
     Scrolled {
         /// Relative offset from the bottom anchor: 0 = newest, 1 = oldest.
@@ -461,6 +503,26 @@ pub enum Done {
         /// Path or error text.
         result: Result<PathBuf, String>,
     },
+    /// A poster frame was extracted for a video without an inline thumbnail.
+    Poster {
+        /// Chat.
+        chat: ChatId,
+        /// Message id.
+        id: String,
+        /// JPEG or error text.
+        result: Result<Vec<u8>, String>,
+    },
+    /// The image viewer's full-resolution download finished.
+    ViewerImage {
+        /// Message id.
+        id: String,
+        /// Bytes or error.
+        result: Result<Arc<Vec<u8>>, String>,
+    },
+    /// An info drawer query finished.
+    Info(Box<crate::app::info::InfoDone>),
+    /// A photo was saved / handed to the system viewer (`None` = cancelled).
+    ViewerSaved(Result<Option<PathBuf>, String>),
     /// Voice note downloaded and decoded.
     VoiceReady {
         /// Message id.

@@ -125,6 +125,12 @@ pub enum Icon {
     StarOff,
     /// `user-plus`
     UserPlus,
+    /// `zoom-in`
+    ZoomIn,
+    /// `zoom-out`
+    ZoomOut,
+    /// `ban`
+    Ban,
     /// `phone-off`
     PhoneOff,
     /// `phone-missed`
@@ -143,6 +149,9 @@ impl Icon {
     fn bytes(self) -> &'static [u8] {
         match self {
             Icon::Archive => include_bytes!("../../assets/icons/archive.svg"),
+            Icon::ZoomIn => include_bytes!("../../assets/icons/zoom-in.svg"),
+            Icon::ZoomOut => include_bytes!("../../assets/icons/zoom-out.svg"),
+            Icon::Ban => include_bytes!("../../assets/icons/ban.svg"),
             Icon::ArrowLeft => include_bytes!("../../assets/icons/arrow-left.svg"),
             Icon::BellOff => include_bytes!("../../assets/icons/bell-off.svg"),
             Icon::CheckCheck => include_bytes!("../../assets/icons/check-check.svg"),

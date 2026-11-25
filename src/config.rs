@@ -53,6 +53,14 @@ pub enum ScreenshotTarget {
     HeaderMenu,
     /// Conversation with the attachment preview of a pasted image.
     Paste,
+    /// Conversation with the emoji drawer open.
+    Emoji,
+    /// The full-size image viewer.
+    Viewer,
+    /// The contact info drawer of a one-to-one chat.
+    Info,
+    /// The group info drawer.
+    GroupInfo,
     /// Chat list with the "new version available" banner.
     UpdateBanner,
     /// Settings page with an update available (Updates section).
@@ -126,6 +134,10 @@ impl ScreenshotTarget {
             "starred" => Some(Self::Starred),
             "header-menu" | "menu-header" => Some(Self::HeaderMenu),
             "paste" | "attach" => Some(Self::Paste),
+            "emoji" | "emoji-picker" => Some(Self::Emoji),
+            "viewer" | "image-viewer" => Some(Self::Viewer),
+            "info" | "contact-info" => Some(Self::Info),
+            "group-info" => Some(Self::GroupInfo),
             "update-banner" => Some(Self::UpdateBanner),
             "update-settings" => Some(Self::UpdateSettings),
             "call" | "call-incoming" => Some(Self::Call),

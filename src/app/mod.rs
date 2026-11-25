@@ -2,10 +2,14 @@
 
 mod actions;
 pub mod call;
+pub mod composer;
+pub mod emoji;
+pub mod info;
 pub mod input;
 pub mod linkify;
 pub mod lists;
 pub mod video;
+pub mod viewer;
 pub use actions::{PopupPos, popup_top, row_id};
 mod background;
 pub use background::WindowGeom;
@@ -209,14 +213,25 @@ pub struct App {
     pub(crate) list_dialog: Option<ListDialog>,
     pub(crate) open: Option<Conversation>,
     pending_read: usize,
-    pub(crate) composer: String,
+    /// Display JID -> the JID messages came from (LID-addressed chats and
+    /// group members), so read receipts go where the message came from.
+    wire: HashMap<String, String>,
+    pub(crate) composer: composer::Composer,
+    /// Drafts of the chats that are not open.
+    pub(crate) drafts: composer::Drafts,
     pub(crate) emoji_open: bool,
+    /// Emoji picker search and recent emoji.
+    pub(crate) emoji: emoji::Picker,
     /// Attachment preview (picked or pasted media waiting for "send").
     pub(crate) attach: Option<paste::AttachPreview>,
     pub(crate) menu_open: bool,
     pub(crate) qr: Option<image::Handle>,
     pub(crate) images: ByteLru<String, image::Handle>,
     pub(crate) thumbs: HashMap<String, image::Handle>,
+    /// Videos a poster frame was tried for (each at most once per run).
+    pub(crate) posters_tried: HashSet<String>,
+    /// A poster extraction is running (one at a time).
+    poster_busy: bool,
     downloading: HashSet<String>,
     player: Option<Player>,
     pub(crate) voice: Option<VoiceState>,
@@ -225,7 +240,9 @@ pub struct App {
     pub(crate) recording_since: Option<Instant>,
     pub(crate) toast: Option<String>,
     pub(crate) focused: bool,
-    pub(crate) viewer: Option<String>,
+    pub(crate) viewer: Option<viewer::ImageViewer>,
+    /// Contact / group info drawer.
+    pub(crate) info: Option<info::InfoPanel>,
     pub(crate) sync_progress: Option<u32>,
     started: Instant,
     first_frame_logged: bool,
@@ -442,6 +459,12 @@ impl App {
             }
         };
         let own_jid = store.kv("own_jid").ok().flatten();
+        let recent_emoji = store
+            .kv(emoji::RECENT_KEY)
+            .ok()
+            .flatten()
+            .map(|j| emoji::parse_recent(&j))
+            .unwrap_or_default();
         let _ = store.prune_expired(now_secs());
         let mut lid_map = LidMap::default();
         let mut chats = chats;
@@ -498,13 +521,21 @@ impl App {
             list_dialog: None,
             open: None,
             pending_read: 0,
-            composer: String::new(),
+            wire: HashMap::new(),
+            composer: composer::Composer::new(),
+            drafts: composer::Drafts::default(),
             emoji_open: false,
+            emoji: emoji::Picker {
+                recent: recent_emoji,
+                ..Default::default()
+            },
             attach: None,
             menu_open: false,
             qr: None,
             images: ByteLru::new(IMAGE_BUDGET),
             thumbs: HashMap::new(),
+            posters_tried: HashSet::new(),
+            poster_busy: false,
             downloading: HashSet::new(),
             player: None,
             voice: None,
@@ -514,6 +545,7 @@ impl App {
             toast: None,
             focused: true,
             viewer: None,
+            info: None,
             sync_progress: None,
             started,
             first_frame_logged: false,
@@ -596,6 +628,13 @@ impl App {
                     Some((ScreenshotTarget::Video, _)) => 9000,
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
+                    Some((
+                        ScreenshotTarget::Emoji
+                        | ScreenshotTarget::Viewer
+                        | ScreenshotTarget::Info
+                        | ScreenshotTarget::GroupInfo,
+                        _,
+                    )) => 5000,
                     // Call bubbles are stored, then the call rings.
                     Some((ScreenshotTarget::Call | ScreenshotTarget::CallActive, _)) => 6000,
                     // Scenes that wait for statuses, stars or communities.
@@ -671,14 +710,29 @@ impl App {
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight),
                     ..
-                }) if status == iced::event::Status::Ignored => {
-                    Some(Message::Ui(Ui::Nav(nav::NavMsg::StatusNext)))
-                }
+                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(1))),
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
                     ..
-                }) if status == iced::event::Status::Ignored => {
-                    Some(Message::Ui(Ui::Nav(nav::NavMsg::StatusPrev)))
+                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(-1))),
+                // Image viewer zoom keys (no text field has them then).
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character(c),
+                    modifiers,
+                    ..
+                }) if status == iced::event::Status::Ignored && !modifiers.control() => {
+                    match c.as_str() {
+                        "+" | "=" => Some(Message::Ui(Ui::ViewerZoom {
+                            factor: viewer::ZOOM_STEP,
+                            at: iced::Vector::ZERO,
+                        })),
+                        "-" => Some(Message::Ui(Ui::ViewerZoom {
+                            factor: 1.0 / viewer::ZOOM_STEP,
+                            at: iced::Vector::ZERO,
+                        })),
+                        "0" => Some(Message::Ui(Ui::ViewerResetZoom)),
+                        _ => None,
+                    }
                 }
                 _ => None,
             }),
@@ -753,6 +807,8 @@ impl App {
             Message::Focus(f) => {
                 self.focused = f;
                 if f {
+                    // Unread messages of the open chat become read when the
+                    // window comes back (if the newest ones are on screen).
                     self.send_pending_reads()
                 } else {
                     Task::none()
@@ -802,6 +858,16 @@ impl App {
                 return self.want_visible_avatars();
             }
             Ui::OpenChat(chat) => return self.open_chat(chat),
+            Ui::Arrow(d) => {
+                if self.viewer.is_some() {
+                    return self.update_inner(Message::Ui(Ui::ViewerStep(d)));
+                }
+                return self.on_nav(if d > 0 {
+                    nav::NavMsg::StatusNext
+                } else {
+                    nav::NavMsg::StatusPrev
+                });
+            }
             Ui::CloseChat => {
                 // Esc closes the topmost layer first, the conversation last.
                 let mut close_video = None;
@@ -817,6 +883,7 @@ impl App {
                         true
                     }
                     || self.viewer.take().is_some()
+                    || self.info.take().is_some()
                     || self.chat_search.take().is_some()
                     || self.reply_to.take().is_some()
                     || (self.editing.is_some() && {
@@ -826,6 +893,8 @@ impl App {
                 let mut task = Task::none();
                 if !consumed && !self.emoji_open && !self.menu_open {
                     task = self.compose_stop();
+                    self.stash_draft();
+                    self.composer.clear();
                     self.open = None;
                     self.hovered = None;
                 }
@@ -836,9 +905,10 @@ impl App {
                 }
                 return task;
             }
-            Ui::Composer(t) => {
-                self.composer = t;
-                return self.compose_input();
+            Ui::ComposerAction(action) => {
+                if self.composer.perform(action) {
+                    return self.compose_input();
+                }
             }
             Ui::Send => {
                 if self.editing.is_some() {
@@ -876,8 +946,18 @@ impl App {
             }
             Ui::AttachSend => return self.send_attachment(),
             Ui::AttachCancel => self.attach = None,
-            Ui::ToggleEmoji => self.emoji_open = !self.emoji_open,
-            Ui::Emoji(e) => self.composer.push_str(e),
+            Ui::ToggleEmoji => {
+                self.emoji_open = !self.emoji_open;
+                self.emoji.opened();
+                if !self.emoji_open {
+                    return operation::focus(COMPOSER_ID);
+                }
+            }
+            Ui::Emoji(e) => {
+                return self.pick_emoji(e);
+            }
+            Ui::EmojiSearch(q) => self.emoji.query = q,
+            Ui::EmojiCategory(c) => return self.scroll_picker_to(c),
             Ui::StartRecording => {
                 // Device I/O happens on the recorder's own thread.
                 self.recorder = Some(Recorder::start());
@@ -939,12 +1019,6 @@ impl App {
                 }
             }
             Ui::OpenDocument(id) => return self.open_document(&id),
-            Ui::OpenImage(id) => {
-                let task = self.ensure_media(&id);
-                self.viewer = Some(id);
-                return task;
-            }
-            Ui::CloseViewer => self.viewer = None,
             Ui::Scrolled {
                 relative_y,
                 offset_y,
@@ -955,6 +1029,10 @@ impl App {
                     self.popup = None;
                 }
                 self.scroll_y = offset_y;
+                if self.pending_read > 0 && self.reading_chat().is_some() {
+                    // Scrolled back down to unread messages: they are read now.
+                    return self.send_pending_reads();
+                }
                 if relative_y < 0.02
                     && self
                         .open
@@ -1050,15 +1128,28 @@ impl App {
         if self.open.as_ref().is_some_and(|c| c.chat == chat) {
             return Task::none();
         }
-        self.pending_read = self
+        let unread = self
             .chats
             .get(&chat)
             .map(|e| e.meta.unread as usize)
             .unwrap_or(0);
-        self.chats.mark_read(&chat);
+        // Read once it is on screen (focused, at the bottom): until then the
+        // badge stays, like WhatsApp Desktop.
+        self.pending_read = unread;
         let paused = self.compose_stop();
-        self.open = Some(Conversation::new(chat.clone(), Vec::new(), false));
-        self.composer.clear();
+        self.stash_draft();
+        self.info = None;
+        self.scroll_y = 0.0;
+        let mut conv = Conversation::new(chat.clone(), Vec::new(), false);
+        conv.unread = (unread > 0).then_some(state::UnreadDivider {
+            first: None,
+            count: unread,
+        });
+        self.open = Some(conv);
+        match self.drafts.take(&chat) {
+            Some(d) => self.composer.set_text(&d),
+            None => self.composer.clear(),
+        }
         self.attach = None;
         self.reply_to = None;
         self.editing = None;
@@ -1083,10 +1174,9 @@ impl App {
                 Err(e) => Message::done(Done::Stored(Err(e.to_string()))),
             },
         );
-        let persist = store_task(&self.store, {
-            let chat = chat.clone();
-            move |s| s.set_unread(&chat, 0)
-        });
+        // The cached counter is cleared with the badge, once the messages are
+        // on screen (`send_pending_reads`).
+        let persist = Task::none();
         Task::batch([load, persist, paused, presence, avatars])
     }
 
@@ -1103,6 +1193,7 @@ impl App {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         }
     }
@@ -1126,7 +1217,7 @@ impl App {
     }
 
     fn send_text(&mut self) -> Task<Message> {
-        let text = self.composer.trim().to_string();
+        let text = self.composer.text().trim().to_string();
         let Some(chat) = self.open.as_ref().map(|c| c.chat.clone()) else {
             return Task::none();
         };
@@ -1232,8 +1323,8 @@ impl App {
             return Task::none();
         }
         let staged = *staged;
-        if let Some(text) = paste::strip_pasted_paths(&self.composer, &staged.pasted_paths) {
-            self.composer = text;
+        if let Some(text) = paste::strip_pasted_paths(&self.composer.text(), &staged.pasted_paths) {
+            self.composer.set_text(&text);
         }
         if let Some(first) = staged.problems.first() {
             let more = staged.problems.len() - 1;
@@ -1291,15 +1382,8 @@ impl App {
         }
     }
 
-    fn find_message(&self, id: &str) -> Option<&ChatMessage> {
+    pub fn find_message(&self, id: &str) -> Option<&ChatMessage> {
         self.open.as_ref().and_then(|c| c.get(id))
-    }
-
-    /// Starts downloading the media of message `id` if not cached yet.
-    /// Downloads the media of message `id` (explicit user action: higher
-    /// pixel cap, jumps the queue).
-    fn ensure_media(&mut self, id: &str) -> Task<Message> {
-        self.request_media(id, crate::media::MAX_IMAGE_PIXELS, true)
     }
 
     /// Queues or starts a download, at most [`crate::media::MAX_CONCURRENT_DOWNLOADS`]
@@ -1380,7 +1464,7 @@ impl App {
             let Some(id) = self.download_queue.pop_front() else {
                 break;
             };
-            let cap = if self.viewer.as_deref() == Some(id.as_str()) {
+            let cap = if self.viewer.as_ref().is_some_and(|v| v.id == id) {
                 crate::media::MAX_IMAGE_PIXELS
             } else {
                 crate::media::MAX_AUTO_IMAGE_PIXELS
@@ -1546,6 +1630,8 @@ impl App {
     fn cleanup_session(&mut self) -> Task<Message> {
         self.client = None;
         self.open = None;
+        self.composer.clear();
+        self.drafts = composer::Drafts::default();
         self.chats = ChatList::default();
         self.images.clear();
         self.thumbs.clear();
@@ -1593,12 +1679,35 @@ impl App {
         )
     }
 
+    /// The open chat, if the user is reading its newest messages.
+    pub fn reading_chat(&self) -> Option<&str> {
+        let c = self.open.as_ref()?;
+        state::is_reading(self.focused, self.scroll_y, c.has_newer).then_some(c.chat.as_str())
+    }
+
+    /// Unread messages of the open chat are on screen: clear the badge
+    /// (and its cached counter) and send read receipts the way the library
+    /// does, addressed to the JIDs the messages came from.
     fn send_pending_reads(&mut self) -> Task<Message> {
-        if !self.focused || self.pending_read == 0 {
+        if self.pending_read == 0 || self.reading_chat().is_none() {
             return Task::none();
         }
         let Some(conv) = &self.open else {
             return Task::none();
+        };
+        let had_badge = self
+            .chats
+            .get(&conv.chat)
+            .is_some_and(|e| e.meta.unread > 0);
+        let chat_id = conv.chat.clone();
+        self.chats.mark_read(&chat_id);
+        let clear = if had_badge {
+            store_task(&self.store, move |s| s.set_unread(&chat_id, 0))
+        } else {
+            Task::none()
+        };
+        let Some(conv) = &self.open else {
+            return clear;
         };
         let incoming: Vec<ChatMessage> = conv
             .messages
@@ -1610,18 +1719,22 @@ impl App {
             .collect();
         self.pending_read = 0;
         let Some(client) = self.client.clone() else {
-            return Task::none();
+            return clear;
         };
         let chat = conv.chat.clone();
         let batches = state::read_receipt_batches(&chat, &incoming);
-        Task::batch(batches.into_iter().map(|(sender, ids)| {
+        let wire_chat = state::wire_jid(&self.wire, &chat).to_string();
+        let mut tasks = vec![clear];
+        for (sender, ids) in batches {
             let client = client.clone();
-            let chat = chat.clone();
-            Task::perform(
+            let chat = wire_chat.clone();
+            let sender = sender.map(|s| state::wire_jid(&self.wire, &s).to_string());
+            tasks.push(Task::perform(
                 async move { client.mark_read(&chat, sender.as_deref(), &ids).await },
                 |_| Message::done(Done::Nothing),
-            )
-        }))
+            ));
+        }
+        Task::batch(tasks)
     }
 
     fn index_thumbs(&mut self, msgs: &[ChatMessage]) {
@@ -1664,11 +1777,12 @@ impl App {
             })
             .map(|m| m.id.clone())
             .collect();
-        Task::batch(
-            ids.iter()
-                .map(|id| self.request_media(id, crate::media::MAX_AUTO_IMAGE_PIXELS, false))
-                .collect::<Vec<_>>(),
-        )
+        let mut tasks: Vec<_> = ids
+            .iter()
+            .map(|id| self.request_media(id, crate::media::MAX_AUTO_IMAGE_PIXELS, false))
+            .collect();
+        tasks.push(self.want_poster());
+        Task::batch(tasks)
     }
 
     // ---------------------------------------------------------------- Net
@@ -1755,6 +1869,11 @@ impl App {
                     c.id = self.lid_map.normalize(&c.id);
                 }
                 self.chats.apply_history(&chats, &names);
+                // A history chunk carries the phone's counter from when it was
+                // built: it must not mark the chat being read as unread.
+                if let Some(c) = self.reading_chat().map(str::to_string) {
+                    self.chats.mark_read(&c);
+                }
                 let rows = crate::net::push_names(&names);
                 let mut tasks = vec![
                     store_task(&self.store, move |s| {
@@ -1791,9 +1910,13 @@ impl App {
                     Some((t, _)) if !t.list_only()
                 ) && self.open.is_none()
                 {
-                    tasks.push(Task::done(Message::Ui(Ui::OpenChat(
-                        crate::mock::SHOWCASE_CHAT.into(),
-                    ))));
+                    let chat =
+                        if matches!(self.cfg.screenshot, Some((ScreenshotTarget::GroupInfo, _))) {
+                            "120363000000000001@g.us"
+                        } else {
+                            crate::mock::SHOWCASE_CHAT
+                        };
+                    tasks.push(Task::done(Message::Ui(Ui::OpenChat(chat.into()))));
                 }
                 tasks.extend(self.nav_scene(nav::SceneStage::History));
                 return Task::batch(tasks);
@@ -2058,8 +2181,18 @@ impl App {
     /// messages are new (live or drained from the offline queue).
     fn on_messages(&mut self, mut messages: Vec<ChatMessage>, origin: Origin) -> Task<Message> {
         let own = self.own_jid.clone().unwrap_or_default();
+        if self.wire.len() > 4096 {
+            self.wire.clear();
+        }
         for m in &mut messages {
+            let (chat, sender) = (m.chat.clone(), m.sender.clone());
             self.lid_map.apply(m);
+            if m.chat != chat {
+                self.wire.insert(m.chat.clone(), chat);
+            }
+            if m.sender != sender {
+                self.wire.insert(m.sender.clone(), sender);
+            }
             if let Some(q) = &mut m.reply {
                 q.sender = self.lid_map.normalize(&q.sender);
             }
@@ -2111,10 +2244,13 @@ impl App {
         };
         let counts = origin != Origin::History;
         let pushed = self.chats.learn_push_names(&messages);
+        // Only a chat the user is reading (focused, at the bottom) takes
+        // new messages as read; otherwise they count, even in the open chat.
+        let reading = self.reading_chat().map(str::to_string);
         self.chats.apply_messages(
             &messages,
-            open_chat.as_deref(),
-            self.focused,
+            reading.as_deref(),
+            true,
             counts.then_some(&fresh),
         );
         self.index_thumbs(&messages);
@@ -2143,8 +2279,25 @@ impl App {
                     .iter()
                     .filter(|m| !m.from_me && fresh.contains(&m.id))
                     .count();
+                let first_new = mine
+                    .iter()
+                    .find(|m| !m.from_me && fresh.contains(&m.id))
+                    .map(|m| m.id.clone());
                 c.merge(mine);
-                if counts && self.focused {
+                if counts && incoming > 0 {
+                    if reading.is_none() {
+                        // Not on screen: the divider marks where they start
+                        // (a new run of unread messages moves it).
+                        match &mut c.unread {
+                            Some(d) if self.pending_read > 0 => d.count += incoming,
+                            _ => {
+                                c.unread = Some(state::UnreadDivider {
+                                    first: first_new,
+                                    count: incoming,
+                                })
+                            }
+                        }
+                    }
                     self.pending_read += incoming;
                 }
                 if origin == Origin::Live {
@@ -2182,7 +2335,7 @@ impl App {
                         let (summary, body) = crate::notify::notification_text(
                             &sender,
                             group.as_deref(),
-                            &m.content.preview(),
+                            &self.preview(m),
                             mode,
                         );
                         (summary, body, Some(m.chat.clone()))
@@ -2237,6 +2390,11 @@ impl App {
                     } else {
                         c.merge(msgs);
                         c.has_more = has_more;
+                        if let Some(d) = &mut c.unread
+                            && d.first.is_none()
+                        {
+                            d.first = state::first_unread(&c.messages, d.count);
+                        }
                         let scene = self.scene_tasks();
                         return Task::batch([
                             operation::snap_to(
@@ -2327,6 +2485,23 @@ impl App {
                 let applied = self.apply_stored_messages(messages, new_ids, origin);
                 return Task::batch([applied, self.replay_deferred()]);
             }
+            Done::Poster { chat, id, result } => return self.on_poster(chat, id, result),
+            Done::ViewerImage { id, result } => self.on_viewer_image(id, result),
+            Done::Info(d) => return self.on_info(*d),
+            Done::ViewerSaved(r) => match r {
+                Ok(Some(p)) => {
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.toast(format!("Saved {name}"));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "saving a photo failed");
+                    self.toast("The photo could not be saved.");
+                }
+            },
             Done::PlayerReady { result, then } => match result {
                 Ok(p) => {
                     self.player = Some(p);
@@ -2525,6 +2700,24 @@ impl App {
                 })));
                 v.push(ui(Ui::AttachCaption("Look at this sunset".into())));
             }
+            ScreenshotTarget::Emoji => {
+                v.push(ui(Ui::Emoji("\u{1F602}")));
+                v.push(ui(Ui::Emoji("\u{2764}\u{FE0F}")));
+                v.push(ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")));
+                v.push(ui(Ui::ToggleEmoji));
+            }
+            ScreenshotTarget::Info | ScreenshotTarget::GroupInfo => v.push(ui(Ui::ToggleInfo)),
+            ScreenshotTarget::Viewer => {
+                if let Some(id) = c
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| matches!(m.content, Content::Image { .. }))
+                    .map(|m| m.id.clone())
+                {
+                    v.push(ui(Ui::OpenImage(id)));
+                }
+            }
             ScreenshotTarget::Call => v.extend(call::scene(&c.chat, false)),
             ScreenshotTarget::CallActive => v.extend(call::scene(&c.chat, true)),
             ScreenshotTarget::Delete => {
@@ -2548,19 +2741,14 @@ impl App {
         v
     }
 
-    /// Display name of an `@<user>` mention in message text, from the saved,
-    /// business or push name of that number (or LID).
-    pub fn mention_name(&self, user: &str) -> Option<String> {
-        let pn = format!("{user}@s.whatsapp.net");
-        let jid = if self.chats.names.best(&pn).is_some() {
-            pn
-        } else {
-            self.lid_map.normalize(&format!("{user}@lid"))
-        };
-        if self.own_jid.as_deref() == Some(jid.as_str()) {
-            return Some("You".into());
-        }
-        self.chats.names.best(&jid).map(|(_, n)| n.to_string())
+    /// Our own JIDs, for "@You" mentions.
+    pub fn own_ids(&self) -> Vec<&str> {
+        self.own_jid.as_deref().into_iter().collect()
+    }
+
+    /// One-line preview of a message, mentions shown as "@Name".
+    pub fn preview(&self, m: &ChatMessage) -> String {
+        self.chats.preview(m, &self.own_ids())
     }
 
     /// Logical size of the main window.
@@ -2586,7 +2774,7 @@ fn jitter_ms() -> u64 {
     u16::from_le_bytes(b) as u64
 }
 
-fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
+pub(crate) fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
         return candidate;

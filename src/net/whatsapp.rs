@@ -30,8 +30,8 @@ use super::call::{self, CallAudio, CallBook};
 use super::convert::{self, Envelope, Uploaded};
 use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
-    ChatState, CollectionResync, Content, ListDef, MediaKind, MediaRef, MsgKey, NameSource, Origin,
-    OutgoingKind, OutgoingMedia, Quote, ResyncReport,
+    ChatState, CollectionResync, ContactInfo, Content, GroupInfo, ListDef, MediaKind, MediaRef,
+    MsgKey, NameSource, Origin, OutgoingKind, OutgoingMedia, Quote, ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
@@ -768,6 +768,94 @@ impl WaClient for RealClient {
 
     fn set_call_muted(&self, call_id: &str, muted: bool) {
         self.calls.set_muted(call_id, muted);
+    }
+
+    fn contact_info<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<ContactInfo>> {
+        Box::pin(async move {
+            let j = parse_jid(jid)?;
+            let info = self
+                .client
+                .contacts()
+                .get_user_info(std::slice::from_ref(&j))
+                .await
+                .map_err(|e| Error::Net(format!("contact info: {e}")))?;
+            let u = info
+                .values()
+                .find(|u| u.jid.user == j.user || u.lid.as_ref().is_some_and(|l| l.user == j.user))
+                .or_else(|| info.values().next());
+            Ok(match u {
+                Some(u) => convert::contact_info(
+                    u.status.as_deref(),
+                    u.verified_name.as_ref().and_then(|v| v.name.as_deref()),
+                ),
+                None => ContactInfo::default(),
+            })
+        })
+    }
+
+    fn group_info<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<GroupInfo>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let meta = self
+                .client
+                .groups()
+                .get_metadata(&jid)
+                .await
+                .map_err(|e| Error::Net(format!("group info: {e}")))?;
+            Ok(convert::group_info(&meta))
+        })
+    }
+
+    fn common_groups<'a>(
+        &'a self,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<(String, String)>>> {
+        Box::pin(async move {
+            let groups = self
+                .client
+                .groups()
+                .get_participating()
+                .await
+                .map_err(|e| Error::Net(format!("groups: {e}")))?;
+            Ok(convert::common_groups(&groups, ids))
+        })
+    }
+
+    fn is_blocked<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            let j = parse_jid(jid)?;
+            self.client
+                .blocking()
+                .is_blocked(&j)
+                .await
+                .map_err(|e| Error::Net(format!("block list: {e}")))
+        })
+    }
+
+    fn set_blocked<'a>(&'a self, jid: &'a str, blocked: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let j = parse_jid(jid)?;
+            let b = self.client.blocking();
+            if blocked {
+                b.block(&j).await
+            } else {
+                b.unblock(&j).await
+            }
+            .map_err(|e| Error::Net(format!("block: {e}")))
+        })
+    }
+
+    fn set_muted<'a>(&'a self, chat: &'a str, muted: bool) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            let jid = parse_jid(chat)?;
+            let actions = self.client.chat_actions();
+            if muted {
+                actions.mute_chat(&jid).await
+            } else {
+                actions.unmute_chat(&jid).await
+            }
+            .map_err(|e| Error::Net(e.to_string()))
+        })
     }
 
     fn logout(&self) -> BoxFuture<'_, Result<()>> {

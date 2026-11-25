@@ -68,6 +68,25 @@ pub fn probe_and_thumbnail(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
     Ok((w, h, out))
 }
 
+/// Longest side of a video poster frame kept in the cache.
+pub const POSTER_SIDE: u32 = 480;
+
+/// A decoded video frame as the bubble's poster: scaled to fit
+/// [`POSTER_SIDE`] and JPEG-encoded (a few tens of kB, stored like an
+/// inline thumbnail so it is extracted once).
+pub fn poster_jpeg(width: u32, height: u32, rgba: Vec<u8>) -> Result<Vec<u8>> {
+    let img = image::RgbaImage::from_raw(width, height, rgba)
+        .ok_or_else(|| Error::Media("frame size does not match its pixels".into()))?;
+    let img = image::DynamicImage::ImageRgba8(img)
+        .thumbnail(POSTER_SIDE, POSTER_SIDE)
+        .to_rgb8();
+    let mut out = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(Cursor::new(&mut out), 80)
+        .encode_image(&img)
+        .map_err(|e| Error::Media(e.to_string()))?;
+    Ok(out)
+}
+
 /// MIME type from the file extension.
 pub fn mime_for_path(path: &Path) -> &'static str {
     let ext = path

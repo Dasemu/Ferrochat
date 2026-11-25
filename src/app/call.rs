@@ -297,6 +297,7 @@ impl App {
             expires_at: None,
             reply: None,
             edited: false,
+            mentions: Vec::new(),
             reactions: Vec::new(),
         };
         let origin = if missed {
@@ -338,6 +339,7 @@ pub(super) fn scene(chat: &str, active: bool) -> Vec<Task<Message>> {
         expires_at: None,
         reply: None,
         edited: false,
+        mentions: Vec::new(),
         reactions: Vec::new(),
     };
     let mut v = vec![Task::done(Message::Net(Event::Messages {

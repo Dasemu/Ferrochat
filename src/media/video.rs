@@ -257,6 +257,46 @@ pub fn spawn_with(
     ))
 }
 
+/// Decodes only the first picture of `file` with the helper at `helper`
+/// (a poster frame), then stops it. Gives up after `wait`.
+pub async fn first_frame_with(
+    helper: &Path,
+    file: &Path,
+    wait: std::time::Duration,
+) -> Result<(u32, u32, Vec<u8>), Failure> {
+    let (player, mut rx) = spawn_with(helper, file)?;
+    let deadline = tokio::time::Instant::now() + wait;
+    let out = loop {
+        match tokio::time::timeout_at(deadline, rx.recv()).await {
+            Ok(Some(Event::Frame {
+                width,
+                height,
+                rgba,
+            })) => break Ok((width, height, rgba)),
+            Ok(Some(Event::Failed(f))) => break Err(f),
+            Ok(Some(_)) => {}
+            Ok(None) => break Err(Failure::Broken("the helper ended without a picture".into())),
+            Err(_) => break Err(Failure::Broken("no picture in time".into())),
+        }
+    };
+    // Dropping the player ends the helper process.
+    drop(player);
+    out
+}
+
+/// [`first_frame_with`] using the helper found by [`helper_path`].
+pub async fn first_frame(
+    file: &Path,
+    wait: std::time::Duration,
+) -> Result<(u32, u32, Vec<u8>), Failure> {
+    let helper = helper_path().ok_or_else(|| {
+        Failure::Unavailable(format!(
+            "the {HELPER_NAME} helper was not found next to Ferrochat"
+        ))
+    })?;
+    first_frame_with(&helper, file, wait).await
+}
+
 /// Starts the helper found by [`helper_path`].
 pub fn spawn(file: &Path) -> Result<(Player, mpsc::UnboundedReceiver<Event>), Failure> {
     let helper = helper_path().ok_or_else(|| {

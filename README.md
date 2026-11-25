@@ -138,4 +138,6 @@ Architecture: [docs/architecture.md](docs/architecture.md). Lessons learned:
 ## Licence
 
 MIT. Inter is under the SIL Open Font License 1.1, Lucide icons under ISC
-(see `assets/`).
+(see `assets/`). Emoji are drawn with a COLRv0 build of Twemoji (graphics
+CC-BY 4.0 by Twitter, Inc and jdecked; font build Apache-2.0, see
+`assets/fonts/Twemoji-LICENSE.txt`), not WhatsApp's own emoji art.
