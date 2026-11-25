@@ -285,6 +285,60 @@ the last size and position (position is not reported on Wayland). Left click
 on the icon toggles the window. `--minimized` starts with no window; if there
 is no tray it opens the window anyway.
 
+### 11.5 Updates
+
+The app updates itself from GitHub Releases (`src/update/`, glue in
+`app/updates.rs`, views in `ui/update.rs`).
+
+| Piece | Where |
+|---|---|
+| One `GET https://api.github.com/repos/FerroApps/Ferrochat/releases/latest` (`Accept: application/vnd.github+json`, `User-Agent: ferrochat/<version>`, `If-None-Match`), no account data, telemetry or machine id. `FERRO_RELEASE_API` overrides the URL (HTTPS GitHub, or plain HTTP on loopback for tests) | `update/http.rs` |
+| Strict `X.Y.Z` compare against `CARGO_PKG_VERSION`; drafts, prereleases and odd tags ignored | `update/version.rs`, `update/release.rs` |
+| Schedule: 10-20 s after start, then every 6 h ± 30 min, also while hidden in the tray; 403/429 back off silently (`Retry-After` / `X-RateLimit-Reset`, max 24 h). Never in `--mock`, `--screenshot` or debug builds unless `FERRO_UPDATE_FORCE=1`. "Check for updates automatically" (`check_updates` in `settings.json`, default on) stops the timer; the manual check still works | `update/schedule.rs`, `app/updates.rs` |
+| Dismissed version, last ETag and the release it described | `$XDG_STATE_HOME/ferrochat/update.json` (not written in `--mock`) |
+| Banner above the window content: "Ferrochat X is available" [Update] [Release notes] [x]; progress (cancellable while downloading); "Restart to finish" [Restart now] [Later]; failures with "Open release page". [x] hides that version until a newer one appears | `ui/update.rs` |
+| Settings "Updates": version, detected install method, check button + result, update action, auto-check toggle, release notes | `ui/update.rs::section` |
+
+Install methods (`update/method.rs`, pure `detect` over a `Probe` of
+`current_exe()` and markers):
+
+1. **install.sh** (`${XDG_BIN_HOME:-~/.local/bin}/ferrochat` plus
+   `${XDG_DATA_HOME:-~/.local/share}/ferrochat/installed-version`): self-update.
+   The `.tar.gz` and `.sha256` are downloaded into
+   `<bin_dir>/.ferrochat-update.<pid>/` (same filesystem), the SHA-256 is
+   checked, the archive is unpacked by a safe extractor (no absolute paths,
+   `..`, links or special files; 1 GB / 10 000 entries cap), then `ferrochat`
+   and `ferrochat-player` are written as `.<name>.new.<pid>` (0755) and renamed
+   over the targets. Old files are hard-linked to `.<name>.old.<pid>` first,
+   so a rename failing halfway rolls back. The desktop entry, icon and
+   `installed-version` are rewritten exactly as install.sh does. Leftovers of
+   a killed update are removed by the next one.
+2. **cargo install** (`${CARGO_HOME:-~/.cargo}/bin`): never self-updates; the
+   banner shows `cargo install --git https://github.com/FerroApps/Ferrochat --locked --force`
+   with a copy button.
+3. **Anything else** (cargo `target/` dir, `/usr`, `/opt`, Flatpak / AppImage /
+   Snap, read-only folder): notify only, with a button that opens the release
+   page. Nothing is written there.
+
+There is no Windows build, so there is no zip path.
+
+Downloads: HTTPS only, every hop (redirects are followed by hand) must be
+`api.github.com`, `github.com`, `objects.githubusercontent.com` or
+`release-assets.githubusercontent.com`; 300 MB cap; timeouts. Logs strip
+query strings (asset URLs are signed). Checks and installs run on detached
+threads, never on tokio's blocking pool, so Quit never waits for them.
+
+Restart: "Restart now" records the new binary and the same arguments
+(`--minimized` added only if the window is hidden), the app quits through the
+normal path, and `main` starts the new process after the event loop ended
+and the single-instance lock and socket were released.
+
+Integrity: the `.sha256` comes from the same release, so it only proves the
+file arrived intact; releases are **not signed** yet. Signing them
+(minisign or cosign, verified with a public key embedded in the binary)
+needs a signing key stored as a CI secret, which the repository owner has to
+add first.
+
 ### 11.2 Screens and navigation
 
 ```

@@ -22,6 +22,9 @@ pub mod state;
 pub mod status;
 #[cfg(test)]
 mod test_support;
+#[cfg(test)]
+mod update_flows;
+mod updates;
 pub mod window;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -303,6 +306,8 @@ pub struct App {
     geom: WindowGeom,
     /// Last tray model handed to the tray service.
     tray_sent: Option<crate::tray::TrayModel>,
+    /// In-app updater (`app/updates.rs`).
+    pub(crate) updater: crate::update::Updater,
 }
 
 /// Subscription key for the protocol stream. Changing `generation`
@@ -461,6 +466,7 @@ impl App {
         let autostart = !cfg.mock && crate::autostart::is_enabled();
         let window = App::initial_mode(&cfg, settings.close_to_tray);
         let geom = WindowGeom::initial(cfg.screenshot.is_some());
+        let updater = App::new_updater(&cfg);
         let app = Self {
             theme: FerroTheme::new(!cfg.light_theme),
             cfg,
@@ -542,6 +548,7 @@ impl App {
             window_id: None,
             geom,
             tray_sent: None,
+            updater,
         };
         let mut app = app;
         app.focused = !app.cfg.minimized;
@@ -564,9 +571,16 @@ impl App {
                 Message::External(crate::ext::External::TrayUp(up))
             }));
         }
-        if matches!(app.cfg.screenshot, Some((ScreenshotTarget::Settings, _))) {
+        if matches!(
+            app.cfg.screenshot,
+            Some((
+                ScreenshotTarget::Settings | ScreenshotTarget::UpdateSettings,
+                _
+            ))
+        ) {
             app.settings_open = true;
         }
+        tasks.push(app.updates_boot());
         if app.cfg.screenshot.is_some() {
             tasks.push(Task::perform(
                 tokio::time::sleep(Duration::from_millis(match app.cfg.screenshot {
@@ -709,6 +723,7 @@ impl App {
                 Task::none()
             }
             Message::Quit => self.quit(),
+            Message::Update(m) => self.on_update(m),
             Message::Video(m) => {
                 self.on_video_event(*m);
                 self.status_after_video()

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.94"
 description = "Unofficial lightweight native WhatsApp desktop client written in Rust"
 license = "MIT"
-repository = "https://github.com/Dasemu/Ferrochat"
+repository = "https://github.com/FerroApps/Ferrochat"
 readme = "README.md"
 publish = false
 default-run = "ferrochat"
@@ -76,6 +76,16 @@ openh264 = { version = "0.9", optional = true }
 mp4 = { version = "0.14", optional = true }
 # Pure-Rust AAC decoder + MP4 audio demuxer (symphonia is already in the tree through rodio).
 symphonia = { version = "0.5", default-features = false, features = ["aac", "isomp4"], optional = true }
+# In-app updater (src/update/): HTTPS client already in the tree via whatsapp-rust (same features).
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# Updater: URL / redirect policy (already in the tree via ureq).
+url = "2"
+# Updater: release checksum (already in the tree via wacore).
+sha2 = "0.11"
+# Updater: release tarball gzip (already in the tree via png).
+flate2 = "1"
+# Updater: reads the release tarball (new; pure Rust, xattr feature off).
+tar = { version = "0.4", default-features = false }
 # Renders the app's SVG icon to ARGB32 tray pixmaps / the window icon (already in the tree via iced's svg).
 resvg = { version = "0.45", default-features = false }
 
