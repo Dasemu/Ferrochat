@@ -1,5 +1,6 @@
 //! Views. Pure functions `&App -> Element<Message>`.
 
+pub mod call;
 pub mod chat;
 pub mod emoji_font;
 pub mod emoji_picker;
@@ -93,6 +94,9 @@ pub fn view(app: &App) -> El<'_> {
     }
     if let Some(d) = chat::dialog(app) {
         layers.push(d);
+    }
+    if let Some(c) = call::panel(app) {
+        layers.push(c);
     }
     if let Some(msg) = &app.toast {
         layers.push(toast(t, msg));

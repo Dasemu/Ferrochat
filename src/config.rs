@@ -61,6 +61,10 @@ pub enum ScreenshotTarget {
     Info,
     /// The group info drawer.
     GroupInfo,
+    /// Call bubbles in a chat and an incoming call ringing.
+    Call,
+    /// A call in progress.
+    CallActive,
 }
 
 impl ScreenshotTarget {
@@ -129,6 +133,8 @@ impl ScreenshotTarget {
             "viewer" | "image-viewer" => Some(Self::Viewer),
             "info" | "contact-info" => Some(Self::Info),
             "group-info" => Some(Self::GroupInfo),
+            "call" | "call-incoming" => Some(Self::Call),
+            "call-active" => Some(Self::CallActive),
             _ => None,
         }
     }

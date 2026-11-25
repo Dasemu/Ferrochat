@@ -223,6 +223,26 @@ pub enum Sent {
         /// Number of recipients.
         recipients: usize,
     },
+    /// Declined an incoming call.
+    RejectCall(String),
+    /// Answered an incoming call.
+    AcceptCall(String),
+    /// Placed a call.
+    StartCall {
+        /// Peer.
+        peer: String,
+        /// Call id the fake gave it.
+        call_id: String,
+    },
+    /// Hung up.
+    EndCall(String),
+    /// Mute changed.
+    MuteCall {
+        /// Call id.
+        call_id: String,
+        /// Muted.
+        muted: bool,
+    },
 }
 
 /// The fake client.
@@ -289,6 +309,11 @@ impl FakeClient {
         if let Ok(mut p) = self.lid_pairs.lock() {
             *p = pairs;
         }
+    }
+
+    /// Simulates call signalling (a ringing offer, the caller giving up, ...).
+    pub fn simulate_call(&self, signal: super::CallSignal) {
+        let _ = self.tx.send(Event::Call(signal));
     }
 
     /// Simulates an incoming live message.
@@ -868,6 +893,76 @@ impl WaClient for FakeClient {
 
     fn simulate_scan(&self) {
         self.scan();
+    }
+
+    fn reject_call<'a>(&'a self, call_id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::RejectCall(call_id.into()));
+            Ok(())
+        })
+    }
+
+    fn accept_call<'a>(
+        &'a self,
+        call_id: &'a str,
+        _audio: super::CallAudio,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::AcceptCall(call_id.into()));
+            let _ = self.tx.send(Event::Call(super::CallSignal::Connected {
+                call_id: call_id.into(),
+            }));
+            Ok(())
+        })
+    }
+
+    fn start_call<'a>(
+        &'a self,
+        peer: &'a str,
+        _audio: super::CallAudio,
+    ) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Protocol("could not call".into()));
+            }
+            let call_id = format!("00{:030X}", self.log().len());
+            self.record(Sent::StartCall {
+                peer: peer.into(),
+                call_id: call_id.clone(),
+            });
+            if self.opts.auto_reply {
+                // The mock peer picks up after a moment.
+                let tx = self.tx.clone();
+                let id = call_id.clone();
+                let delay = self.opts.receipt_delay;
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay * 3).await;
+                    let _ = tx.send(Event::Call(super::CallSignal::PeerAccepted {
+                        call_id: id.clone(),
+                    }));
+                    let _ = tx.send(Event::Call(super::CallSignal::Connected { call_id: id }));
+                });
+            }
+            Ok(call_id)
+        })
+    }
+
+    fn end_call<'a>(&'a self, call_id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(Sent::EndCall(call_id.into()));
+            let _ = self.tx.send(Event::Call(super::CallSignal::MediaEnded {
+                call_id: call_id.into(),
+                error: None,
+            }));
+            Ok(())
+        })
+    }
+
+    fn set_call_muted(&self, call_id: &str, muted: bool) {
+        self.record(Sent::MuteCall {
+            call_id: call_id.into(),
+            muted,
+        });
     }
 
     fn contact_info<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<ContactInfo>> {

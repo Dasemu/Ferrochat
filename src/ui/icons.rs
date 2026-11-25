@@ -131,6 +131,18 @@ pub enum Icon {
     ZoomOut,
     /// `ban`
     Ban,
+    /// `phone-off`
+    PhoneOff,
+    /// `phone-missed`
+    PhoneMissed,
+    /// `phone-incoming`
+    PhoneIncoming,
+    /// `phone-outgoing`
+    PhoneOutgoing,
+    /// `mic-off`
+    MicOff,
+    /// `video-off`
+    VideoOff,
 }
 
 impl Icon {
@@ -197,6 +209,12 @@ impl Icon {
             Icon::Palette => include_bytes!("../../assets/icons/palette.svg"),
             Icon::StarOff => include_bytes!("../../assets/icons/star-off.svg"),
             Icon::UserPlus => include_bytes!("../../assets/icons/user-plus.svg"),
+            Icon::PhoneOff => include_bytes!("../../assets/icons/phone-off.svg"),
+            Icon::PhoneMissed => include_bytes!("../../assets/icons/phone-missed.svg"),
+            Icon::PhoneIncoming => include_bytes!("../../assets/icons/phone-incoming.svg"),
+            Icon::PhoneOutgoing => include_bytes!("../../assets/icons/phone-outgoing.svg"),
+            Icon::MicOff => include_bytes!("../../assets/icons/mic-off.svg"),
+            Icon::VideoOff => include_bytes!("../../assets/icons/video-off.svg"),
         }
     }
 

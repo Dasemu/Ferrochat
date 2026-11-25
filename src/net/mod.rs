@@ -8,6 +8,7 @@
 //! * [`fake::FakeClient`]: an in-process scripted fake used by `--mock`,
 //!   screenshot mode and the integration tests.
 
+pub mod call;
 pub mod convert;
 pub mod fake;
 pub mod social;
@@ -20,6 +21,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 
 use crate::error::Result;
+pub use call::{CallAudio, CallLog, CallOutcome, CallSignal, IncomingCallInfo};
 pub use social::{
     CommunityInfo, PhoneLookup, StarChange, StarredMessage, StatusBody, StatusGroup, StatusItem,
     SubGroup,
@@ -164,6 +166,17 @@ pub trait WaClient: Send + Sync {
     fn set_blocked<'a>(&'a self, jid: &'a str, blocked: bool) -> BoxFuture<'a, Result<()>>;
     /// Mutes a chat indefinitely / unmutes it (synced to the phone).
     fn set_muted<'a>(&'a self, chat: &'a str, muted: bool) -> BoxFuture<'a, Result<()>>;
+    /// Declines a call ringing here (the library's `<reject>`).
+    fn reject_call<'a>(&'a self, call_id: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Answers a call ringing here with these audio ends. Progress arrives
+    /// as [`Event::Call`] (`Connected`, `MediaEnded`).
+    fn accept_call<'a>(&'a self, call_id: &'a str, audio: CallAudio) -> BoxFuture<'a, Result<()>>;
+    /// Places a 1:1 voice call; returns the call id.
+    fn start_call<'a>(&'a self, peer: &'a str, audio: CallAudio) -> BoxFuture<'a, Result<String>>;
+    /// Hangs up a call with media, or cancels one still ringing at the peer.
+    fn end_call<'a>(&'a self, call_id: &'a str) -> BoxFuture<'a, Result<()>>;
+    /// Mutes or unmutes our microphone in a call.
+    fn set_call_muted(&self, call_id: &str, muted: bool);
     /// Unlinks this device, disconnects and deletes the session store.
     fn logout(&self) -> BoxFuture<'_, Result<()>>;
     /// `--mock` only: pretend the phone scanned the QR code. The live client
@@ -372,6 +385,8 @@ pub enum Event {
     },
     /// A message was starred / unstarred (here or on another device).
     Star(StarChange),
+    /// Call signalling or call media progress.
+    Call(CallSignal),
     /// LID ↔ phone-number pairs learned from envelopes or history.
     LidMappings(Vec<(String, String)>),
     /// The session store exists but cannot be decrypted with the keyring key
@@ -426,6 +441,7 @@ impl fmt::Debug for Event {
             Event::Status(v) => write!(f, "Status(n={})", v.len()),
             Event::StatusRevoked { .. } => write!(f, "StatusRevoked"),
             Event::Star(c) => write!(f, "Star({})", c.starred),
+            Event::Call(c) => write!(f, "Call({c:?})"),
             Event::LidMappings(p) => write!(f, "LidMappings(n={})", p.len()),
             Event::SessionUnreadable(_) => write!(f, "SessionUnreadable"),
             Event::Fatal(_) => write!(f, "Fatal"),

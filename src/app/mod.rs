@@ -1,6 +1,7 @@
 //! App state and the single `update` mutation point.
 
 mod actions;
+pub mod call;
 pub mod composer;
 pub mod emoji;
 pub mod info;
@@ -12,6 +13,8 @@ pub mod viewer;
 pub use actions::{PopupPos, popup_top, row_id};
 mod background;
 pub use background::WindowGeom;
+#[cfg(test)]
+mod call_flows;
 #[cfg(test)]
 mod flows;
 pub mod live;
@@ -248,6 +251,10 @@ pub struct App {
     download_queue: VecDeque<String>,
     /// App-level reconnect backoff after a non-transient refusal.
     offline_attempt: u32,
+    /// Calls: the ringing / current call and the logged call ids.
+    pub(crate) calls: crate::call::Calls,
+    /// Audio devices and ringtone of the current call.
+    call_media: call::CallMedia,
     /// The video viewer (at most one: one decoder at a time).
     pub(crate) video: Option<video::VideoView>,
     video_session: u32,
@@ -498,6 +505,8 @@ impl App {
             search: String::new(),
             filter: Filter::All,
             archived_view: false,
+            calls: crate::call::Calls::default(),
+            call_media: call::CallMedia::default(),
             video: None,
             video_session: 0,
             video_fullscreen: false,
@@ -612,6 +621,8 @@ impl App {
                         | ScreenshotTarget::GroupInfo,
                         _,
                     )) => 5000,
+                    // Call bubbles are stored, then the call rings.
+                    Some((ScreenshotTarget::Call | ScreenshotTarget::CallActive, _)) => 6000,
                     // Scenes that wait for statuses, stars or communities.
                     Some((t, _)) if t.is_nav() => 6000,
                     _ => 2500,
@@ -726,6 +737,12 @@ impl App {
                 video::video_stream,
             ));
         }
+        if self.calls.busy() {
+            subs.push(
+                iced::time::every(Duration::from_secs(1))
+                    .map(|_| Message::Ui(Ui::Call(call::CallUi::Tick))),
+            );
+        }
         if self.status.viewer.is_some() {
             subs.push(
                 iced::time::every(Duration::from_millis(status::TICK_MS))
@@ -808,6 +825,9 @@ impl App {
     fn on_ui(&mut self, ui: Ui) -> Task<Message> {
         if let Ui::Nav(m) = ui {
             return self.on_nav(m);
+        }
+        if let Ui::Call(c) = ui {
+            return self.on_call_ui(c);
         }
         let ui = match self.on_ui_extra(ui) {
             Ok(task) => return task,
@@ -1958,6 +1978,7 @@ impl App {
                 self.chats.mark_read(&chat);
                 return store_task(&self.store, move |s| s.set_unread(&chat, 0));
             }
+            Event::Call(signal) => return self.on_call_signal(signal),
             Event::LidMappings(pairs) => {
                 for (lid, pn) in &pairs {
                     if crate::net::is_lid_pair(lid, pn) {
@@ -2570,6 +2591,7 @@ impl App {
                 error,
             } => return self.on_member_failed(list, chat, undo, error),
             Done::Nav(d) => return self.on_nav_done(*d),
+            Done::Call(d) => return self.on_call_done(d),
             Done::Stored(Ok(())) | Done::Nothing => {}
             Done::Resync { attempt, result } => return self.on_resync(attempt, result),
             Done::ResyncDue => return self.maybe_resync(),
@@ -2681,6 +2703,8 @@ impl App {
                     v.push(ui(Ui::OpenImage(id)));
                 }
             }
+            ScreenshotTarget::Call => v.extend(call::scene(&c.chat, false)),
+            ScreenshotTarget::CallActive => v.extend(call::scene(&c.chat, true)),
             ScreenshotTarget::Delete => {
                 if let Some(a) = find("Llevo yo el café") {
                     v.push(ui(Ui::AskDelete(a)));

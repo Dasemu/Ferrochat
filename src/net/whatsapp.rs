@@ -26,6 +26,7 @@ use whatsapp_rust::wacore_binary::jid::JidExt;
 use whatsapp_rust::{Client, Jid};
 use whatsapp_rust_sqlite_storage::{SqliteStore, SqliteStoreConfig};
 
+use super::call::{self, CallAudio, CallBook};
 use super::convert::{self, Envelope, Uploaded};
 use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
@@ -47,12 +48,35 @@ pub struct RealClient {
     contacts_seen: Arc<AtomicUsize>,
     /// "Read receipts" privacy value and when it was fetched.
     read_receipts: Mutex<Option<(std::time::Instant, bool)>>,
+    /// Ringing offers and live calls.
+    calls: CallBook,
 }
 
 /// How long the fetched "read receipts" privacy value is trusted.
 const PRIVACY_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 impl RealClient {
+    /// Call events of one library event (ringing offers are kept for
+    /// Accept / Decline).
+    fn call_events(&self, ev: &WaEvent) -> Vec<Event> {
+        match ev {
+            WaEvent::IncomingCall(c) => {
+                let signal = call::signal_from_call(c);
+                self.calls.observe(c, signal.as_ref());
+                signal.map(Event::Call).into_iter().collect()
+            }
+            WaEvent::MissedCall(m) => {
+                self.calls.forget(&m.call_id);
+                vec![Event::Call(call::signal_from_missed(m))]
+            }
+            WaEvent::CallEndedElsewhere(e) => {
+                self.calls.forget(&e.call_id);
+                vec![Event::Call(call::signal_from_elsewhere(e))]
+            }
+            _ => Vec::new(),
+        }
+    }
+
     /// Is the account's "read receipts" privacy setting on? Cached for a few
     /// minutes; an unreadable setting counts as "off" (never leak a view).
     async fn read_receipts_on(&self) -> bool {
@@ -723,6 +747,29 @@ impl WaClient for RealClient {
         })
     }
 
+    fn reject_call<'a>(&'a self, call_id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.calls.reject(&self.client, call_id).await })
+    }
+
+    fn accept_call<'a>(&'a self, call_id: &'a str, audio: CallAudio) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.calls.accept(&self.client, call_id, audio).await })
+    }
+
+    fn start_call<'a>(&'a self, peer: &'a str, audio: CallAudio) -> BoxFuture<'a, Result<String>> {
+        Box::pin(async move {
+            let jid = parse_jid(peer)?;
+            self.calls.start(&self.client, &jid, audio).await
+        })
+    }
+
+    fn end_call<'a>(&'a self, call_id: &'a str) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.calls.end(&self.client, call_id).await })
+    }
+
+    fn set_call_muted(&self, call_id: &str, muted: bool) {
+        self.calls.set_muted(call_id, muted);
+    }
+
     fn contact_info<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<ContactInfo>> {
         Box::pin(async move {
             let j = parse_jid(jid)?;
@@ -1038,6 +1085,7 @@ async fn run(
         signal_db: signal_db.clone(),
         contacts_seen,
         read_receipts: Mutex::new(None),
+        calls: CallBook::new(tx.clone()),
     });
     let _ = tx.send(Event::Ready(real.clone()));
 
@@ -1055,7 +1103,9 @@ async fn run(
             ev = wa_rx.recv() => {
                 let Some(ev) = ev else { return Ok(()) };
                 let terminal = is_terminal(&ev);
-                for out in translate(&ev, &client, &mut attempt) {
+                let mut outs = real.call_events(&ev);
+                outs.extend(translate(&ev, &client, &mut attempt));
+                for out in outs {
                     if tx.send(out).is_err() {
                         break;
                     }

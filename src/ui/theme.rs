@@ -438,6 +438,28 @@ pub fn primary_button(t: &FerroTheme) -> impl Fn(&Theme, button::Status) -> butt
     }
 }
 
+/// Round filled call button (accept green, decline / hang up red, or the
+/// neutral grey of mute).
+pub fn call_button(bg: Color) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+    move |_, status| button::Style {
+        background: Some(Background::Color(match status {
+            button::Status::Hovered | button::Status::Pressed => Color { a: 0.85, ..bg },
+            _ => bg,
+        })),
+        text_color: Color::WHITE,
+        border: border(CALL_BUTTON / 2.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// Diameter of the call panel's round buttons.
+pub const CALL_BUTTON: f32 = 52.0;
+/// Width of the call panel.
+pub const CALL_PANEL_WIDTH: f32 = 320.0;
+/// Avatar size in the call panel.
+pub const CALL_AVATAR: f32 = 96.0;
+
 /// Plain text link button.
 pub fn link_button(t: &FerroTheme) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
     let p = t.palette;
