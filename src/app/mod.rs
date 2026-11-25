@@ -3,6 +3,7 @@
 mod actions;
 pub mod composer;
 pub mod emoji;
+pub mod info;
 pub mod input;
 pub mod linkify;
 pub mod lists;
@@ -219,7 +220,7 @@ pub struct App {
     pub(crate) images: ByteLru<String, image::Handle>,
     pub(crate) thumbs: HashMap<String, image::Handle>,
     /// Videos a poster frame was tried for (each at most once per run).
-    posters_tried: HashSet<String>,
+    pub(crate) posters_tried: HashSet<String>,
     /// A poster extraction is running (one at a time).
     poster_busy: bool,
     downloading: HashSet<String>,
@@ -231,6 +232,8 @@ pub struct App {
     pub(crate) toast: Option<String>,
     pub(crate) focused: bool,
     pub(crate) viewer: Option<viewer::ImageViewer>,
+    /// Contact / group info drawer.
+    pub(crate) info: Option<info::InfoPanel>,
     pub(crate) sync_progress: Option<u32>,
     started: Instant,
     first_frame_logged: bool,
@@ -523,6 +526,7 @@ impl App {
             toast: None,
             focused: true,
             viewer: None,
+            info: None,
             sync_progress: None,
             started,
             first_frame_logged: false,
@@ -839,6 +843,7 @@ impl App {
                         true
                     }
                     || self.viewer.take().is_some()
+                    || self.info.take().is_some()
                     || self.chat_search.take().is_some()
                     || self.reply_to.take().is_some()
                     || (self.editing.is_some() && {
@@ -1087,6 +1092,7 @@ impl App {
         self.chats.mark_read(&chat);
         let paused = self.compose_stop();
         self.stash_draft();
+        self.info = None;
         self.open = Some(Conversation::new(chat.clone(), Vec::new(), false));
         match self.drafts.take(&chat) {
             Some(d) => self.composer.set_text(&d),
@@ -1821,9 +1827,13 @@ impl App {
                     Some((t, _)) if !t.list_only()
                 ) && self.open.is_none()
                 {
-                    tasks.push(Task::done(Message::Ui(Ui::OpenChat(
-                        crate::mock::SHOWCASE_CHAT.into(),
-                    ))));
+                    let chat =
+                        if matches!(self.cfg.screenshot, Some((ScreenshotTarget::GroupInfo, _))) {
+                            "120363000000000001@g.us"
+                        } else {
+                            crate::mock::SHOWCASE_CHAT
+                        };
+                    tasks.push(Task::done(Message::Ui(Ui::OpenChat(chat.into()))));
                 }
                 tasks.extend(self.nav_scene(nav::SceneStage::History));
                 return Task::batch(tasks);
@@ -2358,6 +2368,7 @@ impl App {
             }
             Done::Poster { chat, id, result } => return self.on_poster(chat, id, result),
             Done::ViewerImage { id, result } => self.on_viewer_image(id, result),
+            Done::Info(d) => return self.on_info(*d),
             Done::ViewerSaved(r) => match r {
                 Ok(Some(p)) => {
                     let name = p
@@ -2582,6 +2593,7 @@ impl App {
                 v.push(ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")));
                 v.push(ui(Ui::ToggleEmoji));
             }
+            ScreenshotTarget::Info | ScreenshotTarget::GroupInfo => v.push(ui(Ui::ToggleInfo)),
             ScreenshotTarget::Viewer => {
                 if let Some(id) = c
                     .messages

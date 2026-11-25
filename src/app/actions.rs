@@ -207,7 +207,10 @@ impl App {
                 Ok(t) => t,
                 Err(other) => match self.on_ui_viewer(other) {
                     Ok(t) => t,
-                    Err(other) => return self.on_ui_lists(other),
+                    Err(other) => match self.on_ui_info(other) {
+                        Ok(t) => t,
+                        Err(other) => return self.on_ui_lists(other),
+                    },
                 },
             },
         })

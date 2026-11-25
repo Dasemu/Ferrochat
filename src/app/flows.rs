@@ -843,3 +843,102 @@ async fn the_image_viewer_opens_zooms_steps_and_frees_its_picture() {
     assert!(h.app.viewer.is_none());
     assert!(h.app.open.is_some(), "Esc closed only the viewer");
 }
+
+#[tokio::test]
+async fn a_video_without_inline_thumbnail_gets_a_cached_poster_frame() {
+    use crate::net::Content;
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(SHOWCASE_CHAT.into())).await;
+    // The grey-placeholder case: a video that came without jpegThumbnail.
+    let id = {
+        let c = h.app.open.as_mut().unwrap();
+        let m = c
+            .messages
+            .iter_mut()
+            .find(|m| matches!(m.content, Content::Video { .. }))
+            .expect("showcase video");
+        if let Content::Video { thumbnail, .. } = &mut m.content {
+            *thumbnail = None;
+        }
+        m.id.clone()
+    };
+    h.app.thumbs.remove(&id);
+    let t = h.app.want_poster();
+    h.pump(t).await;
+    assert!(
+        h.app.thumbs.contains_key(&id),
+        "poster handle made in update"
+    );
+    // Cached: the poster is the stored thumbnail now, never extracted again.
+    let stored = h.app.store.message(SHOWCASE_CHAT, &id).unwrap().unwrap();
+    assert!(matches!(
+        stored.content,
+        Content::Video {
+            thumbnail: Some(_),
+            ..
+        }
+    ));
+    let t = h.app.want_poster();
+    h.pump(t).await;
+    assert!(h.app.posters_tried.contains(&id));
+}
+
+#[tokio::test]
+async fn the_header_opens_the_contact_info_drawer() {
+    use super::info::Load;
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(SHOWCASE_CHAT.into())).await;
+    h.ui(Ui::ToggleInfo).await;
+    let info = h.app.info.as_ref().expect("drawer open");
+    assert_eq!(info.chat, SHOWCASE_CHAT);
+    assert_eq!(
+        info.contact.ready().and_then(|c| c.about.as_deref()),
+        Some(mock::about_for(SHOWCASE_CHAT))
+    );
+    assert_eq!(info.blocked, Load::Ready(false));
+    assert!(matches!(info.common, Load::Ready(_)));
+    assert!(
+        info.counts.0 > 0,
+        "the showcase chat has photos and a video"
+    );
+    assert!(!info.recent.is_empty());
+    // Mute is optimistic and synced.
+    h.ui(Ui::ToggleMute(SHOWCASE_CHAT.into())).await;
+    assert!(h.app.chats.get(SHOWCASE_CHAT).unwrap().meta.muted);
+    assert!(h.fake.log().iter().any(|s| matches!(
+        s,
+        Sent::Mute { chat, muted: true } if chat == SHOWCASE_CHAT
+    )));
+    // Block asks first.
+    h.ui(Ui::AskBlock).await;
+    assert!(h.app.info.as_ref().unwrap().confirm_block);
+    h.ui(Ui::SetBlocked(true)).await;
+    let info = h.app.info.as_ref().unwrap();
+    assert_eq!(info.blocked, Load::Ready(true));
+    assert!(!info.confirm_block);
+    // The gallery lists the photos with thumbnails made in update.
+    h.ui(Ui::InfoGallery(Some(super::info::Tab::Media))).await;
+    let (_, items) = h.app.info.as_ref().unwrap().gallery.as_ref().unwrap();
+    assert!(items.iter().any(|i| i.thumb.is_some()));
+    // Esc goes back layer by layer: the drawer closes, the chat stays.
+    h.ui(Ui::CloseChat).await;
+    assert!(h.app.info.is_none());
+    assert!(h.app.open.is_some());
+}
+
+#[tokio::test]
+async fn the_group_info_drawer_lists_members_with_admins_first() {
+    let mut h = Harness::new().await;
+    let family = "120363000000000001@g.us";
+    h.ui(Ui::OpenChat(family.into())).await;
+    h.ui(Ui::ToggleInfo).await;
+    let info = h.app.info.as_ref().unwrap();
+    let g = info.group.ready().expect("metadata");
+    assert!(g.participants.len() >= 2);
+    assert!(g.participants[0].admin && g.participants[0].owner);
+    assert_eq!(g.participants[0].jid, OWN_JID);
+    assert!(g.description.is_some());
+    // A second click on the header closes it.
+    h.ui(Ui::ToggleInfo).await;
+    assert!(h.app.info.is_none());
+}

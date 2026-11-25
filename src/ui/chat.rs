@@ -116,7 +116,9 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         p.text_secondary
     };
 
-    let header = container(
+    // The avatar, name and subtitle open the info drawer, like WhatsApp
+    // Desktop's header (the subtitle invites the click).
+    let who = button(
         row![
             avatar_for(app, &conv.chat, group, m.avatar_small),
             column![
@@ -128,6 +130,17 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
             ]
             .spacing(1),
             fill(),
+        ]
+        .spacing(15)
+        .align_y(Alignment::Center),
+    )
+    .padding(0)
+    .width(Length::Fill)
+    .style(theme::flat_button(p.text_primary))
+    .on_press(Message::Ui(Ui::ToggleInfo));
+    let header = container(
+        row![
+            who,
             button(icon(Icon::Search, m.icon, p.text_secondary))
                 .padding(8)
                 .style(theme::icon_button(t, app.chat_search.is_some()))
@@ -230,7 +243,7 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
         .style(theme::solid(p.bg_panel));
 
     if let Some(a) = app.attach.as_ref().filter(|a| a.chat == conv.chat) {
-        return column![header, attach_preview(app, a)].into();
+        return with_info(app, conv, column![header, attach_preview(app, a)].into());
     }
     let mut body = column![header];
     if let Some(cs) = &app.chat_search {
@@ -265,7 +278,19 @@ pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
     if let Some(bar) = reply_bar(app, conv) {
         body = body.push(bar);
     }
-    body.push(composer(app)).into()
+    with_info(app, conv, body.push(composer(app)).into())
+}
+
+/// The conversation with the info drawer on its right, when open.
+fn with_info<'a>(app: &'a App, conv: &'a Conversation, el: El<'a>) -> El<'a> {
+    match app.info.as_ref().filter(|i| i.chat == conv.chat) {
+        Some(info) => row![
+            container(el).width(Length::Fill).height(Length::Fill),
+            super::info::view(app, info)
+        ]
+        .into(),
+        None => el,
+    }
 }
 
 /// Floating reaction picker / message menu next to its message row. A

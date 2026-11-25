@@ -4,6 +4,7 @@ pub mod chat;
 pub mod emoji_font;
 pub mod emoji_picker;
 pub mod icons;
+pub mod info;
 pub mod login;
 pub mod measure;
 pub mod nav;

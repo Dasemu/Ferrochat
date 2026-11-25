@@ -126,6 +126,20 @@ pub enum Ui {
     ViewerOpenExternal,
     /// Left / Right arrow: the photo viewer or the status viewer steps.
     Arrow(i32),
+    /// Conversation header clicked: open / close the info drawer.
+    ToggleInfo,
+    /// Close the info drawer.
+    CloseInfo,
+    /// Open a gallery tab of the info drawer (`None` = back).
+    InfoGallery(Option<crate::app::info::Tab>),
+    /// Mute / unmute a chat.
+    ToggleMute(ChatId),
+    /// "Block" pressed: ask first.
+    AskBlock,
+    /// Block confirmation dismissed.
+    CancelBlock,
+    /// Block (`true`) / unblock the contact of the drawer.
+    SetBlocked(bool),
     /// Conversation scrolled; load older when near the top.
     Scrolled {
         /// Relative offset from the bottom anchor: 0 = newest, 1 = oldest.
@@ -501,6 +515,8 @@ pub enum Done {
         /// Bytes or error.
         result: Result<Arc<Vec<u8>>, String>,
     },
+    /// An info drawer query finished.
+    Info(Box<crate::app::info::InfoDone>),
     /// A photo was saved / handed to the system viewer (`None` = cancelled).
     ViewerSaved(Result<Option<PathBuf>, String>),
     /// Voice note downloaded and decoded.

@@ -160,6 +160,45 @@ impl Store {
         Ok(())
     }
 
+    /// Counts for the info drawer: `(photos and videos, links, documents)`.
+    pub fn media_counts(&self, chat: &str) -> Result<(usize, usize, usize)> {
+        let conn = self.lock()?;
+        let mut st = conn.prepare_cached(
+            "SELECT
+                COALESCE(SUM(kind IN ('image', 'video')), 0),
+                COALESCE(SUM(kind = 'link'), 0),
+                COALESCE(SUM(kind = 'document'), 0)
+             FROM messages WHERE chat_id = ?1",
+        )?;
+        let (a, b, c): (i64, i64, i64) =
+            st.query_row(params![chat], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        let n = |v: i64| usize::try_from(v).unwrap_or(0);
+        Ok((n(a), n(b), n(c)))
+    }
+
+    /// The newest messages of `chat` whose kind is one of `kinds`, newest
+    /// first (the info drawer's gallery, links and documents).
+    pub fn messages_of_kind(
+        &self,
+        chat: &str,
+        kinds: &[&str],
+        limit: usize,
+    ) -> Result<Vec<Message>> {
+        let conn = self.lock()?;
+        let mut st = conn.prepare_cached(
+            "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
+                    reply, edited, mentions
+             FROM messages
+             WHERE chat_id = ?1 AND kind IN (SELECT value FROM json_each(?2))
+             ORDER BY ts DESC, id DESC LIMIT ?3",
+        )?;
+        let kinds = serde_json::to_string(kinds).map_err(|e| Error::Protocol(e.to_string()))?;
+        let rows = st
+            .query_map(params![chat, kinds, limit.min(500) as i64], row_to_message)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Stores a poster frame as the thumbnail of a message that has none.
     pub fn set_thumb(&self, chat: &str, id: &str, thumb: &[u8]) -> Result<()> {
         self.lock()?.execute(
@@ -1093,6 +1132,46 @@ mod tests {
             got.content,
             Content::Video { thumbnail: Some(ref t), .. } if t == &[1, 2, 3]
         ));
+    }
+
+    #[test]
+    fn media_counts_and_galleries_per_chat() {
+        let s = Store::open_in_memory().unwrap();
+        let mut img = msg("c", "i", 10, false, "");
+        img.content = Content::Image {
+            caption: None,
+            width: 1,
+            height: 1,
+            thumbnail: Some(vec![1]),
+            media: None,
+        };
+        let mut doc = msg("c", "d", 11, false, "");
+        doc.content = Content::Document {
+            file_name: "a.pdf".into(),
+            mimetype: "application/pdf".into(),
+            size: 1,
+            pages: None,
+            caption: None,
+            media: None,
+        };
+        let text = msg("c", "t", 12, false, "hi");
+        let other = msg("o", "x", 13, false, "hi");
+        s.insert_messages(&[img, doc, text, other]).unwrap();
+        assert_eq!(s.media_counts("c").unwrap(), (1, 0, 1));
+        assert_eq!(s.media_counts("none").unwrap(), (0, 0, 0));
+        let g = s.messages_of_kind("c", &["image", "video"], 10).unwrap();
+        assert_eq!(g.len(), 1);
+        assert!(matches!(
+            g[0].content,
+            Content::Image {
+                thumbnail: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            s.messages_of_kind("c", &["document"], 10).unwrap()[0].id,
+            "d"
+        );
     }
 
     #[test]

@@ -147,6 +147,23 @@ pub trait WaClient: Send + Sync {
         font: i32,
         recipients: &'a [String],
     ) -> BoxFuture<'a, Result<String>>;
+    /// About text and business name of a contact (the usync query the
+    /// official clients use for the contact info drawer).
+    fn contact_info<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<ContactInfo>>;
+    /// Group subject, description and members (group metadata query).
+    fn group_info<'a>(&'a self, chat: &'a str) -> BoxFuture<'a, Result<GroupInfo>>;
+    /// `(group JID, subject)` of the groups we share with the person whose
+    /// ids (phone number and / or LID) are `ids`.
+    fn common_groups<'a>(
+        &'a self,
+        ids: &'a [String],
+    ) -> BoxFuture<'a, Result<Vec<(String, String)>>>;
+    /// Whether a contact is on our block list.
+    fn is_blocked<'a>(&'a self, jid: &'a str) -> BoxFuture<'a, Result<bool>>;
+    /// Blocks / unblocks a contact.
+    fn set_blocked<'a>(&'a self, jid: &'a str, blocked: bool) -> BoxFuture<'a, Result<()>>;
+    /// Mutes a chat indefinitely / unmutes it (synced to the phone).
+    fn set_muted<'a>(&'a self, chat: &'a str, muted: bool) -> BoxFuture<'a, Result<()>>;
     /// Unlinks this device, disconnects and deletes the session store.
     fn logout(&self) -> BoxFuture<'_, Result<()>>;
     /// `--mock` only: pretend the phone scanned the QR code. The live client
