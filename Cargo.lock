@@ -2025,7 +2025,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
- "sha2",
+ "sha2 0.11.1",
  "symphonia",
  "tar",
  "thiserror 2.0.21",
