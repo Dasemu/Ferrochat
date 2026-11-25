@@ -160,6 +160,15 @@ impl Store {
         Ok(())
     }
 
+    /// Stores a poster frame as the thumbnail of a message that has none.
+    pub fn set_thumb(&self, chat: &str, id: &str, thumb: &[u8]) -> Result<()> {
+        self.lock()?.execute(
+            "UPDATE messages SET thumb = ?3 WHERE chat_id = ?1 AND id = ?2 AND thumb IS NULL",
+            params![chat, id, thumb],
+        )?;
+        Ok(())
+    }
+
     /// Sets the unread counter of a chat.
     pub fn set_unread(&self, chat: &str, unread: u32) -> Result<()> {
         self.lock()?.execute(
@@ -1061,6 +1070,29 @@ mod tests {
         assert_eq!(s.chat_rows().unwrap()[0].last.as_ref().unwrap().id, "2");
         assert!(decode_mentions("not json").is_empty());
         assert_eq!(encode_mentions(&[]), None);
+    }
+
+    #[test]
+    fn a_poster_frame_is_kept_as_the_video_thumbnail() {
+        let s = Store::open_in_memory().unwrap();
+        let mut m = msg("c", "v", 10, false, "");
+        m.content = Content::Video {
+            caption: None,
+            seconds: 3,
+            width: 320,
+            height: 180,
+            thumbnail: None,
+            media: None,
+        };
+        s.insert_messages(&[m]).unwrap();
+        s.set_thumb("c", "v", &[1, 2, 3]).unwrap();
+        // An inline thumbnail that is already there is never replaced.
+        s.set_thumb("c", "v", &[9]).unwrap();
+        let got = s.message("c", "v").unwrap().unwrap();
+        assert!(matches!(
+            got.content,
+            Content::Video { thumbnail: Some(ref t), .. } if t == &[1, 2, 3]
+        ));
     }
 
     #[test]

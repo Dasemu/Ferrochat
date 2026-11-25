@@ -1728,41 +1728,6 @@ pub fn fit(w: u32, h: u32, max_w: f32, max_h: f32) -> (f32, f32) {
     ((w * s).max(120.0), (h * s).max(80.0))
 }
 
-/// Full-size image viewer overlay.
-pub fn viewer<'a>(app: &'a App, id: &'a str) -> El<'a> {
-    let t = &app.theme;
-    let p = t.palette;
-    let msg = app.open.as_ref().and_then(|c| c.get(id));
-    let handle = msg
-        .and_then(|m| m.content.media())
-        .and_then(|r| app.images.peek(&r.cache_key()))
-        .or_else(|| app.thumbs.get(id))
-        .cloned();
-    let content: El<'a> = match handle {
-        Some(h) => image(h).content_fit(ContentFit::Contain).into(),
-        None => text("Loading…").size(16).color(p.text_secondary).into(),
-    };
-    opaque(
-        mouse_area(
-            container(column![
-                row![
-                    fill(),
-                    button(icon(Icon::X, 24.0, p.text_secondary))
-                        .padding(10)
-                        .style(theme::icon_button(t, false))
-                        .on_press(Message::Ui(Ui::CloseViewer)),
-                ]
-                .padding(10),
-                center(content).padding(40),
-            ])
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(theme::solid(p.bg_app.scale_alpha(0.96))),
-        )
-        .on_press(Message::Ui(Ui::CloseViewer)),
-    )
-}
-
 /// The in-app video player: picture, play / pause, seek bar with times,
 /// volume, full screen, "Open externally" and close.
 pub fn video_viewer<'a>(app: &'a App, v: &'a crate::app::video::VideoView) -> El<'a> {

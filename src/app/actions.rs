@@ -205,7 +205,10 @@ impl App {
             Ui::JumpLatest => self.jump_latest(),
             other => match self.on_ui_video(other) {
                 Ok(t) => t,
-                Err(other) => return self.on_ui_lists(other),
+                Err(other) => match self.on_ui_viewer(other) {
+                    Ok(t) => t,
+                    Err(other) => return self.on_ui_lists(other),
+                },
             },
         })
     }

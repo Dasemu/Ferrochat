@@ -711,3 +711,135 @@ async fn the_preview_is_dropped_by_escape_and_by_a_chat_switch() {
     h.pump(t).await;
     assert!(h.app.attach.is_none());
 }
+
+// ------------------------------------------------ composer, emoji, viewer
+
+fn type_text(s: &str) -> Vec<Ui> {
+    use iced::widget::text_editor::{Action, Edit};
+    s.chars()
+        .map(|c| {
+            Ui::ComposerAction(Action::Edit(if c == '\n' {
+                Edit::Enter
+            } else {
+                Edit::Insert(c)
+            }))
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn shift_enter_lines_are_sent_as_one_message() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    // Shift+Enter is bound to the editor's own Enter (a newline).
+    for u in type_text("first line\nsecond line") {
+        h.ui(u).await;
+    }
+    assert_eq!(h.app.composer.text(), "first line\nsecond line");
+    h.ui(Ui::Send).await;
+    assert!(h.app.composer.is_blank());
+    assert!(h.fake.log().iter().any(|s| matches!(
+        s,
+        Sent::Text { chat, text, .. } if chat == MARCOS && text == "first line\nsecond line"
+    )));
+}
+
+#[tokio::test]
+async fn drafts_survive_switching_chats() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    for u in type_text("half\nwritten") {
+        h.ui(u).await;
+    }
+    h.ui(Ui::OpenChat(PABLO.into())).await;
+    assert!(h.app.composer.is_blank());
+    assert_eq!(h.app.drafts.get(MARCOS), Some("half\nwritten"));
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    assert_eq!(h.app.composer.text(), "half\nwritten");
+    assert!(h.app.drafts.get(MARCOS).is_none());
+}
+
+#[tokio::test]
+async fn picked_emoji_go_into_the_composer_and_the_recent_list() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(MARCOS.into())).await;
+    h.ui(Ui::ToggleEmoji).await;
+    assert!(h.app.emoji_open);
+    h.ui(Ui::Emoji("\u{1F44B}")).await;
+    h.ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")).await;
+    assert_eq!(h.app.composer.text(), "\u{1F44B}\u{1F1EA}\u{1F1F8}");
+    assert_eq!(
+        h.app.emoji.recent,
+        vec!["\u{1F1EA}\u{1F1F8}".to_string(), "\u{1F44B}".to_string()]
+    );
+    let stored = h.app.store.kv(super::emoji::RECENT_KEY).unwrap().unwrap();
+    assert_eq!(super::emoji::parse_recent(&stored), h.app.emoji.recent);
+    h.ui(Ui::EmojiSearch("pizza".into())).await;
+    assert_eq!(
+        h.app.emoji.sections()[0].emoji,
+        vec!["\u{1F355}".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn lid_mentions_show_names_in_the_chat_list_preview() {
+    let mut h = Harness::new().await;
+    let group = "120363000000000001@g.us";
+    h.net(Event::LidMappings(vec![(
+        "987654321098765@lid".into(),
+        MARCOS.into(),
+    )]))
+    .await;
+    let mut m = h
+        .app
+        .chats
+        .get(group)
+        .and_then(|e| e.last.clone())
+        .expect("group has a message");
+    m.id = "MENTION1".into();
+    m.timestamp += 10;
+    m.content = crate::net::Content::Text("@987654321098765 are you coming?".into());
+    m.mentions = vec!["987654321098765@lid".into()];
+    h.net(Event::Messages {
+        messages: vec![m],
+        origin: crate::net::Origin::Live,
+    })
+    .await;
+    let last = h.app.chats.get(group).and_then(|e| e.last.clone()).unwrap();
+    let name = h.app.chats.plain_name(MARCOS);
+    assert_eq!(h.app.preview(&last), format!("@{name} are you coming?"));
+    assert!(!h.app.preview(&last).contains("987654321098765"));
+}
+
+#[tokio::test]
+async fn the_image_viewer_opens_zooms_steps_and_frees_its_picture() {
+    let mut h = Harness::new().await;
+    h.ui(Ui::OpenChat(SHOWCASE_CHAT.into())).await;
+    let ids = h.app.viewer_ids();
+    assert!(!ids.is_empty(), "the showcase chat has photos");
+    h.ui(Ui::OpenImage(ids[0].clone())).await;
+    assert!(h.app.viewer.is_some());
+    assert!(h.app.viewer_handle().is_some(), "full picture loaded");
+    h.ui(Ui::ViewerZoom {
+        factor: 2.0,
+        at: iced::Vector::ZERO,
+    })
+    .await;
+    assert_eq!(h.app.viewer.as_ref().unwrap().zoom, 2.0);
+    h.ui(Ui::ViewerStep(-1)).await;
+    assert_eq!(
+        h.app.viewer.as_ref().unwrap().id,
+        ids[0],
+        "no photo before the first"
+    );
+    if ids.len() > 1 {
+        h.ui(Ui::Arrow(1)).await;
+        let v = h.app.viewer.as_ref().unwrap();
+        assert_eq!(v.id, ids[1]);
+        assert_eq!(v.zoom, 1.0, "a new photo starts fitted");
+    }
+    // Esc closes it and drops the viewer's own copy.
+    h.ui(Ui::CloseChat).await;
+    assert!(h.app.viewer.is_none());
+    assert!(h.app.open.is_some(), "Esc closed only the viewer");
+}

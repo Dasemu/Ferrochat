@@ -11,6 +11,7 @@ pub mod settings;
 pub mod sidebar;
 pub mod status;
 pub mod theme;
+pub mod viewer;
 
 use chrono::{Datelike, Local, TimeZone};
 use iced::widget::{Space, button, canvas, center, column, container, row, stack, svg, text};
@@ -77,8 +78,8 @@ pub fn view(app: &App) -> El<'_> {
     if let Some(menu) = sidebar::context_menu(app) {
         layers.push(menu);
     }
-    if let Some(id) = &app.viewer {
-        layers.push(chat::viewer(app, id));
+    if let Some(v) = &app.viewer {
+        layers.push(viewer::view(app, v));
     }
     if let Some(v) = status::viewer(app) {
         layers.push(v);

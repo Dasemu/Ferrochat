@@ -7,6 +7,7 @@ pub mod input;
 pub mod linkify;
 pub mod lists;
 pub mod video;
+pub mod viewer;
 pub use actions::{PopupPos, popup_top, row_id};
 mod background;
 pub use background::WindowGeom;
@@ -217,6 +218,10 @@ pub struct App {
     pub(crate) qr: Option<image::Handle>,
     pub(crate) images: ByteLru<String, image::Handle>,
     pub(crate) thumbs: HashMap<String, image::Handle>,
+    /// Videos a poster frame was tried for (each at most once per run).
+    posters_tried: HashSet<String>,
+    /// A poster extraction is running (one at a time).
+    poster_busy: bool,
     downloading: HashSet<String>,
     player: Option<Player>,
     pub(crate) voice: Option<VoiceState>,
@@ -225,7 +230,7 @@ pub struct App {
     pub(crate) recording_since: Option<Instant>,
     pub(crate) toast: Option<String>,
     pub(crate) focused: bool,
-    pub(crate) viewer: Option<String>,
+    pub(crate) viewer: Option<viewer::ImageViewer>,
     pub(crate) sync_progress: Option<u32>,
     started: Instant,
     first_frame_logged: bool,
@@ -507,6 +512,8 @@ impl App {
             qr: None,
             images: ByteLru::new(IMAGE_BUDGET),
             thumbs: HashMap::new(),
+            posters_tried: HashSet::new(),
+            poster_busy: false,
             downloading: HashSet::new(),
             player: None,
             voice: None,
@@ -671,14 +678,29 @@ impl App {
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight),
                     ..
-                }) if status == iced::event::Status::Ignored => {
-                    Some(Message::Ui(Ui::Nav(nav::NavMsg::StatusNext)))
-                }
+                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(1))),
                 iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                     key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
                     ..
-                }) if status == iced::event::Status::Ignored => {
-                    Some(Message::Ui(Ui::Nav(nav::NavMsg::StatusPrev)))
+                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(-1))),
+                // Image viewer zoom keys (no text field has them then).
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key: iced::keyboard::Key::Character(c),
+                    modifiers,
+                    ..
+                }) if status == iced::event::Status::Ignored && !modifiers.control() => {
+                    match c.as_str() {
+                        "+" | "=" => Some(Message::Ui(Ui::ViewerZoom {
+                            factor: viewer::ZOOM_STEP,
+                            at: iced::Vector::ZERO,
+                        })),
+                        "-" => Some(Message::Ui(Ui::ViewerZoom {
+                            factor: 1.0 / viewer::ZOOM_STEP,
+                            at: iced::Vector::ZERO,
+                        })),
+                        "0" => Some(Message::Ui(Ui::ViewerResetZoom)),
+                        _ => None,
+                    }
                 }
                 _ => None,
             }),
@@ -792,6 +814,16 @@ impl App {
                 return self.want_visible_avatars();
             }
             Ui::OpenChat(chat) => return self.open_chat(chat),
+            Ui::Arrow(d) => {
+                if self.viewer.is_some() {
+                    return self.update_inner(Message::Ui(Ui::ViewerStep(d)));
+                }
+                return self.on_nav(if d > 0 {
+                    nav::NavMsg::StatusNext
+                } else {
+                    nav::NavMsg::StatusPrev
+                });
+            }
             Ui::CloseChat => {
                 // Esc closes the topmost layer first, the conversation last.
                 let mut close_video = None;
@@ -942,12 +974,6 @@ impl App {
                 }
             }
             Ui::OpenDocument(id) => return self.open_document(&id),
-            Ui::OpenImage(id) => {
-                let task = self.ensure_media(&id);
-                self.viewer = Some(id);
-                return task;
-            }
-            Ui::CloseViewer => self.viewer = None,
             Ui::Scrolled {
                 relative_y,
                 offset_y,
@@ -1299,15 +1325,8 @@ impl App {
         }
     }
 
-    fn find_message(&self, id: &str) -> Option<&ChatMessage> {
+    pub fn find_message(&self, id: &str) -> Option<&ChatMessage> {
         self.open.as_ref().and_then(|c| c.get(id))
-    }
-
-    /// Starts downloading the media of message `id` if not cached yet.
-    /// Downloads the media of message `id` (explicit user action: higher
-    /// pixel cap, jumps the queue).
-    fn ensure_media(&mut self, id: &str) -> Task<Message> {
-        self.request_media(id, crate::media::MAX_IMAGE_PIXELS, true)
     }
 
     /// Queues or starts a download, at most [`crate::media::MAX_CONCURRENT_DOWNLOADS`]
@@ -1388,7 +1407,7 @@ impl App {
             let Some(id) = self.download_queue.pop_front() else {
                 break;
             };
-            let cap = if self.viewer.as_deref() == Some(id.as_str()) {
+            let cap = if self.viewer.as_ref().is_some_and(|v| v.id == id) {
                 crate::media::MAX_IMAGE_PIXELS
             } else {
                 crate::media::MAX_AUTO_IMAGE_PIXELS
@@ -1674,11 +1693,12 @@ impl App {
             })
             .map(|m| m.id.clone())
             .collect();
-        Task::batch(
-            ids.iter()
-                .map(|id| self.request_media(id, crate::media::MAX_AUTO_IMAGE_PIXELS, false))
-                .collect::<Vec<_>>(),
-        )
+        let mut tasks: Vec<_> = ids
+            .iter()
+            .map(|id| self.request_media(id, crate::media::MAX_AUTO_IMAGE_PIXELS, false))
+            .collect();
+        tasks.push(self.want_poster());
+        Task::batch(tasks)
     }
 
     // ---------------------------------------------------------------- Net
@@ -2336,6 +2356,22 @@ impl App {
                 let applied = self.apply_stored_messages(messages, new_ids, origin);
                 return Task::batch([applied, self.replay_deferred()]);
             }
+            Done::Poster { chat, id, result } => return self.on_poster(chat, id, result),
+            Done::ViewerImage { id, result } => self.on_viewer_image(id, result),
+            Done::ViewerSaved(r) => match r {
+                Ok(Some(p)) => {
+                    let name = p
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.toast(format!("Saved {name}"));
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, "saving a photo failed");
+                    self.toast("The photo could not be saved.");
+                }
+            },
             Done::PlayerReady { result, then } => match result {
                 Ok(p) => {
                     self.player = Some(p);
@@ -2546,6 +2582,17 @@ impl App {
                 v.push(ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")));
                 v.push(ui(Ui::ToggleEmoji));
             }
+            ScreenshotTarget::Viewer => {
+                if let Some(id) = c
+                    .messages
+                    .iter()
+                    .rev()
+                    .find(|m| matches!(m.content, Content::Image { .. }))
+                    .map(|m| m.id.clone())
+                {
+                    v.push(ui(Ui::OpenImage(id)));
+                }
+            }
             ScreenshotTarget::Delete => {
                 if let Some(a) = find("Llevo yo el café") {
                     v.push(ui(Ui::AskDelete(a)));
@@ -2600,7 +2647,7 @@ fn jitter_ms() -> u64 {
     u16::from_le_bytes(b) as u64
 }
 
-fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
+pub(crate) fn unique_path(dir: &std::path::Path, name: &str) -> PathBuf {
     let candidate = dir.join(name);
     if !candidate.exists() {
         return candidate;

@@ -289,3 +289,27 @@ fn the_helper_is_found_in_its_directory() {
 fn _player_is_send(p: Player) -> impl Send {
     p
 }
+
+/// A video bubble without an inline thumbnail gets its poster from the
+/// first decoded picture, scaled and JPEG-encoded like a thumbnail.
+#[tokio::test]
+async fn the_first_frame_makes_a_poster() {
+    let (w, h, rgba) = video::first_frame_with(Path::new(HELPER), &clip(), WAIT)
+        .await
+        .expect("first frame");
+    assert!(w > 0 && h > 0);
+    assert_eq!(rgba.len(), (w * h * 4) as usize);
+    let jpeg = ferrochat::media::image::poster_jpeg(w, h, rgba).expect("encode");
+    let img = image::load_from_memory(&jpeg).expect("decodable poster");
+    assert!(img.width() <= ferrochat::media::image::POSTER_SIDE);
+    assert!(img.height() <= ferrochat::media::image::POSTER_SIDE);
+    // A file that is not a video fails with a reason, never hangs.
+    let dir = tmp("poster");
+    let bad = dir.join("x.mp4");
+    std::fs::write(&bad, b"not a video").unwrap();
+    assert!(
+        video::first_frame_with(Path::new(HELPER), &bad, WAIT)
+            .await
+            .is_err()
+    );
+}

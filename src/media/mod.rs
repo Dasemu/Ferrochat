@@ -21,6 +21,10 @@ pub const MAX_IMAGE_PIXELS: u64 = 40_000_000;
 pub const MAX_AUTO_IMAGE_PIXELS: u64 = 16_000_000;
 /// Concurrent media downloads.
 pub const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+/// Largest video downloaded on its own to make a poster frame for a bubble
+/// that came without an inline thumbnail (bigger ones keep the placeholder
+/// until played).
+pub const MAX_POSTER_VIDEO_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Rejects downloads above [`MAX_DOWNLOAD_BYTES`].
 pub fn check_download_size(len: u64) -> Result<()> {

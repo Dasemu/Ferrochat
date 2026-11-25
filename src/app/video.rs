@@ -246,6 +246,92 @@ impl App {
         })
     }
 
+    /// Videos in the open chat that came without an inline thumbnail get a
+    /// poster frame: the (small) file is downloaded into the video cache,
+    /// the helper decodes its first picture and stops, and the frame is
+    /// stored as the message's thumbnail, so it is extracted only once.
+    /// One at a time, newest first.
+    pub(super) fn want_poster(&mut self) -> Task<Message> {
+        if self.poster_busy {
+            return Task::none();
+        }
+        let Some(client) = self.client.clone() else {
+            return Task::none();
+        };
+        let Some((chat, id, mref)) = self.open.as_ref().and_then(|c| {
+            c.messages
+                .iter()
+                .rev()
+                .take(30)
+                .find_map(|m| match &m.content {
+                    Content::Video {
+                        thumbnail: None,
+                        media: Some(r),
+                        ..
+                    } if needs_poster(
+                        r.file_length,
+                        self.thumbs.contains_key(&m.id),
+                        self.posters_tried.contains(&m.id),
+                    ) =>
+                    {
+                        Some((m.chat.clone(), m.id.clone(), r.clone()))
+                    }
+                    _ => None,
+                })
+        }) else {
+            return Task::none();
+        };
+        self.posters_tried.insert(id.clone());
+        self.poster_busy = true;
+        let dir = self.video_dir();
+        Task::perform(
+            async move {
+                let path = fetch_video_file(client, mref, dir).await?;
+                let (w, h, rgba) =
+                    crate::media::video::first_frame(&path, std::time::Duration::from_secs(15))
+                        .await
+                        .map_err(|f| f.detail())?;
+                tokio::task::spawn_blocking(move || {
+                    crate::media::image::poster_jpeg(w, h, rgba).map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())?
+            },
+            move |result| Message::done(Done::Poster { chat, id, result }),
+        )
+    }
+
+    /// A poster frame is ready: its handle is made here (never in `view`)
+    /// and it is cached as the message's thumbnail.
+    pub(super) fn on_poster(
+        &mut self,
+        chat: String,
+        id: String,
+        result: Result<Vec<u8>, String>,
+    ) -> Task<Message> {
+        self.poster_busy = false;
+        let store = match result {
+            Ok(jpeg) => {
+                self.thumbs.insert(
+                    id.clone(),
+                    iced::widget::image::Handle::from_bytes(jpeg.clone()),
+                );
+                if let Some(c) = self.open.as_mut().filter(|c| c.chat == chat)
+                    && let Some(m) = c.messages.iter_mut().find(|m| m.id == id)
+                    && let Content::Video { thumbnail, .. } = &mut m.content
+                {
+                    *thumbnail = Some(jpeg.clone());
+                }
+                super::store_task(&self.store, move |s| s.set_thumb(&chat, &id, &jpeg))
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "video poster frame failed");
+                Task::none()
+            }
+        };
+        Task::batch([store, self.want_poster()])
+    }
+
     /// The downloaded file is ready: start the helper.
     pub(super) fn on_video_file(&mut self, id: String, result: Result<std::path::PathBuf, String>) {
         let Some(v) = self.video.as_mut().filter(|v| v.id == id) else {
@@ -429,9 +515,28 @@ pub(super) async fn fetch_video_file(
     Ok(path)
 }
 
+/// Whether a video bubble without an inline thumbnail should get a poster
+/// frame: small enough to fetch on its own, not shown yet, not tried yet.
+pub fn needs_poster(file_length: u64, has_thumb: bool, tried: bool) -> bool {
+    !has_thumb && !tried && file_length > 0 && file_length <= crate::media::MAX_POSTER_VIDEO_BYTES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn posters_only_for_small_unshown_untried_videos() {
+        assert!(needs_poster(2_000_000, false, false));
+        assert!(!needs_poster(2_000_000, true, false));
+        assert!(!needs_poster(2_000_000, false, true));
+        assert!(!needs_poster(0, false, false));
+        assert!(!needs_poster(
+            crate::media::MAX_POSTER_VIDEO_BYTES + 1,
+            false,
+            false
+        ));
+    }
 
     fn view() -> VideoView {
         VideoView::new("m".into(), 1)
