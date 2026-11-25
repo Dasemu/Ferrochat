@@ -107,3 +107,9 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
 - Never park an unbounded wait on tokio's blocking pool: iced drops its runtime on quit and that waits for
   every `spawn_blocking` task (KDE keeps notifications open, so a click watch there hung Quit). Notification
   click watches run on detached threads (`notify::show`); `tests/notify_quit.rs` guards it.
+- Calls (`docs/protocol.md` §8): `whatsapp-rust` feature `voip` (MLOW + libopus, webrtc DTLS/SCTP)
+  does signalling, call key, relay and SRTP; we only feed 16 kHz 960-sample PCM frames
+  (`call::audio`). Never build `<call>` stanzas by hand: decline is `voip().reject(&offer)`,
+  which needs the stored offer (`net::call::CallBook`). State machine: `call::Calls` (pure,
+  tested); app glue `app/call.rs`. Video calls are NOT implemented: the video button must keep
+  saying so. `--mock`/tests open no audio device. Each call is logged once (`call-<id>` bubble).
