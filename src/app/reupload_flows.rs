@@ -118,7 +118,7 @@ async fn media_nobody_has_any_more_stays_a_placeholder() {
         .cache_key();
     assert!(!h.app.images.contains(&key));
     assert_eq!(open_path(&h, &id), path);
-    assert!(h.app.downloading.is_empty(), "the slot is free again");
+    assert!(h.app.pictures.downloading.is_empty(), "the slot is free again");
 }
 
 #[tokio::test]

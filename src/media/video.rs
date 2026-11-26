@@ -218,6 +218,8 @@ pub fn spawn_with(
                             duration_ms,
                             state,
                         },
+                        // Frames-mode output; the playback mode never sends it.
+                        Msg::Picture { .. } => continue,
                         Msg::Failed { missing, text } => {
                             announced = true;
                             Event::Failed(if missing {
@@ -350,12 +352,11 @@ pub async fn probe(file: &Path, wait: std::time::Duration) -> Result<Probe, Fail
     probe_with(&find_helper()?, file, wait).await
 }
 
-/// Flag that turns the helper into a GIF → MP4 converter.
-pub const GIF_TO_MP4_FLAG: &str = "--gif-to-mp4";
-
 /// Converts an animated GIF into a silent H.264 MP4 the way WhatsApp sends
-/// GIFs, with the helper at `helper` (the main binary links no encoder).
-/// Gives up after `wait`.
+/// GIFs, with the helper at `helper` (its `--gif-to-mp4` mode, see
+/// [`gifv::encode_gif_with`](super::gifv::encode_gif_with) for the blocking
+/// twin). Async: the helper runs as a child process, never on the blocking
+/// pool. Gives up after `wait`.
 pub async fn gif_to_mp4_with(
     helper: &Path,
     gif: &Path,
@@ -363,7 +364,7 @@ pub async fn gif_to_mp4_with(
     wait: std::time::Duration,
 ) -> Result<(), Failure> {
     let child = tokio::process::Command::new(helper)
-        .arg(GIF_TO_MP4_FLAG)
+        .arg(super::gifv::ENCODE_FLAG)
         .arg(gif)
         .arg(mp4)
         .stdin(Stdio::null())

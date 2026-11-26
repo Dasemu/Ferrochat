@@ -1,6 +1,6 @@
 [package]
 name = "ferrochat"
-version = "0.14.0"
+version = "0.16.0"
 edition = "2024"
 rust-version = "1.94"
 description = "Unofficial lightweight native WhatsApp desktop client written in Rust"
@@ -58,6 +58,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Feature crates
 qrcode = { version = "0.14", default-features = false }
+# "gif": the helper converts GIFs to MP4 and animated stickers / GIF tiles are decoded (gif crate already in the tree).
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 notify-rust = "4"
 rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }

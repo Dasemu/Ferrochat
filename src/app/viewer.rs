@@ -136,13 +136,18 @@ impl App {
             .collect()
     }
 
-    /// The full picture for the open viewer: the shared cache's or our own.
+    /// The full picture (original bytes) of the open viewer, once loaded.
     pub fn viewer_handle(&self) -> Option<&image::Handle> {
-        let v = self.viewer.as_ref()?;
-        v.own.as_ref().or_else(|| {
-            self.find_message(&v.id)
-                .and_then(|m| m.content.media())
-                .and_then(|r| self.images.peek(&r.cache_key()))
+        self.viewer.as_ref()?.own.as_ref()
+    }
+
+    /// What the viewer draws: the full picture, else the bubble's preview
+    /// while it loads.
+    pub fn viewer_display(&self) -> Option<&image::Handle> {
+        self.viewer_handle().or_else(|| {
+            let v = self.viewer.as_ref()?;
+            let key = self.find_message(&v.id).and_then(|m| self.image_key(m))?;
+            self.images.peek(&key)
         })
     }
 
@@ -157,9 +162,8 @@ impl App {
         else {
             return Task::none();
         };
-        if self.images.contains(&mref.cache_key()) {
-            return Task::none();
-        }
+        // The bubble's cache holds a display-sized preview: the viewer (and
+        // "Save as") needs the original.
         let Some(client) = self.client.clone() else {
             return Task::none();
         };

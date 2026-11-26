@@ -106,20 +106,11 @@ pub fn dialog(app: &App) -> Option<El<'_>> {
         );
     }
     let height = (app.window_size().height - 80.0).clamp(300.0, 620.0);
-    let card =
-        container(body)
-            .padding(20)
-            .width(440)
-            .height(height)
-            .style(move |th: &iced::Theme| {
-                let mut s = theme::rounded(p.bg_elevated, 12.0)(th);
-                s.shadow = iced::Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                    offset: iced::Vector::new(0.0, 4.0),
-                    blur_radius: 24.0,
-                };
-                s
-            });
+    let card = container(body)
+        .padding(20)
+        .width(440)
+        .height(height)
+        .style(theme::rounded(p.bg_elevated, 12.0));
     Some(opaque(
         container(card)
             .center(Length::Fill)

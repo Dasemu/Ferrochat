@@ -160,19 +160,19 @@ pub enum Content {
         thumbnail: Option<Vec<u8>>,
         /// Where to fetch the video.
         media: Option<MediaRef>,
-        /// A GIF (WhatsApp sends GIFs as silent MP4s with `gifPlayback`):
-        /// labelled "GIF" and looped. Rows cached before this field read as
-        /// plain videos.
+        /// A GIF (`gifPlayback`): a short silent MP4 that plays muted and
+        /// looped inline, like the official client.
         #[serde(default)]
         gif: bool,
     },
-    /// A sticker (WebP). Rendered statically: animated ones show frame 1.
+    /// A sticker (static or animated WebP), drawn without a bubble; animated
+    /// ones play inline.
     Sticker {
         /// Pixel width, if announced.
         width: u32,
         /// Pixel height, if announced.
         height: u32,
-        /// Animated sticker (only the first frame is shown).
+        /// Animated WebP.
         animated: bool,
         /// Where to fetch the WebP.
         media: Option<MediaRef>,
@@ -201,13 +201,15 @@ impl Content {
             },
             Content::Document { file_name, .. } => format!("📄 {file_name}"),
             Content::Video {
-                caption,
-                seconds,
-                gif,
-                ..
+                caption, gif: true, ..
             } => match caption {
-                Some(c) if !c.is_empty() => format!("{} {c}", if *gif { "GIF" } else { "🎥" }),
-                _ if *gif => "GIF".into(),
+                Some(c) if !c.is_empty() => format!("GIF {c}"),
+                _ => "GIF".into(),
+            },
+            Content::Video {
+                caption, seconds, ..
+            } => match caption {
+                Some(c) if !c.is_empty() => format!("🎥 {c}"),
                 _ => format!("🎥 {}", format_duration(*seconds)),
             },
             Content::Sticker { .. } => "Sticker".into(),
@@ -282,7 +284,7 @@ impl fmt::Debug for Content {
             Content::Image { width, height, .. } => write!(f, "Image({width}x{height})"),
             Content::Document { size, .. } => write!(f, "Document(size={size})"),
             Content::Voice { seconds, ptt, .. } => write!(f, "Voice({seconds}s, ptt={ptt})"),
-            Content::Video { seconds, .. } => write!(f, "Video({seconds}s)"),
+            Content::Video { seconds, gif, .. } => write!(f, "Video({seconds}s, gif={gif})"),
             Content::Sticker { animated, .. } => write!(f, "Sticker(animated={animated})"),
             Content::Unsupported(k) => write!(f, "Unsupported({k})"),
             Content::ViewOnce => write!(f, "ViewOnce"),
@@ -1057,8 +1059,8 @@ pub enum OutgoingKind {
     },
     /// Any file.
     Document,
-    /// MP4 video (H.264) with what the helper read from it. GIFs are sent
-    /// as silent MP4s like WhatsApp does (`gif`).
+    /// MP4 video (H.264) with what the helper read from it. GIFs go as
+    /// [`OutgoingKind::Gif`].
     Video {
         /// Duration in seconds.
         seconds: u32,
@@ -1068,8 +1070,6 @@ pub enum OutgoingKind {
         height: u32,
         /// Small JPEG thumbnail of the first frame.
         thumbnail: Vec<u8>,
-        /// Played as a looping, silent GIF.
-        gif: bool,
     },
     /// Voice note (Ogg/Opus).
     Voice {
@@ -1078,6 +1078,52 @@ pub enum OutgoingKind {
         /// 64 samples, 0..=100.
         waveform: Vec<u8>,
     },
+    /// Sticker (WebP, normally 512x512).
+    Sticker {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Animated WebP.
+        animated: bool,
+    },
+    /// GIF: an H.264 MP4 sent as a video with `gifPlayback`.
+    Gif {
+        /// Width in pixels.
+        width: u32,
+        /// Height in pixels.
+        height: u32,
+        /// Duration in seconds.
+        seconds: u32,
+        /// Small JPEG thumbnail.
+        thumbnail: Vec<u8>,
+        /// Where the GIF came from (shown by receivers as "via GIPHY").
+        source: GifSource,
+    },
+}
+
+/// The GIF service a sent GIF came from (`gifAttribution`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum GifSource {
+    /// A local file or a recent GIF without a known source.
+    #[default]
+    None,
+    /// GIPHY search.
+    Giphy,
+}
+
+impl OutgoingKind {
+    /// The media kind the upload is encrypted as.
+    pub fn media_kind(&self) -> MediaKind {
+        match self {
+            OutgoingKind::Image { .. } => MediaKind::Image,
+            OutgoingKind::Document => MediaKind::Document,
+            OutgoingKind::Video { .. } => MediaKind::Video,
+            OutgoingKind::Voice { .. } => MediaKind::Audio,
+            OutgoingKind::Sticker { .. } => MediaKind::Sticker,
+            OutgoingKind::Gif { .. } => MediaKind::Video,
+        }
+    }
 }
 
 impl OutgoingMedia {
@@ -1108,7 +1154,6 @@ impl OutgoingMedia {
                 width,
                 height,
                 thumbnail,
-                gif,
             } => Content::Video {
                 caption: self.caption.clone(),
                 seconds: *seconds,
@@ -1116,13 +1161,38 @@ impl OutgoingMedia {
                 height: *height,
                 thumbnail: Some(thumbnail.clone()),
                 media,
-                gif: *gif,
+                gif: false,
             },
             OutgoingKind::Voice { seconds, waveform } => Content::Voice {
                 seconds: *seconds,
                 ptt: true,
                 waveform: waveform.clone(),
                 media,
+            },
+            OutgoingKind::Sticker {
+                width,
+                height,
+                animated,
+            } => Content::Sticker {
+                width: *width,
+                height: *height,
+                animated: *animated,
+                media,
+            },
+            OutgoingKind::Gif {
+                width,
+                height,
+                seconds,
+                thumbnail,
+                ..
+            } => Content::Video {
+                caption: self.caption.clone(),
+                seconds: *seconds,
+                width: *width,
+                height: *height,
+                thumbnail: Some(thumbnail.clone()),
+                media,
+                gif: true,
             },
         }
     }
@@ -1353,6 +1423,22 @@ mod tests {
         };
         assert_eq!(g.preview(), "GIF");
         assert_eq!(v.kind_tag(), "video");
+        let g = Content::Video {
+            caption: None,
+            seconds: 2,
+            width: 1,
+            height: 1,
+            thumbnail: None,
+            media: None,
+            gif: true,
+        };
+        assert_eq!(g.preview(), "GIF");
+        // Rows cached before GIFs were told apart read as plain videos.
+        let old = r#"{"Video":{"caption":null,"seconds":2,"width":1,"height":1,"media":null}}"#;
+        assert!(matches!(
+            serde_json::from_str::<Content>(old).unwrap(),
+            Content::Video { gif: false, .. }
+        ));
         let s = Content::Sticker {
             width: 1,
             height: 1,

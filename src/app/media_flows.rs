@@ -58,7 +58,6 @@ async fn an_mp4_is_sent_as_a_video_with_its_duration_and_thumbnail() {
             seconds: 3,
             width: 320,
             height: 180,
-            gif: false,
             ..
         }
     ));

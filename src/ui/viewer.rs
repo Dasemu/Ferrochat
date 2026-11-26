@@ -177,9 +177,10 @@ pub fn view<'a>(app: &'a App, v: &'a ImageViewer) -> El<'a> {
         }
         _ => (0, 0, None),
     };
-    // The full picture, else the blurred inline thumbnail while it loads.
-    let full = app.viewer_handle().cloned();
-    let loading = full.is_none() && !v.failed;
+    // The full picture, else the bubble preview or the blurred inline
+    // thumbnail while it loads.
+    let full = app.viewer_display().cloned();
+    let loading = app.viewer_handle().is_none() && !v.failed;
     let picture = Canvas::new(Picture {
         handle: full.or(thumb),
         size: (w, h),

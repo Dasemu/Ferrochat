@@ -1,7 +1,8 @@
 //! Paste-to-send. Ctrl+V in the composer with a copied image, or with
 //! files copied in a file manager, opens the attachment preview like
-//! WhatsApp Desktop. Text paste stays the text input's own: this module
-//! only acts when the clipboard holds no text.
+//! WhatsApp Desktop. Text paste stays the composer's own (`text_editor`
+//! pastes text by itself); this module only takes over when the clipboard
+//! holds files, or an image with no text beyond the image's own URL.
 //!
 //! The clipboard is read with `arboard` on a blocking thread
 //! ([`read_clipboard`]); the rest is pure and unit-tested.
@@ -53,17 +54,24 @@ pub enum Clipboard {
     /// Files copied in a file manager (`text/uri-list`, `CF_HDROP`).
     Files(Vec<PathBuf>),
     /// A copied image (screenshot, "Copy image" in a browser).
-    Image(RawImage),
+    Image {
+        image: RawImage,
+        /// Text offered next to the image (a browser's image URL), which
+        /// the composer pasted too and the preview removes again.
+        pasted_text: Option<String>,
+    },
     /// Text or nothing: the text input handles it.
     Text,
 }
 
 /// Decides what a paste means. Files win (file managers also offer the
 /// paths as text); then a text that is only `file://` URIs of existing
-/// files; then any other text stays a text paste, so an office suite that
-/// offers both a text and a picture of the copied cells pastes text; an
-/// image is only taken when there is no text at all. The image is fetched
-/// lazily because decoding it is the expensive part.
+/// files. A text that only names the copied image (browsers' "Copy image":
+/// Firefox adds the image URL as plain text, Chromium `<img>` markup, which
+/// Wayland readers return as text) does not hide the image. Any other text
+/// stays a text paste, so an office suite that offers both a text and a
+/// picture of the copied cells pastes text; otherwise an image is taken.
+/// The image is fetched lazily because decoding it is the expensive part.
 pub fn classify(
     files: Vec<PathBuf>,
     text: Option<&str>,
@@ -73,16 +81,50 @@ pub fn classify(
     if !files.is_empty() {
         return Clipboard::Files(files);
     }
-    if let Some(text) = text.filter(|t| !t.trim().is_empty()) {
-        return match parse_uri_list(text) {
-            Some(paths) if paths.iter().all(|p| exists(p)) => Clipboard::Files(paths),
-            _ => Clipboard::Text,
-        };
+    let text = text.map(str::trim).filter(|t| !t.is_empty());
+    if let Some(text) = text {
+        if let Some(paths) = parse_uri_list(text)
+            && paths.iter().all(|p| exists(p))
+        {
+            return Clipboard::Files(paths);
+        }
+        if !names_an_image(text) {
+            return Clipboard::Text;
+        }
     }
     match image() {
-        Some(img) if img.width > 0 && img.height > 0 => Clipboard::Image(img),
+        Some(img) if img.width > 0 && img.height > 0 => Clipboard::Image {
+            image: img,
+            pasted_text: text.map(str::to_string),
+        },
         _ => Clipboard::Text,
     }
+}
+
+/// Whether a text only points at an image copied with it: a single URL
+/// (Firefox's "Copy image" offers it as plain text) or markup made of tags
+/// with an `<img>` and no text (Chromium's `<img src=..>` flavour).
+pub fn names_an_image(text: &str) -> bool {
+    let t = text.trim();
+    if !t.is_empty() && !t.contains(char::is_whitespace) {
+        let head = t.get(..11).unwrap_or(t).to_ascii_lowercase();
+        return ["http://", "https://", "data:image/", "blob:"]
+            .iter()
+            .any(|p| head.starts_with(p));
+    }
+    if !t.starts_with('<') || !t.to_ascii_lowercase().contains("<img") {
+        return false;
+    }
+    let mut in_tag = false;
+    for c in t.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            c if !in_tag && !c.is_whitespace() => return false,
+            _ => {}
+        }
+    }
+    true
 }
 
 /// Parses a `text/uri-list` (RFC 2483): one URI per line, `#` comments.
@@ -167,7 +209,7 @@ fn percent_encode(path: &str) -> String {
     out
 }
 
-/// The text input pasted the clipboard's text flavour too: plain paths
+/// The composer pasted the clipboard's text flavour too: plain paths
 /// (Nautilus) or `file://` URIs (Dolphin). Removes those from the draft.
 pub fn strip_pasted_paths(draft: &str, paths: &[PathBuf]) -> Option<String> {
     let mut text = draft.to_string();
@@ -183,6 +225,19 @@ pub fn strip_pasted_paths(draft: &str, paths: &[PathBuf]) -> Option<String> {
         }
     }
     (text != draft).then(|| text.trim().to_string())
+}
+
+/// The composer pasted the text offered next to a copied image (its URL)
+/// before the image was read: removes that last pasted copy again.
+pub fn strip_pasted_text(draft: &str, pasted: &str) -> Option<String> {
+    let pasted = pasted.trim();
+    if pasted.is_empty() {
+        return None;
+    }
+    let at = draft.rfind(pasted)?;
+    let mut text = draft.to_string();
+    text.replace_range(at..at + pasted.len(), "");
+    Some(text.trim().to_string())
 }
 
 /// A picked file that should go as a video once the helper has read it.
@@ -214,8 +269,11 @@ pub struct Staged {
     pub videos: Vec<PendingVideo>,
     /// Preview pixels of the first item when it is a photo.
     pub preview: Option<(u32, u32, Vec<u8>)>,
-    /// Paths to strip from the draft (the text input pasted them as text).
+    /// Paths to strip from the draft (the composer pasted them as text).
     pub pasted_paths: Vec<PathBuf>,
+    /// Text that came with a copied image (its URL), pasted by the composer
+    /// too: removed from the draft when the image is taken.
+    pub pasted_text: Option<String>,
     /// Files that could not be attached, with the reason.
     pub problems: Vec<String>,
 }
@@ -298,6 +356,7 @@ impl Staged {
             videos: Vec::new(),
             preview,
             pasted_paths,
+            pasted_text: None,
             problems,
         }
     }
@@ -358,12 +417,22 @@ pub fn video_from_probe(
     thumbnail: Vec<u8>,
     gif: bool,
 ) -> crate::net::OutgoingKind {
+    let seconds = ((probe.duration_ms + 500) / 1000) as u32;
+    if gif {
+        // Same shape as a GIF sent from the drawer (`picker::prepare_gif`).
+        return crate::net::OutgoingKind::Gif {
+            width: probe.width,
+            height: probe.height,
+            seconds: seconds.max(1),
+            thumbnail,
+            source: crate::net::GifSource::None,
+        };
+    }
     crate::net::OutgoingKind::Video {
-        seconds: ((probe.duration_ms + 500) / 1000) as u32,
+        seconds,
         width: probe.width,
         height: probe.height,
         thumbnail,
-        gif,
     }
 }
 
@@ -420,7 +489,10 @@ pub async fn stage_paths(paths: Vec<PathBuf>, pasted: bool) -> Option<Staged> {
 pub fn stage(clip: Clipboard) -> Option<Staged> {
     match clip {
         Clipboard::Files(paths) => Some(Staged::from_paths(paths, true)),
-        Clipboard::Image(img) => Some(Staged::from_image(&img)),
+        Clipboard::Image { image, pasted_text } => Some(Staged {
+            pasted_text,
+            ..Staged::from_image(&image)
+        }),
         Clipboard::Text => None,
     }
 }
@@ -556,11 +628,17 @@ mod tests {
         // Image only (a screenshot).
         assert!(matches!(
             classify(vec![], None, yes, img),
-            Clipboard::Image(_)
+            Clipboard::Image {
+                pasted_text: None,
+                ..
+            }
         ));
         assert!(matches!(
             classify(vec![], Some("  "), yes, img),
-            Clipboard::Image(_)
+            Clipboard::Image {
+                pasted_text: None,
+                ..
+            }
         ));
         // A zero-sized image is not an image.
         let empty = || {
@@ -571,6 +649,70 @@ mod tests {
             })
         };
         assert_eq!(classify(vec![], None, yes, empty), Clipboard::Text);
+    }
+
+    #[test]
+    fn a_browsers_copy_image_is_an_image_not_its_url() {
+        let yes = |_: &Path| true;
+        // Firefox "Copy image": the image URL as plain text + the pixels.
+        let url = "https://example.com/cat.png";
+        assert_eq!(
+            classify(vec![], Some(url), yes, img),
+            Clipboard::Image {
+                image: img().unwrap(),
+                pasted_text: Some(url.into()),
+            }
+        );
+        // Chromium's `<img>` markup (Wayland readers return text/html).
+        let html = "<meta charset='utf-8'><img src=\"https://example.com/cat.png\"/>";
+        assert!(matches!(
+            classify(vec![], Some(html), yes, img),
+            Clipboard::Image { .. }
+        ));
+        // A copied link with no image stays a text paste.
+        assert_eq!(classify(vec![], Some(url), yes, || None), Clipboard::Text);
+        // Real text next to an image (office suites, web selections).
+        for t in [
+            "A1\tB1\nA2\tB2",
+            "look https://example.com/cat.png",
+            "<p>hola <img src=x></p>",
+            "<b>hola</b>",
+            "https://a.example\nhttps://b.example",
+        ] {
+            assert_eq!(classify(vec![], Some(t), yes, img), Clipboard::Text, "{t}");
+        }
+    }
+
+    #[test]
+    fn names_an_image_only_for_a_lone_url_or_img_markup() {
+        assert!(names_an_image(" https://x.example/a.png \n"));
+        assert!(names_an_image("HTTPS://X.EXAMPLE/A.PNG"));
+        assert!(names_an_image("data:image/png;base64,AAAA"));
+        assert!(names_an_image(
+            "<html><body><!--StartFragment--><img src=\"a.png\"><!--EndFragment--></body></html>"
+        ));
+        assert!(!names_an_image("hola"));
+        assert!(!names_an_image("ftp://x.example/a.png"));
+        // `file://` text is the file-manager path, never an image's name.
+        assert!(!names_an_image("file:///tmp/a.png"));
+        assert!(!names_an_image("<div></div>"));
+        assert!(!names_an_image("<img src=a> caption"));
+    }
+
+    #[test]
+    fn the_pasted_url_is_removed_once_from_the_end() {
+        let url = "https://example.com/cat.png";
+        assert_eq!(
+            strip_pasted_text(&format!("hi {url}"), url).as_deref(),
+            Some("hi")
+        );
+        // An earlier copy typed by the user stays.
+        assert_eq!(
+            strip_pasted_text(&format!("{url} and {url}"), url).as_deref(),
+            Some(&*format!("{url} and"))
+        );
+        assert_eq!(strip_pasted_text("hola", url), None);
+        assert_eq!(strip_pasted_text("hola", "  "), None);
     }
 
     #[test]
@@ -645,21 +787,28 @@ mod tests {
 
     #[test]
     fn copied_images_and_files_are_staged_like_the_attach_button() {
-        let s = stage(Clipboard::Image(RawImage {
-            width: 4,
-            height: 2,
-            rgba: vec![10; 32],
-        }))
+        let s = stage(Clipboard::Image {
+            image: RawImage {
+                width: 4,
+                height: 2,
+                rgba: vec![10; 32],
+            },
+            pasted_text: Some("https://example.com/a.png".into()),
+        })
         .unwrap();
+        assert_eq!(s.pasted_text.as_deref(), Some("https://example.com/a.png"));
         assert_eq!(s.items.len(), 1);
         assert_eq!(s.items[0].mimetype, "image/jpeg");
         assert_eq!(s.preview.as_ref().map(|p| (p.0, p.1)), Some((4, 2)));
         assert!(stage(Clipboard::Text).is_none());
-        let bad = stage(Clipboard::Image(RawImage {
-            width: 4,
-            height: 2,
-            rgba: vec![10; 3],
-        }))
+        let bad = stage(Clipboard::Image {
+            image: RawImage {
+                width: 4,
+                height: 2,
+                rgba: vec![10; 3],
+            },
+            pasted_text: None,
+        })
         .unwrap();
         assert!(bad.items.is_empty() && bad.problems.len() == 1);
 
@@ -705,11 +854,14 @@ mod tests {
 
     #[test]
     fn the_caption_goes_with_the_first_item() {
-        let staged = stage(Clipboard::Image(RawImage {
-            width: 2,
-            height: 2,
-            rgba: vec![255; 16],
-        }))
+        let staged = stage(Clipboard::Image {
+            image: RawImage {
+                width: 2,
+                height: 2,
+                rgba: vec![255; 16],
+            },
+            pasted_text: None,
+        })
         .unwrap();
         let mut p = AttachPreview::new("chat".into(), staged).unwrap();
         assert!(p.handle.is_some());
@@ -758,11 +910,10 @@ mod tests {
             OutgoingKind::Video {
                 seconds,
                 width,
-                gif,
                 thumbnail,
                 ..
             } => {
-                assert_eq!((*seconds, *width, *gif), (3, 640, false));
+                assert_eq!((*seconds, *width), (3, 640));
                 assert!(!thumbnail.is_empty());
             }
             k => panic!("{k:?}"),
@@ -773,7 +924,10 @@ mod tests {
         assert_eq!(s.items[1].file_name, "b.mp4");
         assert!(matches!(
             s.items[1].kind,
-            OutgoingKind::Video { gif: true, .. }
+            OutgoingKind::Gif {
+                source: crate::net::GifSource::None,
+                ..
+            }
         ));
         // A failed probe leaves a document and says why.
         let mut s = Staged::from_paths(vec![dir.join("a.mp4")], false);

@@ -22,6 +22,10 @@ pub struct Palette {
     pub bg_elevated: Color,
     /// Hovered row.
     pub bg_hover: Color,
+    /// Floating menus and popovers (WhatsApp's dropdown colour).
+    pub bg_menu: Color,
+    /// Hovered menu item.
+    pub menu_hover: Color,
     /// Selected row.
     pub bg_selected: Color,
     /// Main text.
@@ -89,6 +93,8 @@ pub const DARK: Palette = Palette {
     bg_panel: hex(0x0b141a),
     bg_elevated: hex(0x202c33),
     bg_hover: hex(0x202c33),
+    bg_menu: hex(0x233138),
+    menu_hover: hex(0x182229),
     bg_selected: hex(0x2a3942),
     text_primary: hex(0xe9edef),
     text_secondary: hex(0x8696a0),
@@ -123,6 +129,8 @@ pub const LIGHT: Palette = Palette {
     bg_panel: hex(0xefeae2),
     bg_elevated: hex(0xf0f2f5),
     bg_hover: hex(0xf5f6f6),
+    bg_menu: hex(0xffffff),
+    menu_hover: hex(0xf5f6f6),
     bg_selected: hex(0xf0f2f5),
     text_primary: hex(0x111b21),
     text_secondary: hex(0x667781),
@@ -288,6 +296,39 @@ pub fn rounded(color: Color, radius: f32) -> impl Fn(&Theme) -> container::Style
         background: Some(Background::Color(color)),
         border: border(radius),
         ..Default::default()
+    }
+}
+
+/// Floating menu / popover card: opaque menu colour, a hairline edge, and
+/// NO `Shadow`. iced 0.14's tiny-skia draws a quad's shadow without the
+/// damage clip and only damages the quad's own bounds: on every partial
+/// redraw (hovering an item) the shadow is blended again over the whole
+/// card and its surroundings, dimming items and leaving stale halo pixels
+/// (the "⋮" menu bug). `theme::tests::no_blurred_shadows` guards it.
+pub fn popup(t: &FerroTheme, radius: f32) -> impl Fn(&Theme) -> container::Style + use<> {
+    let p = t.palette;
+    move |_| container::Style {
+        background: Some(Background::Color(p.bg_menu)),
+        border: Border {
+            radius: Radius::from(radius),
+            width: 1.0,
+            color: p.border,
+        },
+        ..Default::default()
+    }
+}
+
+/// Item of a floating menu: flat, darker on hover like WhatsApp Desktop
+/// (`bg_hover` equals the old menu colour and showed nothing).
+pub fn menu_item(t: &FerroTheme) -> impl Fn(&Theme, button::Status) -> button::Style + use<> {
+    let p = t.palette;
+    move |_, status| button::Style {
+        background: matches!(status, button::Status::Hovered | button::Status::Pressed)
+            .then_some(Background::Color(p.menu_hover)),
+        text_color: p.text_primary,
+        border: border(0.0),
+        shadow: Shadow::default(),
+        snap: true,
     }
 }
 
@@ -585,6 +626,23 @@ pub fn flat_button(color: Color) -> impl Fn(&Theme, button::Status) -> button::S
     }
 }
 
+/// Pill drawn over a picture ("Retry" on a photo that failed to load):
+/// dark and translucent so it reads on any picture.
+pub fn overlay_pill(_: &Theme, status: button::Status) -> button::Style {
+    let a = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        0.7
+    } else {
+        0.55
+    };
+    button::Style {
+        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, a))),
+        text_color: Color::WHITE,
+        border: border(18.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 /// Search / composer input (the container provides the rounded background).
 pub fn input(t: &FerroTheme) -> impl Fn(&Theme, text_input::Status) -> text_input::Style + use<> {
     let p = t.palette;
@@ -651,6 +709,34 @@ pub fn sender_color(jid: &str) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// iced 0.14's tiny-skia blends a blurred `Shadow` outside the damage
+    /// clip and never repaints its halo: popups smeared over themselves and
+    /// their surroundings (see `popup`). Use `popup` / `bubble_shadow`.
+    #[test]
+    fn no_blurred_shadows() {
+        fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for e in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    walk(&path, out);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut files,
+        );
+        let needle = concat!("blur", "_radius");
+        let offenders: Vec<_> = files
+            .iter()
+            .filter(|f| std::fs::read_to_string(f).unwrap().contains(needle))
+            .collect();
+        assert!(offenders.is_empty(), "blurred shadows in {offenders:?}");
+    }
 
     #[test]
     fn palettes_have_contrast() {
