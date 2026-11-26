@@ -2001,7 +2001,7 @@ dependencies = [
 
 [[package]]
 name = "ferrochat"
-version = "0.16.0"
+version = "0.16.4"
 dependencies = [
  "arboard",
  "async-channel",
@@ -6421,6 +6421,7 @@ dependencies = [
  "mio",
  "parking_lot 0.12.5",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",
