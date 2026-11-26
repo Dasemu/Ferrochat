@@ -264,12 +264,35 @@ pub struct FakeClient {
     groups: HashMap<String, GroupInfo>,
     /// Blocked contacts.
     blocked: Mutex<std::collections::HashSet<String>>,
+    /// CDN paths downloaded, in order.
+    downloads: Mutex<Vec<String>>,
+    /// Downloads of these CDN paths fail this many more times.
+    fail_downloads: Mutex<HashMap<String, u32>>,
 }
 
 impl FakeClient {
     /// Everything the app asked the fake to do, in order.
     pub fn log(&self) -> Vec<Sent> {
         self.log.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// CDN paths the app downloaded, in order (failed attempts included).
+    pub fn downloads(&self) -> Vec<String> {
+        self.downloads.lock().map(|l| l.clone()).unwrap_or_default()
+    }
+
+    /// Serves `bytes` at CDN path `path`.
+    pub fn put_media(&self, path: &str, bytes: Vec<u8>) {
+        if let Ok(mut m) = self.media.lock() {
+            m.insert(path.to_string(), bytes);
+        }
+    }
+
+    /// Makes the next `n` downloads of `path` fail like a network error.
+    pub fn fail_next_downloads(&self, path: &str, n: u32) {
+        if let Ok(mut f) = self.fail_downloads.lock() {
+            f.insert(path.to_string(), n);
+        }
     }
 
     fn record(&self, s: Sent) {
@@ -575,6 +598,21 @@ impl WaClient for FakeClient {
 
     fn download<'a>(&'a self, media: &'a MediaRef) -> BoxFuture<'a, Result<Vec<u8>>> {
         Box::pin(async move {
+            if let Ok(mut d) = self.downloads.lock() {
+                d.push(media.direct_path.clone());
+            }
+            let failing = self.fail_downloads.lock().ok().is_some_and(|mut f| {
+                match f.get_mut(&media.direct_path) {
+                    Some(n) if *n > 0 => {
+                        *n -= 1;
+                        true
+                    }
+                    _ => false,
+                }
+            });
+            if failing {
+                return Err(Error::Net("download failed: fake timeout".into()));
+            }
             self.media
                 .lock()
                 .ok()
@@ -1111,6 +1149,8 @@ pub fn start(
         next_group: Mutex::new(0),
         groups: mock_groups(&data.own_jid, &data.chats, &data.messages),
         blocked: Mutex::new(std::collections::HashSet::new()),
+        downloads: Mutex::new(Vec::new()),
+        fail_downloads: Mutex::new(HashMap::new()),
     });
     let _ = tx.send(if opts.paired {
         Event::SessionFound

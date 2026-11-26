@@ -723,12 +723,12 @@ impl App {
         if c.chat != chat {
             return Task::none();
         }
-        self.index_thumbs(&window.messages);
         let Some(c) = &mut self.open else {
             return Task::none();
         };
-        c.replace_window(window.messages, window.has_older, window.has_newer);
-        let auto = self.auto_download_images();
+        c.replace_window(window.messages.clone(), window.has_older, window.has_newer);
+        let placeholders = self.index_thumbs(&window.messages);
+        let auto = Task::batch([placeholders, self.auto_download_images()]);
         if anchor.is_empty() {
             return Task::batch([
                 auto,
@@ -823,13 +823,18 @@ impl App {
         )
     }
 
-    pub(super) fn on_newer(&mut self, chat: String, msgs: Vec<ChatMessage>, has_newer: bool) {
-        self.index_thumbs(&msgs);
+    pub(super) fn on_newer(
+        &mut self,
+        chat: String,
+        msgs: Vec<ChatMessage>,
+        has_newer: bool,
+    ) -> Task<Message> {
         if let Some(c) = &mut self.open
             && c.chat == chat
         {
-            c.append_newer(msgs, has_newer);
+            c.append_newer(msgs.clone(), has_newer);
         }
+        Task::batch([self.index_thumbs(&msgs), self.check_visible()])
     }
 
     // ------------------------------------------------------------- avatars

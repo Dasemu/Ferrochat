@@ -104,6 +104,8 @@ pub enum Ui {
     OpenDocument(String),
     /// Show an image full size.
     OpenImage(String),
+    /// Try a photo download that failed again.
+    RetryImage(String),
     /// Close the image viewer.
     CloseViewer,
     /// Zoom the viewer by `factor` around `at` (offset from the centre).
@@ -325,8 +327,8 @@ pub enum Setting {
 /// A downloaded blob, already prepared for display where needed.
 #[derive(Clone)]
 pub enum Fetched {
-    /// Raw bytes (images, documents).
-    Bytes(Arc<Vec<u8>>),
+    /// A photo's bubble preview, decoded off the UI thread.
+    Picture(crate::media::picture::Preview),
     /// A decoded sticker: a still (RGBA) or an animation, plus its entry
     /// for the recent-stickers list once it is on the shelf.
     Sticker {
@@ -342,7 +344,7 @@ pub enum Fetched {
 impl std::fmt::Debug for Fetched {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Fetched::Bytes(b) => write!(f, "Bytes({})", b.len()),
+            Fetched::Picture(p) => write!(f, "{p:?}"),
             Fetched::Sticker { anim, .. } => write!(f, "Sticker(animated={})", anim.is_some()),
         }
     }
@@ -377,6 +379,30 @@ pub enum Done {
     ResyncDue,
     /// The autostart entry was written (`true`) or removed (`false`).
     Autostart(Result<bool, String>),
+    /// A photo preview was looked up in the disk cache (`None`: a miss,
+    /// the download follows).
+    DiskPreview {
+        /// Message.
+        id: String,
+        /// Cache key.
+        key: String,
+        /// Pixel cap for the download that may follow.
+        max_pixels: u64,
+        /// The preview, if it was on disk.
+        preview: Option<crate::media::picture::Preview>,
+    },
+    /// Blurred placeholders made from inline thumbnails (message id,
+    /// pixels).
+    Placeholders(Vec<(String, crate::media::picture::Preview)>),
+    /// Time to try a failed download again.
+    RetryMedia {
+        /// Message.
+        id: String,
+        /// Cache key.
+        key: String,
+    },
+    /// Photo / sticker rows on (or near) screen, most urgent first.
+    Visible(Vec<String>),
     /// Messages loaded from the cache.
     Loaded {
         /// Chat.
@@ -408,6 +434,8 @@ pub enum Done {
     },
     /// Media downloaded.
     Downloaded {
+        /// Message the download was for.
+        id: String,
         /// Cache key.
         key: String,
         /// Bytes or error.
