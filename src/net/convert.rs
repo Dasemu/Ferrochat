@@ -506,6 +506,7 @@ pub fn build_forward(content: &Content, source_forward: Option<u32>) -> Option<w
             let m = usable(media)?;
             wa::Message {
                 video_message: buffa_some(wa::message::VideoMessage {
+                    gif_playback: gif.then_some(true),
                     url: url(&m),
                     mimetype: Some(m.mimetype.clone()),
                     file_sha256: Some(m.file_sha256.clone()),
@@ -518,7 +519,6 @@ pub fn build_forward(content: &Content, source_forward: Option<u32>) -> Option<w
                     file_enc_sha256: Some(m.file_enc_sha256.clone()),
                     direct_path: Some(m.direct_path.clone()),
                     jpeg_thumbnail: thumbnail.clone(),
-                    gif_playback: gif.then_some(true),
                     context_info: ctx(),
                     ..Default::default()
                 }),
@@ -1205,6 +1205,31 @@ pub fn build_media(media: &OutgoingMedia, up: &Uploaded) -> (wa::Message, Conten
             }),
             ..Default::default()
         },
+        OutgoingKind::Video {
+            seconds,
+            width,
+            height,
+            thumbnail,
+        } => wa::Message {
+            video_message: buffa_some(wa::message::VideoMessage {
+                url: Some(up.url.clone()),
+                mimetype: Some(media.mimetype.clone()),
+                caption: media.caption.clone(),
+                file_sha256: Some(up.file_sha256.clone()),
+                file_length: Some(up.file_length),
+                seconds: Some(*seconds),
+                height: Some(*height),
+                width: Some(*width),
+                media_key: Some(up.media_key.clone()),
+                file_enc_sha256: Some(up.file_enc_sha256.clone()),
+                direct_path: Some(up.direct_path.clone()),
+                media_key_timestamp: Some(up.media_key_timestamp),
+                jpeg_thumbnail: Some(thumbnail.clone()),
+                streaming_sidecar: up.streaming_sidecar.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
         OutgoingKind::Voice { seconds, waveform } => wa::Message {
             audio_message: buffa_some(wa::message::AudioMessage {
                 url: Some(up.url.clone()),
@@ -1582,6 +1607,59 @@ mod tests {
                 assert_eq!(media.unwrap().direct_path, "/v/t62/x");
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn videos_and_gifs_roundtrip_and_forward_as_gifs() {
+        let up = Uploaded {
+            url: "https://mmg.whatsapp.net/v".into(),
+            direct_path: "/v/t62/v".into(),
+            media_key: vec![7; 32],
+            file_sha256: vec![1; 32],
+            file_enc_sha256: vec![2; 32],
+            file_length: 9,
+            media_key_timestamp: 1,
+            streaming_sidecar: None,
+        };
+        for gif in [false, true] {
+            let media = OutgoingMedia {
+                kind: if gif {
+                    OutgoingKind::Gif {
+                        width: 640,
+                        height: 360,
+                        seconds: 4,
+                        thumbnail: vec![5, 5],
+                        source: GifSource::None,
+                    }
+                } else {
+                    OutgoingKind::Video {
+                        seconds: 4,
+                        width: 640,
+                        height: 360,
+                        thumbnail: vec![5, 5],
+                    }
+                },
+                bytes: vec![0; 9],
+                file_name: "clip.mp4".into(),
+                mimetype: "video/mp4".into(),
+                caption: Some("hey".into()),
+            };
+            let (msg, local) = build_media(&media, &up);
+            let v = msg.video_message.as_option().unwrap();
+            assert_eq!(v.gif_playback, gif.then_some(true));
+            assert_eq!(v.seconds, Some(4));
+            assert_eq!(v.jpeg_thumbnail.as_deref(), Some(&[5u8, 5][..]));
+            let parsed = content_from_wa(&msg).unwrap();
+            assert_eq!(parsed, local);
+            assert!(matches!(parsed, Content::Video { gif: g, .. } if g == gif));
+            assert_eq!(parsed.media().unwrap().kind, MediaKind::Video);
+            // A forwarded GIF is still a GIF.
+            let fwd = build_forward(&parsed, None).unwrap();
+            assert_eq!(
+                fwd.video_message.as_option().unwrap().gif_playback,
+                gif.then_some(true)
+            );
         }
     }
 

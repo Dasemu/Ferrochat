@@ -72,6 +72,52 @@ pub fn empty(app: &App) -> El<'_> {
 
 /// The open conversation.
 pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
+    // Always a stack: switching the root between the conversation and a
+    // stack would rebuild its widget state (scroll offset, composer focus)
+    // whenever files are dragged over the window.
+    let overlay: El<'a> = if app.drop.hovering {
+        drop_overlay(app)
+    } else {
+        iced::widget::Space::new().into()
+    };
+    iced::widget::stack![view_inner(app, conv), overlay].into()
+}
+
+/// Shown over the conversation while files are dragged over the window.
+fn drop_overlay(app: &App) -> El<'_> {
+    let t = &app.theme;
+    let p = t.palette;
+    let m = t.metrics;
+    let card = container(
+        column![
+            icon(Icon::Paperclip, 44.0, p.accent),
+            text("Drop files here to send them")
+                .size(m.text + 3.0)
+                .color(p.text_primary),
+            text("Photos, videos, GIFs and documents")
+                .size(m.text - 1.0)
+                .color(p.text_secondary),
+        ]
+        .spacing(12)
+        .align_x(Alignment::Center),
+    )
+    .padding([36, 48])
+    .style(move |th: &iced::Theme| {
+        let mut s = theme::rounded(p.bg_elevated, 16.0)(th);
+        s.border = iced::Border {
+            color: p.accent,
+            width: 2.0,
+            radius: 16.0.into(),
+        };
+        s
+    });
+    container(card)
+        .center(Length::Fill)
+        .style(theme::solid(Color::from_rgba(0.0, 0.0, 0.0, 0.55)))
+        .into()
+}
+
+fn view_inner<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
     let t = &app.theme;
     let p = t.palette;
     let m = t.metrics;
@@ -586,7 +632,36 @@ fn attach_preview<'a>(app: &'a App, a: &'a crate::app::paste::AttachPreview) -> 
     .align_y(Alignment::Center)
     .padding([8, 16]);
     let content: El<'a> = match &a.handle {
-        Some(h) => image(h.clone()).content_fit(ContentFit::ScaleDown).into(),
+        Some(h) => match &first.kind {
+            crate::net::OutgoingKind::Video { seconds, .. }
+            | crate::net::OutgoingKind::Gif { seconds, .. } => {
+                // The first frame with what WhatsApp shows on a video: a
+                // play mark and the duration, or "GIF".
+                let gif = matches!(first.kind, crate::net::OutgoingKind::Gif { .. });
+                let shade = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+                let label: El<'a> = if gif {
+                    text("GIF").size(13).color(Color::WHITE).into()
+                } else {
+                    row![
+                        icon(Icon::Video, 13.0, Color::WHITE),
+                        text(format_duration(*seconds)).size(13).color(Color::WHITE),
+                    ]
+                    .spacing(5)
+                    .align_y(Alignment::Center)
+                    .into()
+                };
+                column![
+                    image(h.clone()).content_fit(ContentFit::ScaleDown),
+                    container(label)
+                        .padding([3, 9])
+                        .style(theme::rounded(shade, 10.0)),
+                ]
+                .spacing(10)
+                .align_x(Alignment::Center)
+                .into()
+            }
+            _ => image(h.clone()).content_fit(ContentFit::ScaleDown).into(),
+        },
         None => column![
             icon(Icon::FileText, 72.0, p.text_secondary),
             text(first.file_name.clone())

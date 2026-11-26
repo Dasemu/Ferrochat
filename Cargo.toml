@@ -30,7 +30,7 @@ required-features = ["video"]
 # UI
 iced = { version = "0.14", features = ["tokio", "image", "advanced", "svg", "canvas"] }
 # Async runtime
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs", "process"] }
 futures = "0.3"
 # Channel type the whatsapp-rust VoIP facade takes for PCM endpoints (already in the tree through it).
 async-channel = "2"

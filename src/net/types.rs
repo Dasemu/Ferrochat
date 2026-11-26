@@ -1047,6 +1047,18 @@ pub enum OutgoingKind {
     },
     /// Any file.
     Document,
+    /// MP4 video (H.264) with what the helper read from it. GIFs go as
+    /// [`OutgoingKind::Gif`].
+    Video {
+        /// Duration in seconds.
+        seconds: u32,
+        /// Pixel width.
+        width: u32,
+        /// Pixel height.
+        height: u32,
+        /// Small JPEG thumbnail of the first frame.
+        thumbnail: Vec<u8>,
+    },
     /// Voice note (Ogg/Opus).
     Voice {
         /// Duration in seconds.
@@ -1094,6 +1106,7 @@ impl OutgoingKind {
         match self {
             OutgoingKind::Image { .. } => MediaKind::Image,
             OutgoingKind::Document => MediaKind::Document,
+            OutgoingKind::Video { .. } => MediaKind::Video,
             OutgoingKind::Voice { .. } => MediaKind::Audio,
             OutgoingKind::Sticker { .. } => MediaKind::Sticker,
             OutgoingKind::Gif { .. } => MediaKind::Video,
@@ -1123,6 +1136,20 @@ impl OutgoingMedia {
                 pages: None,
                 caption: self.caption.clone(),
                 media,
+            },
+            OutgoingKind::Video {
+                seconds,
+                width,
+                height,
+                thumbnail,
+            } => Content::Video {
+                caption: self.caption.clone(),
+                seconds: *seconds,
+                width: *width,
+                height: *height,
+                thumbnail: Some(thumbnail.clone()),
+                media,
+                gif: false,
             },
             OutgoingKind::Voice { seconds, waveform } => Content::Voice {
                 seconds: *seconds,
@@ -1373,6 +1400,16 @@ mod tests {
             gif: false,
         };
         assert_eq!(v.preview(), "🎥 1:15");
+        let g = Content::Video {
+            caption: None,
+            seconds: 3,
+            width: 1,
+            height: 1,
+            thumbnail: None,
+            media: None,
+            gif: true,
+        };
+        assert_eq!(g.preview(), "GIF");
         assert_eq!(v.kind_tag(), "video");
         let g = Content::Video {
             caption: None,
