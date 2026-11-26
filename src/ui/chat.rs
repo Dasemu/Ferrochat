@@ -72,11 +72,15 @@ pub fn empty(app: &App) -> El<'_> {
 
 /// The open conversation.
 pub fn view<'a>(app: &'a App, conv: &'a Conversation) -> El<'a> {
-    let el = view_inner(app, conv);
-    if !app.drop.hovering {
-        return el;
-    }
-    iced::widget::stack![el, drop_overlay(app)].into()
+    // Always a stack: switching the root between the conversation and a
+    // stack would rebuild its widget state (scroll offset, composer focus)
+    // whenever files are dragged over the window.
+    let overlay: El<'a> = if app.drop.hovering {
+        drop_overlay(app)
+    } else {
+        iced::widget::Space::new().into()
+    };
+    iced::widget::stack![view_inner(app, conv), overlay].into()
 }
 
 /// Shown over the conversation while files are dragged over the window.

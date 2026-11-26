@@ -440,10 +440,9 @@ pub fn video_from_probe(
 const VIDEO_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Reads every pending video with the helper (GIFs are converted to MP4
-/// first, in a private temporary file removed right after). Async: the
+/// first, in a private temporary directory removed right after). Async: the
 /// helper runs as a child process, never on the blocking pool.
 pub async fn finish_videos(mut staged: Staged) -> Staged {
-    static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     for pending in std::mem::take(&mut staged.videos) {
         let result = async {
             if !pending.gif {
@@ -452,9 +451,8 @@ pub async fn finish_videos(mut staged: Staged) -> Staged {
                     .map_err(|f| f.detail())?;
                 return Ok((probe, None));
             }
-            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp =
-                std::env::temp_dir().join(format!("ferrochat-gif-{}-{n}.mp4", std::process::id()));
+            let dir = private_scratch_dir().await?;
+            let tmp = dir.join("converted.mp4");
             let out = async {
                 crate::media::video::gif_to_mp4(&pending.path, &tmp, VIDEO_WAIT)
                     .await
@@ -466,13 +464,28 @@ pub async fn finish_videos(mut staged: Staged) -> Staged {
                 Ok((probe, Some(bytes)))
             }
             .await;
-            let _ = tokio::fs::remove_file(&tmp).await;
+            let _ = tokio::fs::remove_dir_all(&dir).await;
             out
         }
         .await;
         staged.apply_probe(&pending, result);
     }
     staged
+}
+
+/// A fresh directory only we can enter, for the converter's output. The
+/// name is random and the directory is created exclusively (never reused),
+/// so another user of a shared temp dir cannot plant a symlink where the
+/// helper writes.
+async fn private_scratch_dir() -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("ferrochat-gif-{}", crate::net::new_message_id()));
+    let mut b = tokio::fs::DirBuilder::new();
+    #[cfg(unix)]
+    b.mode(0o700);
+    b.create(&dir)
+        .await
+        .map_err(|e| format!("cannot create a temporary folder: {e}"))?;
+    Ok(dir)
 }
 
 /// Prepares picked, pasted or dropped files, videos included. Async.

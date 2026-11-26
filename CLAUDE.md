@@ -126,9 +126,12 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   never on the blocking pool; a failure keeps the document. MP4s go as `OutgoingKind::Video`, GIFs as
   `OutgoingKind::Gif` (like the drawer). All file sources (paperclip, paste, drop) go through
   `paste::stage_paths` / `finish_videos`. GIFs also loop in the viewer (`VideoView::looping`).
+  The converter writes into `paste::private_scratch_dir` (random name, created exclusively, 0700): never a
+  predictable path in the shared temp dir (symlink clobbering).
 - Drag and drop (`app/drop.rs`): one `FileDropped` per file, gathered for `drop::GATHER` and staged together;
   the overlay follows `FileHovered` / `FilesHoveredLeft`. winit 0.30 has no drag and drop on native Wayland
-  (works on X11 / XWayland, Windows, macOS).
+  (works on X11 / XWayland, Windows, macOS). `ui::chat::view` is ALWAYS a stack (overlay or empty `Space`):
+  toggling the root widget type would reset the conversation's scroll / composer state on every drag.
 - Never park an unbounded wait on tokio's blocking pool: iced drops its runtime on quit and that waits for
   every `spawn_blocking` task (KDE keeps notifications open, so a click watch there hung Quit). Notification
   click watches run on detached threads (`notify::show`); `tests/notify_quit.rs` guards it.
