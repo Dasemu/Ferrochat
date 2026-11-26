@@ -35,6 +35,17 @@ fn sent_media(h: &Harness) -> Vec<Content> {
         .collect()
 }
 
+/// The video tests need the real helper; `cargo test` alone does not build
+/// it next to the test binary (CI), so they skip without it.
+#[cfg(feature = "video")]
+fn helper_built() -> bool {
+    let ok = crate::media::video::helper_path().is_some();
+    if !ok {
+        eprintln!("skipped: the ferrochat-player helper is not built");
+    }
+    ok
+}
+
 async fn stage(h: &mut Harness, paths: Vec<PathBuf>) {
     let staged = paste::stage_paths(paths, false).await.map(Box::new);
     let t = h.app.update(Message::done(Done::Staged {
@@ -47,6 +58,9 @@ async fn stage(h: &mut Harness, paths: Vec<PathBuf>) {
 #[cfg(feature = "video")]
 #[tokio::test]
 async fn an_mp4_is_sent_as_a_video_with_its_duration_and_thumbnail() {
+    if !helper_built() {
+        return;
+    }
     let mut h = Harness::new().await;
     h.ui(Ui::OpenChat(PABLO.into())).await;
     stage(&mut h, vec![clip()]).await;
@@ -99,6 +113,9 @@ async fn an_mp4_is_sent_as_a_video_with_its_duration_and_thumbnail() {
 #[cfg(feature = "video")]
 #[tokio::test]
 async fn a_gif_is_converted_and_sent_as_a_looping_gif() {
+    if !helper_built() {
+        return;
+    }
     let dir = tmp("gif");
     let gif = dir.join("baile.gif");
     std::fs::write(&gif, crate::mock::sample_gif()).unwrap();
