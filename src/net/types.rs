@@ -588,8 +588,26 @@ pub struct ChatMeta {
     pub pinned: bool,
     /// Archived.
     pub archived: bool,
-    /// Muted.
-    pub muted: bool,
+    /// When the mute ends: [`MUTE_OFF`], [`MUTE_FOREVER`] or Unix seconds.
+    pub mute_end: i64,
+}
+
+/// [`ChatMeta::mute_end`] of a chat that is not muted.
+pub const MUTE_OFF: i64 = 0;
+/// [`ChatMeta::mute_end`] of a chat muted until unmuted ("Always").
+pub const MUTE_FOREVER: i64 = -1;
+
+/// Whether a mute ending at `end` (see [`ChatMeta::mute_end`]) still holds
+/// at `now` (Unix seconds).
+pub fn mute_active(end: i64, now: i64) -> bool {
+    end < 0 || end > now
+}
+
+impl ChatMeta {
+    /// Muted at `now` (Unix seconds): timed mutes end on their own.
+    pub fn is_muted(&self, now: i64) -> bool {
+        mute_active(self.mute_end, now)
+    }
 }
 
 /// Where a batch of messages comes from. Decides unread counting and
@@ -891,8 +909,9 @@ pub enum ChatFlag {
     Archived(bool),
     /// Pinned / unpinned.
     Pinned(bool),
-    /// Muted / unmuted.
-    Muted(bool),
+    /// Muted until this time (see [`ChatMeta::mute_end`]); [`MUTE_OFF`]
+    /// unmutes.
+    Muted(i64),
 }
 
 /// What a chat list "label" is (WhatsApp's `LabelEditAction.ListType`).

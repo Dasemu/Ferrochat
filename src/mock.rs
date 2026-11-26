@@ -901,7 +901,7 @@ pub fn mock_data(now: i64) -> MockData {
         last_ts: last_of(id),
         pinned,
         archived: false,
-        muted,
+        mute_end: if muted { crate::net::MUTE_FOREVER } else { 0 },
     };
     let mut chats = vec![
         chat(lucia, None, 0, true, false),

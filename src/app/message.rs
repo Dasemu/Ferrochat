@@ -299,6 +299,8 @@ pub enum Ui {
     ConfirmDeleteList(String),
     /// Close the list dialog.
     CloseListDialog,
+    /// Mark read / unread, mute, clear or delete a chat.
+    ChatAct(crate::app::chat_actions::ChatAct),
     /// Open a link from a message in the default browser.
     OpenLink(String),
     /// Open a message found by the chat list search.
@@ -621,6 +623,8 @@ pub enum Done {
     },
     /// A task started by a navigation / status action finished.
     Nav(Box<crate::app::nav::NavDone>),
+    /// A chat action task finished.
+    ChatAct(crate::app::chat_actions::ChatActDone),
     /// Nothing to do.
     Nothing,
     /// A call task finished.

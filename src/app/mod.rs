@@ -13,9 +13,12 @@ pub mod video;
 pub mod viewer;
 pub use actions::{PopupPos, popup_top, row_id};
 mod background;
+pub mod chat_actions;
 pub use background::WindowGeom;
 #[cfg(test)]
 mod call_flows;
+#[cfg(test)]
+mod chat_action_flows;
 #[cfg(test)]
 mod flows;
 #[cfg(test)]
@@ -220,6 +223,8 @@ pub struct App {
     pub(crate) sidebar_menu: Option<SidebarMenu>,
     /// Create / rename / delete list dialog.
     pub(crate) list_dialog: Option<ListDialog>,
+    /// Mute / clear / delete chat dialog.
+    pub(crate) chat_dialog: Option<chat_actions::ChatDialog>,
     pub(crate) open: Option<Conversation>,
     pending_read: usize,
     /// Display JID -> the JID messages came from (LID-addressed chats and
@@ -554,6 +559,7 @@ impl App {
             resync: Resync::default(),
             sidebar_menu: None,
             list_dialog: None,
+            chat_dialog: None,
             open: None,
             pending_read: 0,
             wire: HashMap::new(),
@@ -860,6 +866,7 @@ impl App {
                 let consumed = self.nav_escape()
                     || std::mem::take(&mut self.settings_open)
                     || self.list_dialog.take().is_some()
+                    || self.chat_dialog.take().is_some()
                     || self.sidebar_menu.take().is_some()
                     || self.dialog.take().is_some()
                     || self.attach.take().is_some()
@@ -1611,6 +1618,12 @@ impl App {
         )
     }
 
+    /// The chat is muted now (timed mutes end on their own).
+    pub fn is_muted(&self, chat: &str) -> bool {
+        let now = now_secs();
+        self.chats.get(chat).is_some_and(|e| e.meta.is_muted(now))
+    }
+
     /// The open chat, if the user is reading its newest messages.
     pub fn reading_chat(&self) -> Option<&str> {
         let c = self.open.as_ref()?;
@@ -1632,11 +1645,19 @@ impl App {
             .get(&conv.chat)
             .is_some_and(|e| e.meta.unread > 0);
         let chat_id = conv.chat.clone();
-        self.chats.mark_read(&chat_id);
-        let clear = if had_badge {
-            store_task(&self.store, move |s| s.set_unread(&chat_id, 0))
+        // A chat marked unread by hand is "read" on the other devices too.
+        let sync = if self.chats.mark_read(&chat_id) {
+            self.sync_read_mark(chat_id.clone(), true, 1)
         } else {
             Task::none()
+        };
+        let clear = if had_badge {
+            Task::batch([
+                store_task(&self.store, move |s| s.set_unread(&chat_id, 0)),
+                sync,
+            ])
+        } else {
+            sync
         };
         let Some(conv) = &self.open else {
             return clear;
@@ -1839,6 +1860,11 @@ impl App {
                                 "34622222222@s.whatsapp.net".into(),
                             ))));
                         }
+                        ScreenshotTarget::Mute => {
+                            tasks.push(Task::done(Message::Ui(Ui::ChatAct(
+                                chat_actions::ChatAct::AskMute("34622222222@s.whatsapp.net".into()),
+                            ))));
+                        }
                         _ => {}
                     }
                 }
@@ -1929,6 +1955,18 @@ impl App {
                 let chat = self.lid_map.normalize(&chat);
                 self.chats.mark_read(&chat);
                 return store_task(&self.store, move |s| s.set_unread(&chat, 0));
+            }
+            Event::ChatCleared {
+                chat,
+                keep_starred,
+                upto,
+            } => {
+                let chat = self.lid_map.normalize(&chat);
+                return self.apply_clear(chat, keep_starred, upto);
+            }
+            Event::ChatDeleted { chat, upto } => {
+                let chat = self.lid_map.normalize(&chat);
+                return self.apply_delete(chat, upto);
             }
             Event::Call(signal) => return self.on_call_signal(signal),
             Event::LidMappings(pairs) => {
@@ -2252,8 +2290,7 @@ impl App {
                 .iter()
                 .filter(|m| fresh.contains(&m.id))
                 .filter(|m| {
-                    let muted = self.settings.muted
-                        || self.chats.get(&m.chat).is_some_and(|e| e.meta.muted);
+                    let muted = self.settings.muted || self.is_muted(&m.chat);
                     state::should_notify(m, open_chat.as_deref(), self.focused, muted)
                 })
                 .collect();
@@ -2535,6 +2572,7 @@ impl App {
                 error,
             } => return self.on_member_failed(list, chat, undo, error),
             Done::Nav(d) => return self.on_nav_done(*d),
+            Done::ChatAct(d) => return self.on_chat_act_done(d),
             Done::Call(d) => return self.on_call_done(d),
             Done::Stored(Ok(())) | Done::Nothing => {}
             Done::Resync { attempt, result } => return self.on_resync(attempt, result),

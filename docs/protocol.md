@@ -66,6 +66,8 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `LabelEditUpdate` (app-state `label_edit`) | `ListEdit` | list created / renamed / deleted |
 | `LabelAssociationUpdate` (`label_jid`) | `ListChat` | chat added to / removed from a list |
 | `MarkChatAsReadUpdate` | `ChatRead` (read) / `ChatMarkedUnread` | badge cleared / one unread |
+| `ClearChatUpdate` (app-state `clearChat`) | `ChatCleared { keep_starred, upto }` | messages up to the action's `messageRange` removed (starred kept when asked), the chat stays; newer messages survive a replayed action |
+| `DeleteChatUpdate` (app-state `deleteChat`) | `ChatDeleted { upto }` | chat and messages up to `messageRange` removed, closed if open; a chat with newer messages stays |
 | `IncomingCall`, `MissedCall`, `CallEndedElsewhere` | `Call(CallSignal)` | call panel, ringtone, call bubbles (§8) |
 
 Reactions, edits and "delete for me" events wait until the message batch that
@@ -131,7 +133,10 @@ click jumps to the original, loading the cache around it when needed.
 | Group info drawer | `groups().get_metadata` (description, participants with admin type) | when the drawer opens |
 | Groups in common | `groups().get_participating`, filtered by the contact's PN / LID | when the drawer opens |
 | Block / unblock | `blocking().block / unblock`, `blocking().is_blocked` | after a confirmation in the drawer |
-| Mute / unmute | `chat_actions().mute_chat` (indefinite) / `unmute_chat` | optimistic, reverted on failure; mute durations other than "always" are not offered yet |
+| Mute / unmute | `chat_actions().mute_chat_until` (8 hours, 1 week) / `mute_chat` (always) / `unmute_chat` | optimistic, reverted on failure; the end is kept (`chats.mute_end`, schema 7, Unix seconds, `-1` = always) and a timed mute ends on its own. Sync actions carry the end in milliseconds |
+| Mark as read / unread | `chat_actions().mark_chat_as_read` with the newest message as `messageRange` | optimistic, reverted on failure; reading a chat that was marked unread by hand (here or on the phone, since start-up) also sends `read = true` |
+| Clear chat | `chat_actions().clear_chat(deleteStarred = !keep, deleteMedia = false)` | asks first ("Keep starred messages" ticked by default); sent first, applied here once the phone has it |
+| Delete chat | `chat_actions().delete_chat(deleteMedia = false)` | asks first; sent first, applied once the phone has it; list memberships are left to the phone |
 | Sticker | `upload(MediaType::Sticker)` + `stickerMessage` | §2.5 |
 | GIF | `upload(MediaType::Video)` + `videoMessage { gifPlayback: true, gifAttribution }` | §2.5 |
 
@@ -515,15 +520,15 @@ decodes in-process (memory cannot be given back by closing the viewer).
   normalised to the PN JID. A LID seen before any mapping is learned still
   forms its own chat until the pair arrives (existing rows are not merged
   retroactively).
-* Group "read" ticks turn blue on the first participant's read receipt
-  (WhatsApp waits for all participants).
 * Videos that arrive without `jpegThumbnail` (seen on history-synced media;
   the library's default `HistorySyncConfig` does not ask for
   `thumbnailSyncDaysLimit`) get a poster frame from the helper when they are
   at most 16 MB; bigger ones keep the placeholder until played.
 * The info drawer has no "disappearing messages", encryption code,
   "report" or "exit group" actions, and media visibility / per-chat
-  wallpaper are not offered; mute is "always" only.
+  wallpaper are not offered.
+* "Mark as read" from the chat menu syncs the read state to the other
+  devices but sends no read receipts to the sender.
 * Windows and macOS have no tray yet (stub): closing the window quits.
 * On Wayland the compositor may refuse to focus a window that is shown from
   the tray or a notification (xdg-activation); it then appears without focus.
