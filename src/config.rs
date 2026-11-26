@@ -81,6 +81,11 @@ pub enum ScreenshotTarget {
     Call,
     /// A call in progress.
     CallActive,
+    /// The drawer's Stickers tab (favourite and recent stickers) over a
+    /// chat with an animated sticker and a GIF.
+    Stickers,
+    /// The drawer's GIF tab with (mock) GIPHY results.
+    Gifs,
 }
 
 impl ScreenshotTarget {
@@ -161,6 +166,8 @@ impl ScreenshotTarget {
             "update-settings" => Some(Self::UpdateSettings),
             "call" | "call-incoming" => Some(Self::Call),
             "call-active" => Some(Self::CallActive),
+            "stickers" => Some(Self::Stickers),
+            "gifs" | "gif" => Some(Self::Gifs),
             _ => None,
         }
     }
@@ -219,7 +226,7 @@ pub const USAGE: &str = "\
 ferrochat - unofficial native WhatsApp desktop client
 
 USAGE:
-    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|archived|lists|chat-menu|video|status|status-viewer|communities|new-chat|new-group|new-group-name|starred|header-menu|paste|update-banner|update-settings> <out.png>]
+    ferrochat [--mock] [--minimized] [--screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|settings|archived|lists|chat-menu|video|status|status-viewer|communities|new-chat|new-group|new-group-name|starred|header-menu|paste|emoji|stickers|gifs|update-banner|update-settings> <out.png>]
 
 OPTIONS:
     --mock                      Run with mock data and a fake protocol (no network)
@@ -237,6 +244,7 @@ ENVIRONMENT:
     FERROCHAT_NOTIFY=sender     Notifications show the sender only
     FERRO_RELEASE_API           Override the update check URL (testing)
     FERRO_UPDATE_FORCE=1        Check for updates even in debug/mock runs
+    FERRO_GIPHY_API             Point GIF search at a loopback test server
 ";
 
 impl Config {

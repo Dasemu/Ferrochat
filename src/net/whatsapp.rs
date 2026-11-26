@@ -31,8 +31,7 @@ use super::convert::{self, Envelope, Uploaded};
 use super::social::{CommunityInfo, PhoneLookup};
 use super::types::{
     ChatState, CollectionResync, ContactInfo, Content, GroupInfo, ListDef, MUTE_OFF, MediaKind,
-    MediaRef, Message, MsgKey, NameSource, Origin, OutgoingKind, OutgoingMedia, Quote,
-    ResyncReport,
+    MediaRef, Message, MsgKey, NameSource, Origin, OutgoingMedia, Quote, ResyncReport,
 };
 use super::{Connection, Event, WaClient};
 use crate::auth::secrets::{SecretStore, get_signal_store_key, signal_store_key};
@@ -54,6 +53,40 @@ pub struct RealClient {
 }
 
 /// How long the fetched "read receipts" privacy value is trusted.
+/// Media / CDN HTTP timeouts. ureq's defaults have none: a stalled
+/// connection (a pooled socket that died during suspend, a CDN edge that
+/// stops sending) blocked a download, and its slot, until the kernel gave
+/// up on the TCP connection, many minutes later. Per-read / per-write
+/// timeouts restart on progress, so big files on slow links still work.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+const HTTP_IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The library's ureq client with an agent that has timeouts (same buffer
+/// and pool sizes as its default agent; the proxy still comes from the
+/// environment).
+fn http_client() -> whatsapp_rust::http::UreqHttpClient {
+    whatsapp_rust::http::UreqHttpClient::with_agent(http_agent(
+        HTTP_CONNECT_TIMEOUT,
+        HTTP_IO_TIMEOUT,
+    ))
+}
+
+fn http_agent(connect: std::time::Duration, io: std::time::Duration) -> ureq::Agent {
+    ureq::Agent::config_builder()
+        .input_buffer_size(16 * 1024)
+        .output_buffer_size(16 * 1024)
+        .max_idle_connections(3)
+        .max_idle_connections_per_host(2)
+        .timeout_resolve(Some(connect))
+        .timeout_connect(Some(connect))
+        .timeout_send_request(Some(io))
+        .timeout_recv_response(Some(io))
+        .timeout_per_read(Some(io))
+        .timeout_per_write(Some(io))
+        .build()
+        .new_agent()
+}
+
 const PRIVACY_TTL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 impl RealClient {
@@ -153,12 +186,8 @@ impl WaClient for RealClient {
     ) -> BoxFuture<'a, Result<Content>> {
         Box::pin(async move {
             let jid = parse_jid(chat)?;
-            let mt = match media.kind {
-                OutgoingKind::Image { .. } => MediaType::Image,
-                OutgoingKind::Document => MediaType::Document,
-                OutgoingKind::Video { .. } => MediaType::Video,
-                OutgoingKind::Voice { .. } => MediaType::Audio,
-            };
+            // Stickers upload as `MediaType::Sticker`, GIFs as video.
+            let mt = media_type(media.kind.media_kind());
             let up = self
                 .client
                 .upload(media.bytes.clone(), mt, UploadOptions::default())
@@ -1145,6 +1174,7 @@ async fn run(
     let bot = Bot::builder()
         .with_backend(store)
         .with_device_props(device_props())
+        .with_http_client(http_client())
         .with_event_handler(Forwarder {
             tx: wa_tx,
             contacts_seen: contacts_seen.clone(),
@@ -1536,5 +1566,50 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
             None => vec![],
         },
         _ => vec![],
+    }
+}
+
+#[cfg(test)]
+mod http_tests {
+    use std::time::{Duration, Instant};
+
+    use whatsapp_rust::wacore::net::HttpClient;
+
+    /// A CDN edge that accepts the connection and never answers.
+    fn silent_server() -> (std::net::TcpListener, String) {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/mms/image/x", l.local_addr().unwrap());
+        (l, url)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_cdn_fails_fast_instead_of_holding_the_slot() {
+        let (_l, url) = silent_server();
+        let client = whatsapp_rust::http::UreqHttpClient::with_agent(super::http_agent(
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+        ));
+        let t = Instant::now();
+        let r = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.execute(whatsapp_rust::wacore::net::HttpRequest::get(url)),
+        )
+        .await
+        .expect("our agent gives up by itself");
+        assert!(r.is_err());
+        assert!(t.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_library_default_agent_waits_forever_on_a_silent_cdn() {
+        // Why `http_client` exists: the default ureq agent has no timeouts.
+        let (_l, url) = silent_server();
+        let client = whatsapp_rust::http::UreqHttpClient::new();
+        let r = tokio::time::timeout(
+            Duration::from_secs(2),
+            client.execute(whatsapp_rust::wacore::net::HttpRequest::get(url)),
+        )
+        .await;
+        assert!(r.is_err(), "still waiting after 2 s");
     }
 }

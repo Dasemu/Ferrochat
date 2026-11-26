@@ -8,9 +8,9 @@ use whatsapp_rust::waproto::whatsapp as wa;
 
 use super::Event;
 use super::types::{
-    ChatFlag, ChatMeta, Content, LinkPreview, ListDef, ListKind, MUTE_FOREVER, MUTE_OFF, MediaKind,
-    MediaRef, Message, MsgKey, NameSource, OutgoingKind, OutgoingMedia, QUOTE_PREVIEW_MAX, Quote,
-    Reaction, ReceiptStatus, mute_active,
+    ChatFlag, ChatMeta, Content, GifSource, LinkPreview, ListDef, ListKind, MUTE_FOREVER, MUTE_OFF,
+    MediaKind, MediaRef, Message, MsgKey, NameSource, OutgoingKind, OutgoingMedia,
+    QUOTE_PREVIEW_MAX, Quote, Reaction, ReceiptStatus, mute_active,
 };
 
 /// Unwraps ephemeral / view-once / edited / caption wrappers (up to a few
@@ -177,11 +177,11 @@ pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
         };
     }
     if let Some(v) = m.video_message.as_option() {
-        return Some(video_content(v));
+        return Some(video_content(v, v.gif_playback.unwrap_or(false)));
     }
     if let Some(v) = m.ptv_message.as_option() {
         // Round "video notes" travel as a video message.
-        return Some(video_content(v));
+        return Some(video_content(v, false));
     }
     if let Some(st) = m.sticker_message.as_option() {
         return Some(Content::Sticker {
@@ -214,7 +214,7 @@ pub fn content_from_wa(msg: &wa::Message) -> Option<Content> {
     None
 }
 
-fn video_content(v: &wa::message::VideoMessage) -> Content {
+fn video_content(v: &wa::message::VideoMessage, gif: bool) -> Content {
     Content::Video {
         caption: non_empty(v.caption.as_ref()),
         seconds: v.seconds.unwrap_or_default(),
@@ -230,7 +230,7 @@ fn video_content(v: &wa::message::VideoMessage) -> Content {
             v.file_length,
             v.mimetype.as_ref(),
         ),
-        gif: v.gif_playback.unwrap_or_default(),
+        gif,
     }
 }
 
@@ -1138,12 +1138,7 @@ pub struct Uploaded {
 
 /// Builds the protobuf for uploaded media plus the matching local content.
 pub fn build_media(media: &OutgoingMedia, up: &Uploaded) -> (wa::Message, Content) {
-    let kind = match media.kind {
-        OutgoingKind::Image { .. } => MediaKind::Image,
-        OutgoingKind::Document => MediaKind::Document,
-        OutgoingKind::Video { .. } => MediaKind::Video,
-        OutgoingKind::Voice { .. } => MediaKind::Audio,
-    };
+    let kind = media.kind.media_kind();
     let mref = MediaRef {
         direct_path: up.direct_path.clone(),
         media_key: up.media_key.clone(),
@@ -1199,7 +1194,6 @@ pub fn build_media(media: &OutgoingMedia, up: &Uploaded) -> (wa::Message, Conten
             width,
             height,
             thumbnail,
-            gif,
         } => wa::Message {
             video_message: buffa_some(wa::message::VideoMessage {
                 url: Some(up.url.clone()),
@@ -1216,7 +1210,6 @@ pub fn build_media(media: &OutgoingMedia, up: &Uploaded) -> (wa::Message, Conten
                 media_key_timestamp: Some(up.media_key_timestamp),
                 jpeg_thumbnail: Some(thumbnail.clone()),
                 streaming_sidecar: up.streaming_sidecar.clone(),
-                gif_playback: gif.then_some(true),
                 ..Default::default()
             }),
             ..Default::default()
@@ -1239,8 +1232,66 @@ pub fn build_media(media: &OutgoingMedia, up: &Uploaded) -> (wa::Message, Conten
             }),
             ..Default::default()
         },
+        OutgoingKind::Sticker {
+            width,
+            height,
+            animated,
+        } => wa::Message {
+            sticker_message: buffa_some(wa::message::StickerMessage {
+                url: Some(up.url.clone()),
+                mimetype: Some(media.mimetype.clone()),
+                file_sha256: Some(up.file_sha256.clone()),
+                file_enc_sha256: Some(up.file_enc_sha256.clone()),
+                media_key: Some(up.media_key.clone()),
+                direct_path: Some(up.direct_path.clone()),
+                file_length: Some(up.file_length),
+                media_key_timestamp: Some(up.media_key_timestamp),
+                width: Some(*width),
+                height: Some(*height),
+                is_animated: Some(*animated),
+                sticker_sent_ts: Some(up.media_key_timestamp.saturating_mul(1000)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        OutgoingKind::Gif {
+            width,
+            height,
+            seconds,
+            thumbnail,
+            source,
+        } => wa::Message {
+            video_message: buffa_some(wa::message::VideoMessage {
+                url: Some(up.url.clone()),
+                mimetype: Some(media.mimetype.clone()),
+                caption: media.caption.clone(),
+                file_sha256: Some(up.file_sha256.clone()),
+                file_length: Some(up.file_length),
+                seconds: Some(*seconds),
+                media_key: Some(up.media_key.clone()),
+                gif_playback: Some(true),
+                height: Some(*height),
+                width: Some(*width),
+                file_enc_sha256: Some(up.file_enc_sha256.clone()),
+                direct_path: Some(up.direct_path.clone()),
+                media_key_timestamp: Some(up.media_key_timestamp),
+                jpeg_thumbnail: Some(thumbnail.clone()),
+                streaming_sidecar: up.streaming_sidecar.clone(),
+                gif_attribution: Some(gif_attribution(*source)),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
     };
     (msg, content)
+}
+
+fn gif_attribution(source: GifSource) -> wa::message::video_message::Attribution {
+    use wa::message::video_message::Attribution;
+    match source {
+        GifSource::None => Attribution::NONE,
+        GifSource::Giphy => Attribution::GIPHY,
+    }
 }
 
 fn buffa_some<T: Default>(v: T) -> whatsapp_rust::waproto::buffa::MessageField<T> {
@@ -1557,12 +1608,21 @@ mod tests {
         };
         for gif in [false, true] {
             let media = OutgoingMedia {
-                kind: OutgoingKind::Video {
-                    seconds: 4,
-                    width: 640,
-                    height: 360,
-                    thumbnail: vec![5, 5],
-                    gif,
+                kind: if gif {
+                    OutgoingKind::Gif {
+                        width: 640,
+                        height: 360,
+                        seconds: 4,
+                        thumbnail: vec![5, 5],
+                        source: GifSource::None,
+                    }
+                } else {
+                    OutgoingKind::Video {
+                        seconds: 4,
+                        width: 640,
+                        height: 360,
+                        thumbnail: vec![5, 5],
+                    }
                 },
                 bytes: vec![0; 9],
                 file_name: "clip.mp4".into(),

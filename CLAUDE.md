@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|chat-menu|mute|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|attach-video|attach-gif|drop|update-banner|update-settings|emoji|viewer|info|group-info> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|attach-video|attach-gif|drop|header-menu|chat-menu|mute|update-banner|update-settings|emoji|stickers|gifs|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -105,20 +105,25 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   `readreceipts` privacy setting. All Status / panel / star / logout actions
   are `Ui::Nav(NavMsg)` handled in `app/nav.rs`; leaving the status viewer
   must clear `App::video`.
-- Paste-to-send (`app/paste.rs`): Ctrl+V / Shift+Insert is seen by the
-  global event listener while the composer's `text_input` pastes text on
-  its own. `arboard` (with `wayland-data-control`, or Wayland reads fail)
-  is read in `spawn_blocking`, and only when `operation::is_focused(COMPOSER_ID)`.
-  Order: file list > `file://`-only text > any text (stays a text paste) >
-  image. File managers also paste the paths as text: `strip_pasted_paths`
-  removes them. Picked and pasted media both go through `AttachPreview`;
-  its image handle is made in `update`.
-- Sending video / GIF (`app/paste.rs`): `.mp4`/`.m4v` (and `.gif`, converted first) are staged as documents, then
-  `paste::finish_videos` runs the helper (`media::video::probe`, muted; `gif_to_mp4` = `ferrochat-player
-  --gif-to-mp4`) as a child process, never on the blocking pool; a failure keeps the document. All file
-  sources (paperclip, paste, drop) go through `paste::stage_paths` / `finish_videos`. The GIF encoder lives
-  in `src/bin/ferrochat-player/gif.rs` (OpenH264 encoder + `mp4` writer): the main binary still links no codec.
-  `Content::Video::gif` is `#[serde(default)]` (old rows = plain video); GIFs loop in the viewer (`VideoView::looping`).
+- Paste-to-send (`app/paste.rs`): Ctrl+V / Shift+Insert is seen by the global listener
+  (`app::runtime_event`, matched even when CAPTURED: the composer `text_editor` captures the key
+  and pastes text itself). `arboard` (with `wayland-data-control`, or Wayland reads fail) is read
+  in `spawn_blocking` through `App::read_clipboard` (swapped in tests), only when
+  `operation::is_focused(COMPOSER_ID)`. Order: file list > `file://`-only text > text that only
+  names the image (one URL / `<img>`-only markup: browsers' "Copy image"; arboard's Wayland
+  `text()` also returns `text/html`) gives the image and `strip_pasted_text` removes the URL the
+  editor pasted > any other text (stays a text paste) > image. File managers also paste the
+  paths as text: `strip_pasted_paths` removes them. Picked and pasted media both go through
+  `AttachPreview`; its image handle is made in `update`. Widget-tree test: `app/paste_flows.rs`.
+- Never set a blurred `Shadow` (iced 0.14 tiny-skia draws it outside the damage clip and only
+  damages the quad: popups dimmed themselves and left halos on hover). Floating menus use
+  `theme::popup` + `theme::menu_item`; `theme::tests::no_blurred_shadows` guards it.
+- Sending video / GIF from files (`app/paste.rs`): `.mp4`/`.m4v` (and `.gif`, converted first) are staged as
+  documents, then `paste::finish_videos` runs the helper (`media::video::probe`, muted; `media::video::gif_to_mp4`
+  = the helper's `--gif-to-mp4`, the same encoder as the drawer's `gifv::encode_gif_with`) as a child process,
+  never on the blocking pool; a failure keeps the document. MP4s go as `OutgoingKind::Video`, GIFs as
+  `OutgoingKind::Gif` (like the drawer). All file sources (paperclip, paste, drop) go through
+  `paste::stage_paths` / `finish_videos`. GIFs also loop in the viewer (`VideoView::looping`).
 - Drag and drop (`app/drop.rs`): one `FileDropped` per file, gathered for `drop::GATHER` and staged together;
   the overlay follows `FileHovered` / `FilesHoveredLeft`. winit 0.30 has no drag and drop on native Wayland
   (works on X11 / XWayland, Windows, macOS).
@@ -157,3 +162,18 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   which needs the stored offer (`net::call::CallBook`). State machine: `call::Calls` (pure,
   tested); app glue `app/call.rs`. Video calls are NOT implemented: the video button must keep
   saying so. `--mock`/tests open no audio device. Each call is logged once (`call-<id>` bubble).
+- Photos (`app/pictures.rs`, `media/picture.rs`, protocol §2): bubbles get RGBA previews (<= 660 px) decoded in a
+  worker, never `Handle::from_bytes` of the full file (iced decodes that on the UI thread at full size on every
+  draw-cache miss). Order: disk cache (`previews/`) > network; on-screen photos (`Done::Visible`, a debounced
+  widget operation) jump the queue. Own sends are previewed from the file under `pictures::key_of` (= upload
+  `file_sha256`): never download them back. `images` holds previews, so the viewer / "Save as" use
+  `viewer_handle` (original bytes). Failures retry twice, then "Retry". The ureq agent MUST keep timeouts
+  (`net/whatsapp.rs::http_agent`): the default has none and a dead socket held a download slot for minutes.
+  Spinner (`ui::spinner`) animates itself only while visible. Tests: `app/image_flows.rs`.
+- Stickers / GIFs (`app/picker.rs`, protocol §2.5): animations are `app::anim::Anim`s drawn by
+  `ui::anim_image` (self-playing, redraws only its own due frames, only visible + focused): never tick
+  the app for them. GIF bubbles are decoded by the helper's `--frames` mode and `.gif` files converted by
+  `--gif-to-mp4` (codecs stay in the helper). Shelf keys are hex SHA-256 = `MediaRef::cache_key`. Drawer
+  tiles are freed on close (`release_picker`). Sticker favourites are LOCAL: whatsapp-rust 0.7 drops the
+  phone's `favoriteSticker` mutations; never write that app state. GIF search = the user's own GIPHY key
+  (keyring `giphy-api-key`), never WhatsApp's Tenor key; network on detached threads (`media::detached`).

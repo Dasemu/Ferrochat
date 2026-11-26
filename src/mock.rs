@@ -3,6 +3,7 @@
 //! All names, numbers and messages are invented. Media is generated
 //! procedurally (no external files).
 
+use sha2::Digest;
 use std::collections::HashMap;
 use std::io::Cursor;
 
@@ -74,29 +75,30 @@ pub fn group_description(jid: &str) -> &'static str {
     }
 }
 
+fn hsv(h: f32, s: f32, v: f32) -> [u8; 3] {
+    let c = v * s;
+    let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match (h / 60.0) as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    [
+        ((r + m) * 255.0) as u8,
+        ((g + m) * 255.0) as u8,
+        ((b + m) * 255.0) as u8,
+    ]
+}
+
 /// A procedurally drawn portrait-like avatar (original artwork): a coloured
 /// disc background with a head and shoulders silhouette.
 pub fn avatar_png(seed: u32, group: bool) -> Vec<u8> {
     let side = 160u32;
     let hue = (seed.wrapping_mul(2_654_435_761) >> 8) % 360;
-    let hsv = |h: f32, s: f32, v: f32| -> [u8; 3] {
-        let c = v * s;
-        let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());
-        let m = v - c;
-        let (r, g, b) = match (h / 60.0) as u32 {
-            0 => (c, x, 0.0),
-            1 => (x, c, 0.0),
-            2 => (0.0, c, x),
-            3 => (0.0, x, c),
-            4 => (x, 0.0, c),
-            _ => (c, 0.0, x),
-        };
-        [
-            ((r + m) * 255.0) as u8,
-            ((g + m) * 255.0) as u8,
-            ((b + m) * 255.0) as u8,
-        ]
-    };
     let h = hue as f32;
     let img = image::RgbImage::from_fn(side, side, |x, y| {
         let (fx, fy) = (x as f32 / side as f32, y as f32 / side as f32);
@@ -151,11 +153,127 @@ pub fn sticker_webp() -> Vec<u8> {
     out
 }
 
+/// Wraps RGBA frames into an animated lossless WebP. `image` has no
+/// animated WebP encoder, so the frames are encoded one by one and put in
+/// the `VP8X` / `ANIM` / `ANMF` container by hand.
+pub fn animated_webp(frames: &[image::RgbaImage], delays_ms: &[u32]) -> Vec<u8> {
+    use image::ImageEncoder;
+    fn chunk(out: &mut Vec<u8>, tag: &[u8; 4], body: &[u8]) {
+        out.extend_from_slice(tag);
+        out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        out.extend_from_slice(body);
+        if body.len() % 2 == 1 {
+            out.push(0);
+        }
+    }
+    fn u24(v: u32) -> [u8; 3] {
+        let b = v.to_le_bytes();
+        [b[0], b[1], b[2]]
+    }
+    let (w, h) = frames.first().map_or((1, 1), |f| f.dimensions());
+    let mut body = Vec::new();
+    let mut vp8x = vec![0x12u8, 0, 0, 0]; // animation + alpha
+    vp8x.extend_from_slice(&u24(w - 1));
+    vp8x.extend_from_slice(&u24(h - 1));
+    chunk(&mut body, b"VP8X", &vp8x);
+    chunk(&mut body, b"ANIM", &[0, 0, 0, 0, 0, 0]);
+    for (i, img) in frames.iter().enumerate() {
+        let mut still = Vec::new();
+        let _ = image::codecs::webp::WebPEncoder::new_lossless(&mut still).write_image(
+            img.as_raw(),
+            img.width(),
+            img.height(),
+            image::ExtendedColorType::Rgba8,
+        );
+        // RIFF(12) + the single VP8L chunk of the still picture.
+        let bitstream = still.get(12..).unwrap_or_default();
+        let mut anmf = Vec::new();
+        anmf.extend_from_slice(&u24(0));
+        anmf.extend_from_slice(&u24(0));
+        anmf.extend_from_slice(&u24(img.width() - 1));
+        anmf.extend_from_slice(&u24(img.height() - 1));
+        anmf.extend_from_slice(&u24(delays_ms.get(i).copied().unwrap_or(100)));
+        anmf.push(0x02); // no blending, no disposal
+        anmf.extend_from_slice(bitstream);
+        chunk(&mut body, b"ANMF", &anmf);
+    }
+    let mut out = Vec::with_capacity(body.len() + 12);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&((body.len() + 4) as u32).to_le_bytes());
+    out.extend_from_slice(b"WEBP");
+    out.extend_from_slice(&body);
+    out
+}
+
+/// A procedurally drawn animated sticker (a bouncing, winking smiley) as
+/// an animated WebP (original artwork).
+pub fn animated_sticker_webp() -> Vec<u8> {
+    const SIDE: u32 = 192;
+    const FRAMES: u32 = 8;
+    let mut frames = Vec::new();
+    let mut delays = Vec::new();
+    for i in 0..FRAMES {
+        let phase = i as f32 / FRAMES as f32 * std::f32::consts::TAU;
+        let lift = phase.sin().abs() * 0.12;
+        let wink = i == FRAMES / 2;
+        frames.push(image::RgbaImage::from_fn(SIDE, SIDE, |x, y| {
+            let fx = x as f32 / SIDE as f32 - 0.5;
+            let fy = y as f32 / SIDE as f32 - 0.55 + lift;
+            let r = (fx * fx + fy * fy).sqrt();
+            let eye = |ex: f32| ((fx - ex).powi(2) + (fy + 0.1).powi(2)).sqrt() < 0.05;
+            let closed = (fx - 0.14).abs() < 0.06 && (fy + 0.1).abs() < 0.012;
+            let mouth = {
+                let d = (fx * fx + (fy - 0.02) * (fy - 0.02)).sqrt();
+                (0.2..0.25).contains(&d) && fy > 0.06
+            };
+            if r > 0.4 {
+                image::Rgba([0, 0, 0, 0])
+            } else if r > 0.37 {
+                image::Rgba([0xc9, 0x5a, 0x00, 255])
+            } else if eye(-0.14) || (if wink { closed } else { eye(0.14) }) || mouth {
+                image::Rgba([0x4a, 0x2f, 0x00, 255])
+            } else {
+                image::Rgba([0xff, 0x9f, 0x1c, 255])
+            }
+        }));
+        delays.push(if wink { 300 } else { 90 });
+    }
+    animated_webp(&frames, &delays)
+}
+
+/// A small animated "GIF" tile for mock GIF search results: shapes
+/// orbiting on a coloured background (original artwork).
+pub fn gif_tile_webp(seed: u32) -> Vec<u8> {
+    let (w, h) = (120u32, 90u32);
+    let hue = (seed * 47 % 360) as f32;
+    let frames: Vec<image::RgbaImage> = (0..10)
+        .map(|i| {
+            let a = i as f32 / 10.0 * std::f32::consts::TAU;
+            let (cx, cy) = (0.5 + 0.28 * a.cos(), 0.5 + 0.28 * a.sin());
+            let bg = hsv(hue, 0.55, 0.75);
+            let fg = hsv((hue + 180.0) % 360.0, 0.6, 0.98);
+            image::RgbaImage::from_fn(w, h, |x, y| {
+                let fx = x as f32 / w as f32;
+                let fy = y as f32 / h as f32;
+                let d = ((fx - cx) * 1.33).powi(2) + (fy - cy).powi(2);
+                let c = if d < 0.018 { fg } else { bg };
+                image::Rgba([c[0], c[1], c[2], 255])
+            })
+        })
+        .collect();
+    animated_webp(&frames, &[80; 10])
+}
+
+/// The mock clip (an H.264 MP4), used as the GIF in mock mode.
+pub fn gif_clip() -> Vec<u8> {
+    include_bytes!("../assets/mock-clip.mp4").to_vec()
+}
+
 fn media_ref(path: &str, kind: MediaKind, mimetype: &str, bytes: &[u8]) -> MediaRef {
     MediaRef {
         direct_path: path.into(),
         media_key: vec![0x42; 32],
-        file_sha256: path.as_bytes().to_vec(),
+        file_sha256: sha2::Sha256::digest(bytes).to_vec(),
         file_enc_sha256: vec![0; 32],
         file_length: bytes.len() as u64,
         kind,
@@ -425,6 +543,12 @@ pub fn mock_data(now: i64) -> MockData {
     let webp = sticker_webp();
     let sticker_ref = media_ref("/mock/smile.webp", MediaKind::Sticker, "image/webp", &webp);
     media.insert(sticker_ref.direct_path.clone(), webp);
+    let wink = animated_sticker_webp();
+    let wink_ref = media_ref("/mock/wink.webp", MediaKind::Sticker, "image/webp", &wink);
+    media.insert(wink_ref.direct_path.clone(), wink);
+    let gif = gif_clip();
+    let gif_ref = media_ref("/mock/gif.mp4", MediaKind::Video, "video/mp4", &gif);
+    media.insert(gif_ref.direct_path.clone(), gif);
 
     let today = now - now.rem_euclid(86_400) + 9 * 3600;
     let mut b = B {
@@ -563,6 +687,33 @@ pub fn mock_data(now: i64) -> MockData {
             height: 256,
             animated: false,
             media: Some(sticker_ref),
+        },
+        Read,
+    );
+    b.push(
+        lucia,
+        l,
+        now - 1600,
+        Content::Sticker {
+            width: 192,
+            height: 192,
+            animated: true,
+            media: Some(wink_ref),
+        },
+        Read,
+    );
+    b.push(
+        lucia,
+        None,
+        now - 1500,
+        Content::Video {
+            caption: None,
+            seconds: 3,
+            width: 320,
+            height: 180,
+            thumbnail: clip_thumb.clone(),
+            media: Some(gif_ref),
+            gif: true,
         },
         Read,
     );
