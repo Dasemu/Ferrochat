@@ -68,6 +68,7 @@ fn photo(h: &Harness, id: &str, ts: i64, shade: u8) -> ChatMessage {
         edited: false,
         mentions: Vec::new(),
         reactions: Vec::new(),
+        forwarded: None,
     }
 }
 

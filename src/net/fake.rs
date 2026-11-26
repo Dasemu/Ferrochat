@@ -66,6 +66,17 @@ impl Default for FakeOptions {
 /// A recorded outgoing action.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Sent {
+    /// A forwarded message.
+    Forward {
+        /// Target chat.
+        chat: String,
+        /// New id.
+        id: String,
+        /// Id of the forwarded message.
+        source: String,
+        /// The forwarding score sent.
+        score: u32,
+    },
     /// Text.
     Text {
         /// Chat.
@@ -523,6 +534,30 @@ impl FakeClient {
 }
 
 impl WaClient for FakeClient {
+    fn forward<'a>(
+        &'a self,
+        chat: &'a str,
+        id: &'a str,
+        source: &'a Message,
+    ) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            if self.opts.fail_sends {
+                return Err(Error::Net("fake send failure".into()));
+            }
+            if !source.can_forward() {
+                return Err(Error::Protocol("this message can't be forwarded".into()));
+            }
+            self.record(Sent::Forward {
+                chat: chat.into(),
+                id: id.into(),
+                source: source.id.clone(),
+                score: source.forward_score(),
+            });
+            self.schedule_receipts(chat, id);
+            Ok(())
+        })
+    }
+
     fn send_text<'a>(
         &'a self,
         chat: &'a str,
@@ -571,6 +606,7 @@ impl WaClient for FakeClient {
                             expires_at: None,
                             reply: None,
                             edited: false,
+                            forwarded: None,
                             mentions: Vec::new(),
                             reactions: Vec::new(),
                         }],

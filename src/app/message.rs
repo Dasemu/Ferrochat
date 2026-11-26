@@ -299,6 +299,8 @@ pub enum Ui {
     ConfirmDeleteList(String),
     /// Close the list dialog.
     CloseListDialog,
+    /// Forward messages / selection mode.
+    Forward(crate::app::forward::Fwd),
     /// Mark read / unread, mute, clear or delete a chat.
     ChatAct(crate::app::chat_actions::ChatAct),
     /// Open a link from a message in the default browser.
