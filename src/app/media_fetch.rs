@@ -8,7 +8,7 @@
 //! cache right away and parked in [`FreshMedia`]; `App::update` applies it to
 //! the open conversation on its next message ([`App::apply_fresh_media`]).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use crate::error::Error;
@@ -21,6 +21,12 @@ use super::App;
 /// by `(chat, message id)`.
 pub type FreshMedia = Arc<Mutex<HashMap<(String, String), MediaRef>>>;
 
+/// `(chat, message id)` of media the phone said it no longer has
+/// (`Error::MediaGone`): not asked for again this session, so automatic
+/// preview retries and scrolling old history do not send a retry receipt
+/// per attempt.
+pub type GoneMedia = Arc<Mutex<HashSet<(String, String)>>>;
+
 /// What a download needs to ask for a re-upload of its message's media.
 #[derive(Clone)]
 pub struct MediaOrigin {
@@ -32,6 +38,7 @@ pub struct MediaOrigin {
     pub wire: MsgKey,
     store: Store,
     fresh: FreshMedia,
+    gone: GoneMedia,
 }
 
 impl std::fmt::Debug for MediaOrigin {
@@ -75,9 +82,18 @@ pub async fn reupload(
     mref: &MediaRef,
     origin: &MediaOrigin,
 ) -> Result<MediaRef, String> {
+    let key = (origin.chat.clone(), origin.id.clone());
+    if origin.gone.lock().is_ok_and(|g| g.contains(&key)) {
+        return Err(reason(&Error::MediaGone("asked before".into())));
+    }
     tracing::info!(kind = ?mref.kind, "media expired on the CDN, asking for a re-upload");
     let fresh = client.reupload(&origin.wire, mref).await.map_err(|e| {
         tracing::warn!(error = %e, "media re-upload failed");
+        if matches!(e, Error::MediaGone(_))
+            && let Ok(mut g) = origin.gone.lock()
+        {
+            g.insert(key.clone());
+        }
         reason(&e)
     })?;
     if let Ok(mut m) = origin.fresh.lock() {
@@ -111,6 +127,7 @@ impl App {
             },
             store: self.store.clone(),
             fresh: self.fresh_media.clone(),
+            gone: self.gone_media.clone(),
         }
     }
 

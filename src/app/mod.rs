@@ -269,6 +269,8 @@ pub struct App {
     pub(crate) msg_info: Option<msg_info::MsgInfo>,
     /// Re-uploaded media waiting to be applied to the open conversation.
     pub(crate) fresh_media: media_fetch::FreshMedia,
+    /// Media whose re-upload the phone refused (asked once per session).
+    pub(crate) gone_media: media_fetch::GoneMedia,
     /// Reads the system clipboard for paste-to-send (blocking; a fake in
     /// tests).
     pub(crate) read_clipboard: fn() -> paste::Clipboard,
@@ -600,6 +602,7 @@ impl App {
             attach: None,
             drop: drop::DropState::default(),
             fresh_media: Default::default(),
+            gone_media: Default::default(),
             msg_info: None,
             read_clipboard: paste::read_clipboard,
             menu_open: false,

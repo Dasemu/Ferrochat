@@ -186,6 +186,8 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   (`App::media_origin`); on `Error::MediaExpired` (CDN 404/410) it calls `WaClient::reupload`, caches the new ref
   (`Store::set_media_ref`) and parks it in `App::fresh_media`, applied to the open chat at the start of
   `App::update` (`apply_fresh_media`). Forward refreshes media older than `forward::STALE_MEDIA_SECS` first.
+  A message whose re-upload came back `MediaGone` is remembered (`App::gone_media`) and never asked again in
+  the session: preview retries / scrolling must not send a retry receipt per attempt.
 - Message info (`app/msg_info.rs`): receipt times live in `receipt_times` (schema 9), written by
   `App::record_receipt_times` from every `Event::Receipt` (`timestamp` 0 = now); the open panel reloads after
   the write (chained task). Only our messages; it shares the right slot with the info drawer (one at a time).

@@ -118,7 +118,18 @@ async fn media_nobody_has_any_more_stays_a_placeholder() {
         .cache_key();
     assert!(!h.app.images.contains(&key));
     assert_eq!(open_path(&h, &id), path);
-    assert!(h.app.pictures.downloading.is_empty(), "the slot is free again");
+    assert!(
+        h.app.pictures.downloading.is_empty(),
+        "the slot is free again"
+    );
+    // Asked once per session: a later attempt (preview retry, scrolling
+    // back) does not send another retry receipt.
+    h.fake.expire_media(&path, true);
+    let t = h
+        .app
+        .request_media(&id, crate::media::MAX_IMAGE_PIXELS, true);
+    h.pump(t).await;
+    assert_eq!(reuploads(&h), 1);
 }
 
 #[tokio::test]
