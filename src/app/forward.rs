@@ -302,7 +302,7 @@ impl App {
     /// Shows and stores the local copies of a forward.
     fn add_forwarded(&mut self, locals: Vec<ChatMessage>) -> Task<Message> {
         self.chats.apply_messages(&locals, None, true, None);
-        self.index_thumbs(&locals);
+        let thumbs = self.index_thumbs(&locals);
         let mut snap = Task::none();
         if let Some(c) = &mut self.open
             && locals.iter().any(|m| m.chat == c.chat)
@@ -318,6 +318,7 @@ impl App {
         }
         Task::batch([
             store_task(&self.store, move |s| s.insert_messages(&locals).map(|_| ())),
+            thumbs,
             snap,
         ])
     }

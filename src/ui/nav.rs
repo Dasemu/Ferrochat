@@ -948,15 +948,7 @@ pub fn logout_dialog(app: &App) -> Option<El<'_>> {
     )
     .padding(24)
     .width(400)
-    .style(move |th: &iced::Theme| {
-        let mut s = theme::rounded(p.bg_elevated, 12.0)(th);
-        s.shadow = iced::Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-            offset: iced::Vector::new(0.0, 4.0),
-            blur_radius: 24.0,
-        };
-        s
-    });
+    .style(theme::rounded(p.bg_elevated, 12.0));
     Some(opaque(
         mouse_area(
             container(card)

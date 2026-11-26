@@ -7,6 +7,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Color, ContentFit, Length};
 
+use super::anim_image::anim_image;
 use super::emoji_font::{emoji_font, emoji_text};
 use super::icons::Icon;
 use super::theme::{self, FerroTheme, INTER_MEDIUM};
@@ -16,6 +17,7 @@ use super::{
 use crate::app::composer;
 use crate::app::forward::Fwd;
 use crate::app::live::typing_label;
+use crate::app::picker::PickerUi;
 use crate::app::state::{Conversation, reaction_summary};
 use crate::app::{
     ATTACH_CAPTION_ID, App, CHAT_SEARCH_ID, COMPOSER_ID, CONVERSATION_SCROLL, Dialog, Message,
@@ -375,7 +377,11 @@ fn popup_layer<'a>(
             let items = 6
                 + usize::from(msg.can_forward())
                 + usize::from(msg.can_edit(now))
-                + usize::from(matches!(msg.content, Content::Video { .. }));
+                + usize::from(matches!(msg.content, Content::Video { .. }))
+                + usize::from(matches!(
+                    msg.content,
+                    Content::Sticker { media: Some(_), .. }
+                ));
             (message_menu(app, msg), 12.0 + 38.0 * items as f32)
         }
     };
@@ -892,11 +898,12 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             ..
         } => {
             let (w, h) = fit(*width, *height, 330.0, 330.0);
-            let handle = media
-                .as_ref()
-                .and_then(|r| app.images.peek(&r.cache_key()))
-                .or_else(|| app.thumbs.get(&msg.id))
-                .cloned();
+            let _ = media;
+            let key = app.image_key(msg);
+            let full = key.as_ref().and_then(|k| app.images.peek(k));
+            // The display-sized preview, else the blurred inline thumbnail
+            // (scaled smoothly) while it loads.
+            let handle = full.or_else(|| app.thumbs.get(&msg.id)).cloned();
             let pic: El<'a> = match handle {
                 Some(handle) => cover(
                     image(handle)
@@ -912,6 +919,41 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                     .center_y(h)
                     .style(theme::rounded(p.inset_in, 6.0))
                     .into(),
+            };
+            // A spinner when the download takes a while, "Retry" when it
+            // failed. Always the same size: the overlay never moves layout.
+            let overlay: Option<El<'a>> = match (full, &key) {
+                (None, Some(k)) if app.download_failed(k) => Some(
+                    button(
+                        row![
+                            icon(Icon::RotateCcw, 16.0, Color::WHITE),
+                            text("Retry").size(m.text).color(Color::WHITE),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([7, 14])
+                    .style(theme::overlay_pill)
+                    .on_press(Message::Ui(Ui::RetryImage(msg.id.clone())))
+                    .into(),
+                ),
+                (None, Some(k)) => app.download_since(k).map(|since| {
+                    super::spinner::spinner(
+                        since,
+                        crate::app::pictures::SPINNER_DELAY,
+                        40.0,
+                        Color::WHITE,
+                    )
+                    .into()
+                }),
+                _ => None,
+            };
+            let pic: El<'a> = match overlay {
+                Some(o) => iced::widget::stack![pic, container(o).center(Length::Fill)]
+                    .width(w)
+                    .height(h)
+                    .into(),
+                None => pic,
             };
             let pic = button(pic)
                 .padding(0)
@@ -1000,6 +1042,70 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
         }
         Content::Video {
             caption,
+            width,
+            height,
+            media,
+            gif: true,
+            ..
+        } => {
+            let (w, h) = fit(*width, *height, 330.0, 330.0);
+            let anim = media.as_ref().and_then(|r| app.anims.peek(&r.cache_key()));
+            let shade = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+            let pic: El<'a> = match (anim, app.thumbs.get(&msg.id)) {
+                // Plays muted and looped by itself, like the official client.
+                (Some(a), _) => anim_image(a.clone(), app.anim_epoch, app.media_playing(), w, h)
+                    .content_fit(ContentFit::Contain)
+                    .into(),
+                (None, Some(handle)) => cover(
+                    image(handle.clone())
+                        .width(w)
+                        .height(h)
+                        .content_fit(ContentFit::Contain)
+                        .border_radius(6.0),
+                ),
+                (None, None) => container(icon(Icon::Video, 40.0, p.text_secondary))
+                    .width(w)
+                    .height(h)
+                    .center_x(w)
+                    .center_y(h)
+                    .style(theme::rounded(p.inset_in, 6.0))
+                    .into(),
+            };
+            let badge: El<'a> = if anim.is_some() {
+                container(text("GIF").size(11).font(INTER_MEDIUM).color(Color::WHITE))
+                    .padding([1, 6])
+                    .style(theme::rounded(shade, 4.0))
+                    .into()
+            } else {
+                // Not decoded yet: the round "GIF" button of the official client.
+                container(text("GIF").size(15).font(INTER_MEDIUM).color(Color::WHITE))
+                    .center_x(48)
+                    .center_y(48)
+                    .style(theme::rounded(shade, 24.0))
+                    .into()
+            };
+            let badge = if anim.is_some() {
+                container(badge)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .align_y(Alignment::End)
+                    .padding(6)
+            } else {
+                container(badge).center(Length::Fill)
+            };
+            let layered = iced::widget::stack![pic, badge].width(w).height(h);
+            let card = button(layered)
+                .padding(0)
+                .style(theme::flat_button(fg))
+                .on_press(Message::Ui(Ui::OpenVideo(msg.id.clone())));
+            let mut c = column![card].spacing(4).width(w);
+            if let Some(cap) = caption {
+                c = c.push(message_text(app, msg, cap, fg));
+            }
+            c.push(container(meta_row(t, msg)).align_right(Length::Fill)).into()
+        }
+        Content::Video {
+            caption,
             seconds,
             width,
             height,
@@ -1065,16 +1171,20 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
         } => {
             let (w, h) = fit(*width, *height, 170.0, 170.0);
             let (w, h) = (w.min(170.0), h.min(170.0));
-            let sticker: El<'a> = match media
-                .as_ref()
-                .and_then(|r| app.images.peek(&r.cache_key()))
-            {
-                Some(handle) => image(handle.clone())
+            let key = media.as_ref().map(|r| r.cache_key());
+            let anim = key.as_ref().and_then(|k| app.anims.peek(k));
+            let still = key.as_ref().and_then(|k| app.images.peek(k));
+            let sticker: El<'a> = match (anim, still) {
+                // Animated stickers play by themselves (no app tick).
+                (Some(a), _) => anim_image(a.clone(), app.anim_epoch, app.media_playing(), w, h)
+                    .content_fit(ContentFit::Contain)
+                    .into(),
+                (None, Some(handle)) => image(handle.clone())
                     .width(w)
                     .height(h)
                     .content_fit(ContentFit::Contain)
                     .into(),
-                None => container(icon(Icon::Smile, 44.0, p.text_secondary))
+                (None, None) => container(icon(Icon::Smile, 44.0, p.text_secondary))
                     .width(w)
                     .height(h)
                     .center_x(w)
@@ -1318,7 +1428,6 @@ fn hover_actions<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
 /// Six quick reactions.
 fn reaction_picker<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     let t = &app.theme;
-    let p = t.palette;
     let mine = app
         .own_jid
         .as_deref()
@@ -1339,15 +1448,7 @@ fn reaction_picker<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     .align_y(Alignment::Center);
     container(row_el)
         .padding([4, 8])
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 26.0)(th);
-            s.shadow = iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 8.0,
-            };
-            s
-        })
+        .style(theme::popup(t, 26.0))
         .into()
 }
 
@@ -1367,7 +1468,7 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
         )
         .width(Length::Fill)
         .padding([9, 18])
-        .style(theme::chat_row(t, false))
+        .style(theme::menu_item(t))
         .on_press(Message::Ui(on))
         .into()
     };
@@ -1392,6 +1493,14 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
         if starred { "Unstar" } else { "Star" },
         Ui::Nav(crate::app::nav::NavMsg::ToggleStar(id.clone())),
     ));
+    if let Content::Sticker { media: Some(m), .. } = &msg.content {
+        let fav = app.picker.is_favourite(&m.cache_key());
+        col = col.push(item(
+            if fav { Icon::StarOff } else { Icon::Smile },
+            if fav { "Unfavourite" } else { "Favourite" },
+            Ui::Picker(PickerUi::FavouriteMessage(id.clone())),
+        ));
+    }
     if matches!(msg.content, Content::Video { .. }) {
         col = col.push(item(
             Icon::ExternalLink,
@@ -1410,15 +1519,7 @@ fn message_menu<'a>(app: &'a App, msg: &'a ChatMessage) -> El<'a> {
     col = col.push(item(Icon::Trash2, "Delete", Ui::AskDelete(id)));
     container(col.width(210))
         .padding([6, 0])
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 8.0)(th);
-            s.shadow = iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 10.0,
-            };
-            s
-        })
+        .style(theme::popup(t, 8.0))
         .into()
 }
 
@@ -1748,15 +1849,7 @@ pub fn dialog<'a>(app: &'a App) -> Option<El<'a>> {
     let card = container(body)
         .padding(24)
         .width(380)
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 12.0)(th);
-            s.shadow = iced::Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 24.0,
-            };
-            s
-        });
+        .style(theme::rounded(p.bg_elevated, 12.0));
     Some(opaque(
         container(card)
             .center(Length::Fill)
