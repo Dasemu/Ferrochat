@@ -81,6 +81,24 @@ cannot be verified locally). Ephemeral wrappers are unwrapped; disappearing
 messages carry `expires_at` and are pruned from the cache when it passes.
 **View-once** messages are rendered as "View once message: open it on your
 phone": their media reference is never exposed, downloaded or stored.
+**Photos** (`app/pictures.rs`, `media/picture.rs`): the bubble shows the
+inline `jpegThumbnail` reduced to 64 px and blurred (made in a worker),
+then a preview of the full picture: decoded, EXIF-oriented and scaled to
+<= 660 px off the UI thread and handed to iced as RGBA (iced would decode a
+`from_bytes` photo at full size on the UI thread on every draw-cache miss:
+~80 ms and 45 MB for 12 Mpx). Previews come from the disk cache first
+(`previews/`, no download slot), then the network: photos on screen
+(found by a widget operation after scrolling / loading, debounced) jump the
+queue newest first, then the newest 30 messages in the background, 4
+downloads at a time. A failed download is retried after 2 s and 8 s, then
+the bubble offers "Retry"; a spinner appears on downloads slower than
+0.7 s. Own photos are previewed from the file at send time under the hex
+SHA-256 of the file (= the upload's `file_sha256` cache key), so they are
+sharp at once and never downloaded back. The image viewer always fetches
+the original (for zoom and "Save as") and shows the preview meanwhile.
+The media HTTP client (ureq) has connect / per-read / per-write timeouts
+(15 s / 30 s): the library's default agent has none, and a stalled socket
+held a download slot until TCP gave up, minutes later.
 `videoMessage` (and round video notes) show the inline JPEG thumbnail and the
 duration; a click downloads the file (capped at 100 MB) into the cache
 directory and plays it in the in-app viewer (§6.1). "Open externally"
@@ -317,6 +335,7 @@ loopback test server; `--mock` answers searches in-process.
 | `$XDG_DATA_HOME/ferrochat/cache.sqlite3` (+ `-wal`, `-shm`) | Cache: chats, message bodies, media references (CDN path + per-file media key, needed to download later), contact names (by source), chat lists and their members, own JID | Plain SQLite, mode 0600, like the official desktop client's local database. Deletable at any time; rebuilt from history sync. Never contains credentials or Signal keys. |
 | (cache tables `statuses`, `starred`) | Statuses of the last 24 h (author, text / media references, thumbnail, viewed flag) and starred message keys | Same file as above; wiped on logout |
 | `$XDG_CACHE_HOME/ferrochat/avatars/*.img` / `*.none` | Profile picture previews (JPEG as served) and "no picture" markers. File names are a hash of the JID. Refreshed after 7 days / 12 h or when the contact changes the picture; at most 1500 files and 32 MB; deleted on logout | Directory 0700 |
+| `$XDG_CACHE_HOME/ferrochat/previews/*.img` | Chat photo previews (decrypted, scaled to <= 660 px, JPEG or PNG), named by a hash of the media key, so photos show at once after a restart | Directory 0700; at most 3000 files / 200 MB (oldest used first out); deleted on logout; none in `--mock` |
 | `$XDG_CACHE_HOME/ferrochat/videos/*` | The last four videos you opened (or 400 MB), decrypted, so the player (in-app helper or system player) can read them | Directory 0700. `--mock` writes its 40 kB clip to `$TMPDIR/ferrochat-mock-<pid>` and removes it when the viewer closes. |
 | `$XDG_CONFIG_HOME/ferrochat/settings.json` | Preferences: close to tray, start minimized, mute notifications | Plain JSON, no secrets; not written in `--mock` |
 | `~/.config/autostart/dev.ferro.ferrochat.desktop` | "Start at login" entry (`Exec=<binary> --minimized`) | Only when the user turns the toggle on; the toggle removes it |
@@ -336,8 +355,10 @@ and images are probed (header only) and rejected above 40 Mpx before
 decoding. Notification titles and bodies are markup-escaped (`&`, `<`, `>`)
 because KDE renders a subset of HTML in them.
 
-Decoded profile pictures live in a 12 MB LRU (96x96 tiles, round). Images and voice notes are kept in memory only (byte-bounded LRUs: 48 MB
-images, 16 MB decoded audio) and re-downloaded after a restart.
+Decoded profile pictures live in a 12 MB LRU (96x96 tiles, round). Photo
+previews live in a 48 MB LRU of decoded RGBA (and on disk, see the table);
+voice notes are kept in memory only (16 MB decoded audio) and
+re-downloaded after a restart.
 
 The session store is **never deleted automatically** except on a real
 logout (user action or server-side unlink). Only `SQLITE_NOTADB` (wrong key)

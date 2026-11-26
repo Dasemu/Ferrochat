@@ -87,7 +87,9 @@ The app follows iced's Elm architecture.
 * **Caches are bounded.** In-memory message windows hold at most N messages
   per open conversation (default 200); older pages are loaded from SQLite on
   scroll, then from the network. Decoded images live in an LRU keyed by
-  media id with a byte budget (default 48 MB).
+  media id with a byte budget (default 48 MB); for chat photos that budget
+  counts display-sized RGBA previews (<= 660 px, decoded in a worker), never
+  full-resolution pictures (`app/pictures.rs`).
 
 ### Startup sequence
 

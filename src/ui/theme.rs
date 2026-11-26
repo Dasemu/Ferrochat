@@ -577,6 +577,23 @@ pub fn flat_button(color: Color) -> impl Fn(&Theme, button::Status) -> button::S
     }
 }
 
+/// Pill drawn over a picture ("Retry" on a photo that failed to load):
+/// dark and translucent so it reads on any picture.
+pub fn overlay_pill(_: &Theme, status: button::Status) -> button::Style {
+    let a = if matches!(status, button::Status::Hovered | button::Status::Pressed) {
+        0.7
+    } else {
+        0.55
+    };
+    button::Style {
+        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, a))),
+        text_color: Color::WHITE,
+        border: border(18.0),
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 /// Search / composer input (the container provides the rounded background).
 pub fn input(t: &FerroTheme) -> impl Fn(&Theme, text_input::Status) -> text_input::Style + use<> {
     let p = t.palette;

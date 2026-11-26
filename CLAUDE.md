@@ -144,6 +144,14 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   which needs the stored offer (`net::call::CallBook`). State machine: `call::Calls` (pure,
   tested); app glue `app/call.rs`. Video calls are NOT implemented: the video button must keep
   saying so. `--mock`/tests open no audio device. Each call is logged once (`call-<id>` bubble).
+- Photos (`app/pictures.rs`, `media/picture.rs`, protocol §2): bubbles get RGBA previews (<= 660 px) decoded in a
+  worker, never `Handle::from_bytes` of the full file (iced decodes that on the UI thread at full size on every
+  draw-cache miss). Order: disk cache (`previews/`) > network; on-screen photos (`Done::Visible`, a debounced
+  widget operation) jump the queue. Own sends are previewed from the file under `pictures::key_of` (= upload
+  `file_sha256`): never download them back. `images` holds previews, so the viewer / "Save as" use
+  `viewer_handle` (original bytes). Failures retry twice, then "Retry". The ureq agent MUST keep timeouts
+  (`net/whatsapp.rs::http_agent`): the default has none and a dead socket held a download slot for minutes.
+  Spinner (`ui::spinner`) animates itself only while visible. Tests: `app/image_flows.rs`.
 - Stickers / GIFs (`app/picker.rs`, protocol §2.5): animations are `app::anim::Anim`s drawn by
   `ui::anim_image` (self-playing, redraws only its own due frames, only visible + focused): never tick
   the app for them. GIF bubbles are decoded by the helper's `--frames` mode and `.gif` files converted by
