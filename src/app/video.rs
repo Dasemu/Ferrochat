@@ -63,6 +63,8 @@ pub struct VideoView {
     pub seeking: Option<f32>,
     /// Full screen.
     pub fullscreen: bool,
+    /// A GIF: starts over when it ends, like WhatsApp plays GIFs.
+    pub looping: bool,
     pub(crate) session: u32,
     pub(crate) rx: Shared,
     player: Option<Player>,
@@ -94,6 +96,7 @@ impl VideoView {
             muted: false,
             seeking: None,
             fullscreen: false,
+            looping: false,
             session,
             rx: Arc::new(Mutex::new(None)),
             player: None,
@@ -151,6 +154,13 @@ impl VideoView {
                 }
                 if duration_ms > 0 {
                     self.duration_ms = duration_ms;
+                }
+                if state == PlayState::Ended && self.looping && self.seeking.is_none() {
+                    self.send(Cmd::Seek(0));
+                    self.send(Cmd::Play);
+                    self.position_ms = 0;
+                    self.state = PlayState::Playing;
+                    return false;
                 }
                 self.state = state;
             }
@@ -221,7 +231,7 @@ impl App {
         let Some(m) = self.find_message(id).cloned() else {
             return Task::none();
         };
-        let Content::Video { media, .. } = m.content else {
+        let Content::Video { media, gif, .. } = m.content else {
             return Task::none();
         };
         let Some(mref) = media else {
@@ -233,7 +243,9 @@ impl App {
             return Task::none();
         };
         self.video_session = self.video_session.wrapping_add(1);
-        self.video = Some(VideoView::new(id.to_string(), self.video_session));
+        let mut view = VideoView::new(id.to_string(), self.video_session);
+        view.looping = gif;
+        self.video = Some(view);
         self.viewer = None;
         self.popup = None;
         let dir = self.video_dir();
@@ -587,6 +599,32 @@ mod tests {
         });
         assert!(!v.is_playing());
         assert!((v.progress() - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_gif_starts_over_instead_of_ending() {
+        let mut v = view();
+        v.looping = true;
+        v.apply(Event::Ready {
+            width: 2,
+            height: 2,
+            duration_ms: 1000,
+        });
+        v.apply(Event::Time {
+            position_ms: 1000,
+            duration_ms: 1000,
+            state: PlayState::Ended,
+        });
+        assert!(v.is_playing());
+        assert_eq!(v.position_ms, 0);
+        // A plain video stops at the end.
+        let mut v = view();
+        v.apply(Event::Time {
+            position_ms: 1000,
+            duration_ms: 1000,
+            state: PlayState::Ended,
+        });
+        assert_eq!(v.state, PlayState::Ended);
     }
 
     #[test]

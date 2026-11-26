@@ -73,6 +73,8 @@ pub enum Ui {
     Attach,
     /// Ctrl+V / Shift+Insert: a copied image or files open the preview.
     Paste,
+    /// Files dragged over or dropped on the window.
+    Drop(crate::app::drop::DropMsg),
     /// Attachment preview caption edited.
     AttachCaption(String),
     /// Attachment preview "send".

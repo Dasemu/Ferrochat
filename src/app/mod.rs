@@ -4,6 +4,7 @@ mod actions;
 pub mod anim;
 pub mod call;
 pub mod composer;
+pub mod drop;
 pub mod emoji;
 pub mod info;
 pub mod input;
@@ -27,6 +28,8 @@ mod forward_flows;
 #[cfg(test)]
 mod image_flows;
 pub mod live;
+#[cfg(test)]
+mod media_flows;
 pub mod message;
 pub mod nav;
 pub mod paste;
@@ -256,6 +259,8 @@ pub struct App {
     pub(crate) anim_epoch: Instant,
     /// Attachment preview (picked or pasted media waiting for "send").
     pub(crate) attach: Option<paste::AttachPreview>,
+    /// Files dragged over / dropped on the window.
+    pub(crate) drop: drop::DropState,
     /// Reads the system clipboard for paste-to-send (blocking; a fake in
     /// tests).
     pub(crate) read_clipboard: fn() -> paste::Clipboard,
@@ -585,6 +590,7 @@ impl App {
             gif_inflight: 0,
             anim_epoch: Instant::now(),
             attach: None,
+            drop: drop::DropState::default(),
             read_clipboard: paste::read_clipboard,
             menu_open: false,
             qr: None,
@@ -683,6 +689,8 @@ impl App {
                     Some((ScreenshotTarget::Video, _)) => 9000,
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
+                    // The helper probes / converts the file.
+                    Some((ScreenshotTarget::AttachVideo | ScreenshotTarget::AttachGif, _)) => 9000,
                     // Search debounce, mock tiles, GIF frames from the helper.
                     Some((ScreenshotTarget::Stickers | ScreenshotTarget::Gifs, _)) => 7000,
                     Some((
@@ -849,6 +857,10 @@ impl App {
             Ok(task) => return task,
             Err(ui) => ui,
         };
+        let ui = match self.on_ui_drop(ui) {
+            Ok(task) => return task,
+            Err(ui) => ui,
+        };
         let ui = match self.on_ui_extra(ui) {
             Ok(task) => return task,
             Err(ui) => ui,
@@ -932,16 +944,12 @@ impl App {
                 return Task::perform(
                     async {
                         let files = rfd::AsyncFileDialog::new()
-                            .set_title("Send photos or documents")
+                            .set_title("Send photos, videos or documents")
                             .pick_files()
                             .await?;
                         let paths: Vec<PathBuf> =
                             files.iter().map(|f| f.path().to_path_buf()).collect();
-                        tokio::task::spawn_blocking(move || {
-                            Box::new(paste::Staged::from_paths(paths, false))
-                        })
-                        .await
-                        .ok()
+                        paste::stage_paths(paths, false).await.map(Box::new)
                     },
                     move |staged| Message::done(Done::Staged { chat, staged }),
                 );
@@ -1330,11 +1338,11 @@ impl App {
             let chat = chat.clone();
             Task::perform(
                 async move {
-                    tokio::task::spawn_blocking(move || paste::stage(read()))
+                    let staged = tokio::task::spawn_blocking(move || paste::stage(read()))
                         .await
                         .ok()
-                        .flatten()
-                        .map(Box::new)
+                        .flatten()?;
+                    Some(Box::new(paste::finish_videos(staged).await))
                 },
                 move |staged| Message::done(Done::Staged { chat, staged }),
             )
@@ -2685,6 +2693,31 @@ impl App {
                 })));
                 v.push(ui(Ui::AttachCaption("Look at this sunset".into())));
             }
+            ScreenshotTarget::AttachVideo | ScreenshotTarget::AttachGif => {
+                // The real path of a picked file: staged, then probed (and
+                // for a GIF converted) by the helper.
+                let gif = target == ScreenshotTarget::AttachGif;
+                let dir =
+                    std::env::temp_dir().join(format!("ferrochat-shot-{}", std::process::id()));
+                let chat = c.chat.clone();
+                v.push(Task::perform(
+                    async move {
+                        let path = dir.join(if gif { "dancing.gif" } else { "trip.mp4" });
+                        let bytes = if gif {
+                            crate::mock::sample_gif()
+                        } else {
+                            include_bytes!("../../assets/mock-clip.mp4").to_vec()
+                        };
+                        tokio::fs::create_dir_all(&dir).await.ok()?;
+                        tokio::fs::write(&path, bytes).await.ok()?;
+                        let staged = paste::stage_paths(vec![path], false).await;
+                        let _ = tokio::fs::remove_dir_all(&dir).await;
+                        staged.map(Box::new)
+                    },
+                    move |staged| Message::done(Done::Staged { chat, staged }),
+                ));
+            }
+            ScreenshotTarget::Drop => v.push(ui(Ui::Drop(drop::DropMsg::Hovered))),
             ScreenshotTarget::Emoji => {
                 v.push(ui(Ui::Emoji("\u{1F602}")));
                 v.push(ui(Ui::Emoji("\u{2764}\u{FE0F}")));
@@ -2841,6 +2874,16 @@ fn runtime_event(
             Some(Message::WindowResized(id, size))
         }
         iced::Event::Window(iced::window::Event::Moved(p)) => Some(Message::WindowMoved(id, p)),
+        // Drag and drop (X11 / XWayland, Windows, macOS).
+        iced::Event::Window(iced::window::Event::FileHovered(_)) => {
+            Some(Message::Ui(Ui::Drop(drop::DropMsg::Hovered)))
+        }
+        iced::Event::Window(iced::window::Event::FilesHoveredLeft) => {
+            Some(Message::Ui(Ui::Drop(drop::DropMsg::Left)))
+        }
+        iced::Event::Window(iced::window::Event::FileDropped(path)) => {
+            Some(Message::Ui(Ui::Drop(drop::DropMsg::Dropped(path))))
+        }
         iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
             key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
             ..

@@ -1176,6 +1176,41 @@ pub fn long_history(chat: &str, n: usize, until: i64) -> Vec<Message> {
         .collect()
 }
 
+/// A small animated GIF (a bouncing ball, 12 frames) for the "attach-gif"
+/// screenshot. Empty when encoding fails.
+pub fn sample_gif() -> Vec<u8> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    let (w, h) = (320u32, 200u32);
+    let mut out = Vec::new();
+    {
+        let mut enc = GifEncoder::new(&mut out);
+        if enc.set_repeat(Repeat::Infinite).is_err() {
+            return Vec::new();
+        }
+        for i in 0..12u32 {
+            let t = i as f32 / 12.0;
+            let cx = 40.0 + t * 240.0;
+            let cy = 150.0 - (t * std::f32::consts::PI).sin() * 100.0;
+            let img = image::RgbaImage::from_fn(w, h, |x, y| {
+                let d = ((x as f32 - cx).powi(2) + (y as f32 - cy).powi(2)).sqrt();
+                if d < 22.0 {
+                    image::Rgba([255, 196, 0, 255])
+                } else if y > 176 {
+                    image::Rgba([60, 150, 90, 255])
+                } else {
+                    image::Rgba([120, 180, 235, 255])
+                }
+            });
+            let frame =
+                image::Frame::from_parts(img, 0, 0, image::Delay::from_numer_denom_ms(80, 1));
+            if enc.encode_frame(frame).is_err() {
+                return Vec::new();
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
