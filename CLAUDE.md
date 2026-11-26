@@ -88,7 +88,9 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   in `view`; the video viewer replaces the whole view while open.
 - Chat flags / lists are optimistic: apply, persist, send, revert on failure
   (`app/lists.rs`, `app/chat_actions.rs`). Clear / delete chat are the exception:
-  sent first, applied when the phone has them. Mutes have an end
+  sent first, applied when the phone has them, and only to messages at or before the action's
+  `messageRange` (`upto`, `convert::range_upto`): full app-state syncs / resyncs replay old
+  clears and deletes, which must not wipe newer messages (a deleted chat with newer ones stays). Mutes have an end
   (`ChatMeta::mute_end`, seconds, -1 = always): read them through `App::is_muted` /
   `ChatMeta::is_muted(now)`, never as a flag. Never send the `favorites` app-state action (it carries
   the whole list and would overwrite the phone's).

@@ -267,6 +267,7 @@ async fn clear_and_delete_from_the_phone_apply_here() {
     h.net(Event::ChatCleared {
         chat: PABLO.into(),
         keep_starred: false,
+        upto: i64::MAX,
     })
     .await;
     assert!(h.app.chats.get(PABLO).unwrap().last.is_none());
@@ -279,6 +280,7 @@ async fn clear_and_delete_from_the_phone_apply_here() {
     );
     h.net(Event::ChatDeleted {
         chat: MARCOS.into(),
+        upto: i64::MAX,
     })
     .await;
     assert!(h.app.chats.get(MARCOS).is_none());
@@ -288,5 +290,45 @@ async fn clear_and_delete_from_the_phone_apply_here() {
             .log()
             .iter()
             .any(|s| matches!(s, Sent::ClearChat { .. } | Sent::DeleteChat { .. }))
+    );
+}
+
+#[tokio::test]
+async fn replayed_clear_and_delete_keep_newer_messages() {
+    // A full app-state sync replays old clear / delete actions: messages
+    // that arrived after them must survive.
+    let mut h = Harness::new().await;
+    let newest = h.app.chats.get(PABLO).unwrap().last.clone().unwrap();
+    let cached = h.app.store.load_messages(PABLO, None, 100).unwrap().len();
+    assert!(cached > 1);
+    h.net(Event::ChatCleared {
+        chat: PABLO.into(),
+        keep_starred: false,
+        upto: newest.timestamp - 1,
+    })
+    .await;
+    let left = h.app.store.load_messages(PABLO, None, 100).unwrap();
+    assert!(left.iter().any(|m| m.id == newest.id));
+    assert!(left.iter().all(|m| m.timestamp >= newest.timestamp));
+    assert_eq!(
+        h.app.chats.get(PABLO).unwrap().last.as_ref().map(|m| &m.id),
+        Some(&newest.id)
+    );
+    h.net(Event::ChatDeleted {
+        chat: PABLO.into(),
+        upto: newest.timestamp - 1,
+    })
+    .await;
+    assert!(
+        h.app.chats.get(PABLO).is_some(),
+        "a newer message keeps the chat"
+    );
+    assert!(
+        h.app
+            .store
+            .chat_rows()
+            .unwrap()
+            .iter()
+            .any(|r| r.meta.id == PABLO)
     );
 }

@@ -1507,9 +1507,11 @@ fn translate(ev: &WaEvent, client: &Client, attempt: &mut u32) -> Vec<Event> {
         WaEvent::ClearChatUpdate(c) => vec![Event::ChatCleared {
             chat: convert::bare_jid(&c.jid.to_string()),
             keep_starred: !c.delete_starred,
+            upto: convert::range_upto(c.action.message_range.as_option(), c.timestamp.timestamp()),
         }],
         WaEvent::DeleteChatUpdate(d) => vec![Event::ChatDeleted {
             chat: convert::bare_jid(&d.jid.to_string()),
+            upto: convert::range_upto(d.action.message_range.as_option(), d.timestamp.timestamp()),
         }],
         WaEvent::LabelEditUpdate(l) => vec![convert::list_edit_event(&l.label_id, &l.action)],
         WaEvent::LabelAssociationUpdate(l) => vec![Event::ListChat {

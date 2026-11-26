@@ -122,6 +122,8 @@ pub enum ChatActDone {
         chat: ChatId,
         /// Starred messages stay.
         keep_starred: bool,
+        /// The action's message range end (Unix seconds).
+        upto: i64,
         /// Outcome.
         result: Result<(), String>,
     },
@@ -129,6 +131,8 @@ pub enum ChatActDone {
     Deleted {
         /// Chat.
         chat: ChatId,
+        /// The action's message range end (Unix seconds).
+        upto: i64,
         /// Outcome.
         result: Result<(), String>,
     },
@@ -226,12 +230,14 @@ impl App {
             ChatActDone::Cleared {
                 chat,
                 keep_starred,
+                upto,
                 result: Ok(()),
-            } => self.apply_clear(chat, keep_starred),
+            } => self.apply_clear(chat, keep_starred, upto),
             ChatActDone::Deleted {
                 chat,
+                upto,
                 result: Ok(()),
-            } => self.apply_delete(chat),
+            } => self.apply_delete(chat, upto),
             ChatActDone::Cleared {
                 result: Err(error), ..
             } => {
@@ -322,10 +328,11 @@ impl App {
     }
 
     fn clear_chat(&mut self, chat: ChatId, keep_starred: bool) -> Task<Message> {
-        let Some(client) = self.client.clone() else {
-            return self.apply_clear(chat, keep_starred);
-        };
         let last = self.last_key(&chat);
+        let upto = range_end(last.as_ref());
+        let Some(client) = self.client.clone() else {
+            return self.apply_clear(chat, keep_starred, upto);
+        };
         Task::perform(
             async move {
                 let r = client.clear_chat(&chat, keep_starred, last.as_ref()).await;
@@ -335,6 +342,7 @@ impl App {
                 Message::done(Done::ChatAct(ChatActDone::Cleared {
                     chat,
                     keep_starred,
+                    upto,
                     result,
                 }))
             },
@@ -342,70 +350,117 @@ impl App {
     }
 
     fn delete_chat(&mut self, chat: ChatId) -> Task<Message> {
-        let Some(client) = self.client.clone() else {
-            return self.apply_delete(chat);
-        };
         let last = self.last_key(&chat);
+        let upto = range_end(last.as_ref());
+        let Some(client) = self.client.clone() else {
+            return self.apply_delete(chat, upto);
+        };
         Task::perform(
             async move {
                 let r = client.delete_chat(&chat, last.as_ref()).await;
                 (chat, r.map_err(|e| e.to_string()))
             },
-            |(chat, result)| Message::done(Done::ChatAct(ChatActDone::Deleted { chat, result })),
+            move |(chat, result)| {
+                Message::done(Done::ChatAct(ChatActDone::Deleted { chat, upto, result }))
+            },
         )
     }
 
-    /// Clears a chat here (our action or another device's). Starred
-    /// messages stay in the open conversation when kept.
-    pub(super) fn apply_clear(&mut self, chat: ChatId, keep_starred: bool) -> Task<Message> {
-        self.chats.clear_chat(&chat);
+    /// Clears a chat here (our action or another device's): the messages
+    /// sent at or before `upto` (Unix seconds, the action's message range)
+    /// go, starred ones stay when kept. Newer messages stay: a replayed
+    /// action (full app-state sync) must not wipe what came after it.
+    pub(super) fn apply_clear(
+        &mut self,
+        chat: ChatId,
+        keep_starred: bool,
+        upto: i64,
+    ) -> Task<Message> {
+        self.chats.clear_chat(&chat, upto);
         if !keep_starred {
-            self.forget_stars(&chat);
+            self.forget_stars(&chat, upto);
         }
-        if let Some(c) = &mut self.open
-            && c.chat == chat
-        {
-            if keep_starred {
-                let stars = &self.nav.star_set;
-                c.messages
-                    .retain(|m| stars.contains(&(chat.clone(), m.id.clone())));
-            } else {
-                c.messages.clear();
-            }
-            c.has_more = false;
-            c.has_newer = false;
-            self.pending_read = 0;
-            self.popup = None;
-            self.dialog = None;
-            self.reply_to = None;
-        }
-        store_task(&self.store, move |s| s.clear_chat(&chat, keep_starred))
+        self.drop_open_messages(&chat, keep_starred, upto);
+        store_task(&self.store, move |s| {
+            s.clear_chat(&chat, keep_starred, upto)
+        })
     }
 
-    /// Deletes a chat here (our action or another device's).
-    pub(super) fn apply_delete(&mut self, chat: ChatId) -> Task<Message> {
-        self.chats.delete_chat(&chat);
-        self.forget_stars(&chat);
-        if self.open.as_ref().is_some_and(|c| c.chat == chat) {
-            self.open = None;
-            self.info = None;
+    /// Deletes a chat here (our action or another device's). A chat that
+    /// got messages after `upto` is only cleared up to it, like WhatsApp.
+    pub(super) fn apply_delete(&mut self, chat: ChatId, upto: i64) -> Task<Message> {
+        let gone = self.chats.delete_chat(&chat, upto);
+        self.forget_stars(&chat, upto);
+        if gone {
+            if self.open.as_ref().is_some_and(|c| c.chat == chat) {
+                self.open = None;
+                self.info = None;
+                self.popup = None;
+                self.dialog = None;
+                self.reply_to = None;
+                self.chat_search = None;
+                self.pending_read = 0;
+            }
+            self.drafts.take(&chat);
+        } else {
+            self.drop_open_messages(&chat, false, upto);
+        }
+        store_task(&self.store, move |s| s.delete_chat(&chat, upto))
+    }
+
+    /// Removes the cleared messages from the open conversation.
+    fn drop_open_messages(&mut self, chat: &str, keep_starred: bool, upto: i64) {
+        let Some(c) = &mut self.open else {
+            return;
+        };
+        if c.chat != chat {
+            return;
+        }
+        let stars = &self.nav.star_set;
+        let before = c.messages.len();
+        c.messages.retain(|m| {
+            m.timestamp > upto
+                || (keep_starred && stars.contains(&(chat.to_string(), m.id.clone())))
+        });
+        if c.messages.len() != before {
+            c.has_more = false;
+            self.pending_read = 0;
             self.popup = None;
             self.dialog = None;
             self.reply_to = None;
-            self.chat_search = None;
-            self.pending_read = 0;
         }
-        self.drafts.take(&chat);
-        store_task(&self.store, move |s| s.delete_chat(&chat))
+    }
+
+    /// Drops a chat's messages up to `upto` from the starred set and list.
+    fn forget_stars(&mut self, chat: &str, upto: i64) {
+        let mut gone: std::collections::HashSet<String> = self
+            .nav
+            .starred
+            .iter()
+            .filter(|s| s.message.chat == chat && s.message.timestamp <= upto)
+            .map(|s| s.message.id.clone())
+            .collect();
+        if let Some(c) = self.open.as_ref().filter(|c| c.chat == chat) {
+            gone.extend(
+                c.messages
+                    .iter()
+                    .filter(|m| m.timestamp <= upto)
+                    .map(|m| m.id.clone()),
+            );
+        }
+        self.nav
+            .starred
+            .retain(|s| s.message.chat != chat || s.message.timestamp > upto);
+        self.nav
+            .star_set
+            .retain(|(c, id)| c != chat || !gone.contains(id));
     }
 }
 
-impl App {
-    /// Drops a chat's messages from the starred set and list.
-    fn forget_stars(&mut self, chat: &str) {
-        self.nav.star_set.retain(|(c, _)| c != chat);
-        self.nav.starred.retain(|s| s.message.chat != chat);
-    }
+/// The end of a clear / delete we send: the newest message we have, or now
+/// for a chat without one.
+fn range_end(last: Option<&(MsgKey, i64)>) -> i64 {
+    last.map_or_else(super::now_secs, |(_, ts)| *ts)
 }
 
 #[cfg(test)]

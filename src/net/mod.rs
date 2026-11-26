@@ -405,11 +405,16 @@ pub enum Event {
         chat: ChatId,
         /// Starred messages were kept.
         keep_starred: bool,
+        /// Only messages at or before this time (Unix seconds, the action's
+        /// `messageRange`) go: newer ones arrived after the clear.
+        upto: i64,
     },
     /// A chat was deleted on another device.
     ChatDeleted {
         /// Chat.
         chat: ChatId,
+        /// As in [`Event::ChatCleared`]: a chat with newer messages stays.
+        upto: i64,
     },
     /// New statuses (live or from the offline queue).
     Status(Vec<StatusItem>),

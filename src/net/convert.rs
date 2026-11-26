@@ -351,6 +351,22 @@ pub fn mute_end_secs(raw: i64) -> i64 {
     }
 }
 
+/// Up to when a clear / delete chat action applies (Unix seconds): the
+/// newest message of its `messageRange`, else the action's own time.
+/// Without this bound a replayed action (full app-state sync, resync)
+/// would wipe everything that arrived after it.
+pub fn range_upto(
+    range: Option<&wa::sync_action_value::SyncActionMessageRange>,
+    action_secs: i64,
+) -> i64 {
+    match range.and_then(|r| r.last_message_timestamp) {
+        // Later than year 5000 in seconds: it is milliseconds.
+        Some(t) if t > 100_000_000_000 => t / 1000,
+        Some(t) if t > 0 => t,
+        _ => action_secs,
+    }
+}
+
 /// The `contextInfo` of whichever body the message carries.
 pub fn context_info(msg: &wa::Message) -> Option<&wa::ContextInfo> {
     let m = base_message(msg);
@@ -1894,6 +1910,17 @@ mod name_and_list_tests {
         assert_eq!(mute_flag(&mute(false, 0)), ChatFlag::Muted(MUTE_OFF));
         assert_eq!(mute_end_secs(1_800_000_000), 1_800_000_000);
         assert_eq!(mute_end_secs(0), MUTE_FOREVER);
+        let range = |t| wa::sync_action_value::SyncActionMessageRange {
+            last_message_timestamp: Some(t),
+            ..Default::default()
+        };
+        assert_eq!(range_upto(Some(&range(1_700_000_000)), 9), 1_700_000_000);
+        assert_eq!(
+            range_upto(Some(&range(1_700_000_000_000)), 9),
+            1_700_000_000
+        );
+        assert_eq!(range_upto(Some(&range(0)), 9), 9);
+        assert_eq!(range_upto(None, 9), 9);
         // An 8 hour mute set long ago is over.
         assert!(!mute_active(
             mute_end_secs(1_000_000_000_000),

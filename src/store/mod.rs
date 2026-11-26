@@ -496,56 +496,32 @@ impl Store {
         Ok(())
     }
 
-    /// "Clear chat": removes the chat's messages (keeping the starred ones
-    /// when `keep_starred`), their reactions and receipts. The chat stays.
-    pub fn clear_chat(&self, chat: &str, keep_starred: bool) -> Result<()> {
-        let keep = if keep_starred {
-            " AND id NOT IN (SELECT msg_id FROM starred WHERE chat_id = ?1)"
-        } else {
-            ""
-        };
-        let keep_ref = if keep_starred {
-            " AND msg_id NOT IN (SELECT msg_id FROM starred WHERE chat_id = ?1)"
-        } else {
-            ""
-        };
+    /// "Clear chat": removes the chat's messages sent at or before `upto`
+    /// (Unix seconds; the action's `messageRange`), keeping the starred ones
+    /// when `keep_starred`, with their reactions and receipts. The chat
+    /// stays, and so does anything newer (a replayed clear must not wipe
+    /// what arrived after it).
+    pub fn clear_chat(&self, chat: &str, keep_starred: bool, upto: i64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        // Only the two literal filters above are spliced in.
-        tx.execute(
-            &format!("DELETE FROM reactions WHERE chat_id = ?1{keep_ref}"),
-            params![chat],
-        )?;
-        tx.execute(
-            &format!("DELETE FROM receipts WHERE chat_id = ?1{keep_ref}"),
-            params![chat],
-        )?;
-        tx.execute(
-            &format!("DELETE FROM messages WHERE chat_id = ?1{keep}"),
-            params![chat],
-        )?;
-        if !keep_starred {
-            tx.execute("DELETE FROM starred WHERE chat_id = ?1", params![chat])?;
-        }
-        tx.execute("UPDATE chats SET unread = 0 WHERE id = ?1", params![chat])?;
+        clear_chat_tx(&tx, chat, keep_starred, upto)?;
         tx.commit()?;
         Ok(())
     }
 
-    /// "Delete chat": the chat, its messages and everything hanging off
-    /// them. List memberships stay: they belong to the phone.
-    pub fn delete_chat(&self, chat: &str) -> Result<()> {
+    /// "Delete chat": the chat's messages up to `upto` (see
+    /// [`Store::clear_chat`], starred ones included) and, when nothing newer
+    /// is left, the chat row. List memberships stay: they belong to the
+    /// phone.
+    pub fn delete_chat(&self, chat: &str, upto: i64) -> Result<()> {
         let mut conn = self.lock()?;
         let tx = conn.transaction()?;
-        for sql in [
-            "DELETE FROM reactions WHERE chat_id = ?1",
-            "DELETE FROM receipts WHERE chat_id = ?1",
-            "DELETE FROM messages WHERE chat_id = ?1",
-            "DELETE FROM starred WHERE chat_id = ?1",
-            "DELETE FROM chats WHERE id = ?1",
-        ] {
-            tx.execute(sql, params![chat])?;
-        }
+        clear_chat_tx(&tx, chat, false, upto)?;
+        tx.execute(
+            "DELETE FROM chats WHERE id = ?1
+               AND NOT EXISTS (SELECT 1 FROM messages WHERE chat_id = ?1)",
+            params![chat],
+        )?;
         tx.commit()?;
         Ok(())
     }
@@ -1125,6 +1101,45 @@ fn decode_mentions(json: &str) -> Vec<String> {
     v
 }
 
+/// See [`Store::clear_chat`].
+fn clear_chat_tx(
+    tx: &rusqlite::Transaction<'_>,
+    chat: &str,
+    keep_starred: bool,
+    upto: i64,
+) -> Result<()> {
+    // Only this literal filter is spliced in.
+    let keep = if keep_starred {
+        " AND id NOT IN (SELECT msg_id FROM starred WHERE chat_id = ?1)"
+    } else {
+        ""
+    };
+    tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS cleared (id TEXT PRIMARY KEY)")?;
+    tx.execute("DELETE FROM temp.cleared", [])?;
+    tx.execute(
+        &format!(
+            "INSERT OR IGNORE INTO temp.cleared (id)
+             SELECT id FROM messages WHERE chat_id = ?1 AND ts <= ?2{keep}"
+        ),
+        params![chat, upto],
+    )?;
+    for sql in [
+        "DELETE FROM reactions WHERE chat_id = ?1 AND msg_id IN (SELECT id FROM temp.cleared)",
+        "DELETE FROM receipts WHERE chat_id = ?1 AND msg_id IN (SELECT id FROM temp.cleared)",
+        "DELETE FROM starred WHERE chat_id = ?1 AND msg_id IN (SELECT id FROM temp.cleared)",
+        "DELETE FROM messages WHERE chat_id = ?1 AND id IN (SELECT id FROM temp.cleared)",
+    ] {
+        tx.execute(sql, params![chat])?;
+    }
+    tx.execute("DELETE FROM temp.cleared", [])?;
+    tx.execute(
+        "UPDATE chats SET unread = 0
+         WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM messages WHERE chat_id = ?1 AND ts > ?2)",
+        params![chat, upto],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1548,7 +1563,7 @@ mod tests {
         s.set_star("a", "1", true, 50).unwrap();
         s.apply_reaction("a", "2", "x@s.whatsapp.net", "👍", 40)
             .unwrap();
-        s.clear_chat("a", true).unwrap();
+        s.clear_chat("a", true, 20).unwrap();
         let left: Vec<_> = s
             .load_messages("a", None, 50)
             .unwrap()
@@ -1560,7 +1575,7 @@ mod tests {
         let a = s.chat_rows().unwrap();
         let a = a.iter().find(|r| r.meta.id == "a").unwrap();
         assert_eq!(a.meta.unread, 0);
-        s.clear_chat("a", false).unwrap();
+        s.clear_chat("a", false, 20).unwrap();
         assert!(s.load_messages("a", None, 50).unwrap().is_empty());
         assert!(!s.is_starred("a", "1").unwrap());
         assert!(s.chat_rows().unwrap().iter().any(|r| r.meta.id == "a"));
@@ -1576,7 +1591,7 @@ mod tests {
         ])
         .unwrap();
         s.set_star("a", "1", true, 50).unwrap();
-        s.delete_chat("a").unwrap();
+        s.delete_chat("a", 10).unwrap();
         assert!(s.load_messages("a", None, 50).unwrap().is_empty());
         assert!(!s.is_starred("a", "1").unwrap());
         let ids: Vec<_> = s
@@ -1586,6 +1601,36 @@ mod tests {
             .map(|r| r.meta.id)
             .collect();
         assert_eq!(ids, vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn replayed_clear_and_delete_spare_newer_messages() {
+        let s = Store::open_in_memory().unwrap();
+        s.insert_messages(&[
+            msg("a", "old", 10, false, "before the clear"),
+            msg("a", "new", 30, false, "after the clear"),
+        ])
+        .unwrap();
+        s.set_unread("a", 1).unwrap();
+        s.apply_reaction("a", "new", "x@s.whatsapp.net", "👍", 40)
+            .unwrap();
+        s.clear_chat("a", false, 20).unwrap();
+        let left: Vec<_> = s
+            .load_messages("a", None, 50)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(left, vec!["new".to_string()]);
+        let rows = s.chat_rows().unwrap();
+        let a = rows.iter().find(|r| r.meta.id == "a").unwrap();
+        assert_eq!(a.meta.unread, 1, "the newer message is still unread");
+        // A delete older than the newest message keeps the chat.
+        s.delete_chat("a", 20).unwrap();
+        assert!(s.chat_rows().unwrap().iter().any(|r| r.meta.id == "a"));
+        assert_eq!(s.load_messages("a", None, 50).unwrap().len(), 1);
+        s.delete_chat("a", 30).unwrap();
+        assert!(!s.chat_rows().unwrap().iter().any(|r| r.meta.id == "a"));
     }
 
     #[test]

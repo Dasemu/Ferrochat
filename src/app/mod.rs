@@ -1956,13 +1956,17 @@ impl App {
                 self.chats.mark_read(&chat);
                 return store_task(&self.store, move |s| s.set_unread(&chat, 0));
             }
-            Event::ChatCleared { chat, keep_starred } => {
+            Event::ChatCleared {
+                chat,
+                keep_starred,
+                upto,
+            } => {
                 let chat = self.lid_map.normalize(&chat);
-                return self.apply_clear(chat, keep_starred);
+                return self.apply_clear(chat, keep_starred, upto);
             }
-            Event::ChatDeleted { chat } => {
+            Event::ChatDeleted { chat, upto } => {
                 let chat = self.lid_map.normalize(&chat);
-                return self.apply_delete(chat);
+                return self.apply_delete(chat, upto);
             }
             Event::Call(signal) => return self.on_call_signal(signal),
             Event::LidMappings(pairs) => {

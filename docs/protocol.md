@@ -66,8 +66,8 @@ conversion lives in pure functions in `src/net/convert.rs`.
 | `LabelEditUpdate` (app-state `label_edit`) | `ListEdit` | list created / renamed / deleted |
 | `LabelAssociationUpdate` (`label_jid`) | `ListChat` | chat added to / removed from a list |
 | `MarkChatAsReadUpdate` | `ChatRead` (read) / `ChatMarkedUnread` | badge cleared / one unread |
-| `ClearChatUpdate` (app-state `clearChat`) | `ChatCleared { keep_starred }` | messages removed (starred kept when asked), the chat stays |
-| `DeleteChatUpdate` (app-state `deleteChat`) | `ChatDeleted` | chat and messages removed, closed if open |
+| `ClearChatUpdate` (app-state `clearChat`) | `ChatCleared { keep_starred, upto }` | messages up to the action's `messageRange` removed (starred kept when asked), the chat stays; newer messages survive a replayed action |
+| `DeleteChatUpdate` (app-state `deleteChat`) | `ChatDeleted { upto }` | chat and messages up to `messageRange` removed, closed if open; a chat with newer messages stays |
 | `IncomingCall`, `MissedCall`, `CallEndedElsewhere` | `Call(CallSignal)` | call panel, ringtone, call bubbles (§8) |
 
 Reactions, edits and "delete for me" events wait until the message batch that

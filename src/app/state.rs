@@ -716,21 +716,35 @@ impl ChatList {
         }
     }
 
-    /// "Clear chat": the row stays, without a last message or badge.
-    pub fn clear_chat(&mut self, chat: &str) {
-        if let Some(e) = self.get_mut(chat) {
+    /// "Clear chat" of the messages up to `upto` (Unix seconds): the row
+    /// stays, without a last message or badge unless a newer message
+    /// arrived after the clear (a replayed action).
+    pub fn clear_chat(&mut self, chat: &str, upto: i64) {
+        if let Some(e) = self.get_mut(chat)
+            && e.last.as_ref().is_none_or(|m| m.timestamp <= upto)
+        {
             e.meta.unread = 0;
             e.last = None;
+            self.marked_unread.remove(chat);
         }
-        self.marked_unread.remove(chat);
     }
 
-    /// "Delete chat": the row goes. True when it existed.
-    pub fn delete_chat(&mut self, chat: &str) -> bool {
-        self.marked_unread.remove(chat);
+    /// "Delete chat" of the messages up to `upto`: the row goes, unless a
+    /// newer message arrived after the delete (then it is only cleared).
+    /// True when the row went.
+    pub fn delete_chat(&mut self, chat: &str, upto: i64) -> bool {
         let Some(i) = self.index.get(chat).copied() else {
+            self.marked_unread.remove(chat);
             return false;
         };
+        if self.entries[i]
+            .last
+            .as_ref()
+            .is_some_and(|m| m.timestamp > upto)
+        {
+            return false;
+        }
+        self.marked_unread.remove(chat);
         self.entries.remove(i);
         self.reindex();
         true
@@ -1510,17 +1524,24 @@ mod tests {
     #[test]
     fn clearing_keeps_the_row_and_deleting_drops_it() {
         let mut l = list();
+        l.apply_messages(&[m("a", "1", 30, false)], None, true, None);
         l.mark_unread("a");
-        l.clear_chat("a");
+        let newest = 30;
+        // A replayed clear older than the newest message leaves the row.
+        l.clear_chat("a", newest - 1);
+        assert!(l.get("a").unwrap().last.is_some());
+        assert!(!l.delete_chat("a", newest - 1), "newer messages keep it");
+        assert!(l.get("a").is_some());
+        l.clear_chat("a", newest);
         let a = l.get("a").unwrap();
         assert!(a.last.is_none());
         assert_eq!(a.meta.unread, 0);
         assert!(!l.mark_read("a"), "clearing forgets the manual mark");
         let before = l.entries.len();
-        assert!(l.delete_chat("a"));
+        assert!(l.delete_chat("a", newest));
         assert!(l.get("a").is_none());
         assert_eq!(l.entries.len(), before - 1);
-        assert!(!l.delete_chat("a"));
+        assert!(!l.delete_chat("a", newest));
         // The index still finds the others.
         let other = l.entries[0].meta.id.clone();
         assert!(l.get(&other).is_some());
