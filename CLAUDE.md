@@ -9,7 +9,7 @@ the `net::WaClient` trait. Unofficial: third-party clients can get accounts bann
 - `cargo build` / `cargo build --release` (use `CARGO_BUILD_JOBS=2` on shared hosts)
 - `cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test`
 - `cargo run -- --mock` (fake protocol + mock data, no network, no disk writes)
-- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|attach-video|attach-gif|drop|header-menu|chat-menu|mute|update-banner|update-settings|emoji|stickers|gifs|viewer|info|group-info> docs/screenshots/<name>.png`
+- Screenshots: `ICED_BACKEND=tiny-skia xvfb-run -a -s "-screen 0 1280x800x24" ./target/debug/ferrochat --screenshot <login|chats|chat|reply|reactions|chat-search|list-search|delete|select|forward|settings|paste|attach-video|attach-gif|drop|message-info|group-message-info|header-menu|chat-menu|mute|update-banner|update-settings|emoji|stickers|gifs|viewer|info|group-info> docs/screenshots/<name>.png`
 - Tray test needs a session bus: `dbus-run-session -- cargo test` (the SNI test is skipped without one).
 - Regenerate fixtures: `cargo test --test gen_fixtures -- --ignored`
 
@@ -182,3 +182,12 @@ Wayland `app_id` / desktop entry id: `dev.ferro.ferrochat` (`packaging/`).
   tiles are freed on close (`release_picker`). Sticker favourites are LOCAL: whatsapp-rust 0.7 drops the
   phone's `favoriteSticker` mutations; never write that app state. GIF search = the user's own GIPHY key
   (keyring `giphy-api-key`), never WhatsApp's Tenor key; network on detached threads (`media::detached`).
+- Expired media (`app/media_fetch.rs`): every download goes through `media_fetch::download` with a `MediaOrigin`
+  (`App::media_origin`); on `Error::MediaExpired` (CDN 404/410) it calls `WaClient::reupload`, caches the new ref
+  (`Store::set_media_ref`) and parks it in `App::fresh_media`, applied to the open chat at the start of
+  `App::update` (`apply_fresh_media`). Forward refreshes media older than `forward::STALE_MEDIA_SECS` first.
+  A message whose re-upload came back `MediaGone` is remembered (`App::gone_media`) and never asked again in
+  the session: preview retries / scrolling must not send a retry receipt per attempt.
+- Message info (`app/msg_info.rs`): receipt times live in `receipt_times` (schema 9), written by
+  `App::record_receipt_times` from every `Event::Receipt` (`timestamp` 0 = now); the open panel reloads after
+  the write (chained task). Only our messages; it shares the right slot with the info drawer (one at a time).

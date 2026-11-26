@@ -19,7 +19,7 @@ use sha2::Digest;
 
 use super::actions::row_id;
 use super::message::{Done, Fetched, Message};
-use super::{App, CONVERSATION_SCROLL, MAX_STICKER_BYTES, picker};
+use super::{App, CONVERSATION_SCROLL, MAX_STICKER_BYTES, media_fetch, picker};
 use crate::media::picture::{self, Preview, PreviewCache};
 use crate::net::{Content, MediaKind, Message as ChatMessage};
 
@@ -246,10 +246,9 @@ impl App {
         max_pixels: u64,
         urgent: bool,
     ) -> Task<Message> {
-        let Some(mref) = self
+        let Some((mref, origin)) = self
             .find_message(id)
-            .and_then(|m| m.content.media())
-            .cloned()
+            .and_then(|m| m.content.media().map(|r| (r.clone(), self.media_origin(m))))
         else {
             return Task::none();
         };
@@ -313,7 +312,7 @@ impl App {
             let shelf = self.shelf();
             return Task::perform(
                 async move {
-                    let r = picker::fetch_sticker(client, mref, shelf).await;
+                    let r = picker::fetch_sticker(client, mref, shelf, Some(origin)).await;
                     (id, key, r)
                 },
                 |(id, key, result)| Message::done(Done::Downloaded { id, key, result }),
@@ -323,7 +322,7 @@ impl App {
         Task::perform(
             async move {
                 let r = async {
-                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    let bytes = media_fetch::download(&client, &mref, Some(&origin)).await?;
                     let k = mref.cache_key();
                     // Header probe (decompression bombs), decode, scale and
                     // store, all off the UI thread.

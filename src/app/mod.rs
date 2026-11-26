@@ -10,6 +10,8 @@ pub mod info;
 pub mod input;
 pub mod linkify;
 pub mod lists;
+pub mod media_fetch;
+pub mod msg_info;
 pub mod video;
 pub mod viewer;
 pub use actions::{PopupPos, popup_top, row_id};
@@ -41,6 +43,8 @@ pub mod picker;
 #[cfg(test)]
 mod picker_flows;
 pub mod pictures;
+#[cfg(test)]
+mod reupload_flows;
 #[cfg(test)]
 mod social_flows;
 pub mod state;
@@ -261,6 +265,12 @@ pub struct App {
     pub(crate) attach: Option<paste::AttachPreview>,
     /// Files dragged over / dropped on the window.
     pub(crate) drop: drop::DropState,
+    /// The "Message info" panel.
+    pub(crate) msg_info: Option<msg_info::MsgInfo>,
+    /// Re-uploaded media waiting to be applied to the open conversation.
+    pub(crate) fresh_media: media_fetch::FreshMedia,
+    /// Media whose re-upload the phone refused (asked once per session).
+    pub(crate) gone_media: media_fetch::GoneMedia,
     /// Reads the system clipboard for paste-to-send (blocking; a fake in
     /// tests).
     pub(crate) read_clipboard: fn() -> paste::Clipboard,
@@ -591,6 +601,9 @@ impl App {
             anim_epoch: Instant::now(),
             attach: None,
             drop: drop::DropState::default(),
+            fresh_media: Default::default(),
+            gone_media: Default::default(),
+            msg_info: None,
             read_clipboard: paste::read_clipboard,
             menu_open: false,
             qr: None,
@@ -697,7 +710,9 @@ impl App {
                         ScreenshotTarget::Emoji
                         | ScreenshotTarget::Viewer
                         | ScreenshotTarget::Info
-                        | ScreenshotTarget::GroupInfo,
+                        | ScreenshotTarget::GroupInfo
+                        | ScreenshotTarget::MessageInfo
+                        | ScreenshotTarget::GroupMessageInfo,
                         _,
                     )) => 5000,
                     // Call bubbles are stored, then the call rings.
@@ -779,6 +794,7 @@ impl App {
 
     /// The only mutation point. Pushes the tray model afterwards.
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.apply_fresh_media();
         let mut task = self.update_inner(message);
         self.release_picker();
         if self.settings_open && matches!(self.picker.key, picker::KeyState::Unknown) {
@@ -857,6 +873,10 @@ impl App {
             Ok(task) => return task,
             Err(ui) => ui,
         };
+        let ui = match self.on_ui_msg_info(ui) {
+            Ok(task) => return task,
+            Err(ui) => ui,
+        };
         let ui = match self.on_ui_drop(ui) {
             Ok(task) => return task,
             Err(ui) => ui,
@@ -902,6 +922,7 @@ impl App {
                         true
                     }
                     || self.viewer.take().is_some()
+                    || self.msg_info.take().is_some()
                     || self.info.take().is_some()
                     || self.chat_search.take().is_some()
                     || self.selection.take().is_some()
@@ -1164,6 +1185,7 @@ impl App {
         let paused = self.compose_stop();
         self.stash_draft();
         self.info = None;
+        self.msg_info = None;
         self.scroll_y = 0.0;
         let mut conv = Conversation::new(chat.clone(), Vec::new(), false);
         conv.unread = (unread > 0).then_some(state::UnreadDivider {
@@ -1459,6 +1481,7 @@ impl App {
         let Some(mref) = msg.content.media().cloned() else {
             return Task::none();
         };
+        let origin = self.media_origin(&msg);
         let declared = match &msg.content {
             Content::Voice { seconds, .. } => Some(*seconds),
             _ => None,
@@ -1493,7 +1516,7 @@ impl App {
         tasks.push(Task::perform(
             async move {
                 let r = async {
-                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    let bytes = media_fetch::download(&client, &mref, Some(&origin)).await?;
                     tokio::task::spawn_blocking(move || {
                         audio::decode_ogg_opus_bounded(&bytes, declared)
                     })
@@ -1549,6 +1572,7 @@ impl App {
         let Some(m) = self.find_message(id).cloned() else {
             return Task::none();
         };
+        let origin = self.media_origin(&m);
         let Content::Document {
             file_name,
             media: Some(mref),
@@ -1568,7 +1592,7 @@ impl App {
         self.toast("Downloading document…");
         Task::perform(
             async move {
-                let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                let bytes = media_fetch::download(&client, &mref, Some(&origin)).await?;
                 tokio::task::spawn_blocking(move || {
                     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
                     let path = unique_path(&dir, &safe_name);
@@ -1898,12 +1922,17 @@ impl App {
                     Some((t, _)) if !t.list_only()
                 ) && self.open.is_none()
                 {
-                    let chat =
-                        if matches!(self.cfg.screenshot, Some((ScreenshotTarget::GroupInfo, _))) {
-                            "120363000000000001@g.us"
-                        } else {
-                            crate::mock::SHOWCASE_CHAT
-                        };
+                    let chat = if matches!(
+                        self.cfg.screenshot,
+                        Some((
+                            ScreenshotTarget::GroupInfo | ScreenshotTarget::GroupMessageInfo,
+                            _
+                        ))
+                    ) {
+                        "120363000000000001@g.us"
+                    } else {
+                        crate::mock::SHOWCASE_CHAT
+                    };
                     tasks.push(Task::done(Message::Ui(Ui::OpenChat(chat.into()))));
                 }
                 tasks.extend(self.nav_scene(nav::SceneStage::History));
@@ -1914,8 +1943,16 @@ impl App {
                 ids,
                 status,
                 participant,
+                timestamp,
             } => {
                 let chat = self.lid_map.normalize(&chat);
+                let timed = self.record_receipt_times(
+                    &chat,
+                    &ids,
+                    participant.as_deref(),
+                    status,
+                    timestamp,
+                );
                 if let Some(p) = participant
                     && net::is_group_jid(&chat)
                     && matches!(
@@ -1923,7 +1960,7 @@ impl App {
                         ReceiptStatus::Delivered | ReceiptStatus::Read | ReceiptStatus::Played
                     )
                 {
-                    return self.group_receipt(chat, ids, status, p);
+                    return Task::batch([timed, self.group_receipt(chat, ids, status, p)]);
                 }
                 self.chats.apply_receipt(&chat, &ids, status);
                 if let Some(c) = &mut self.open
@@ -1931,9 +1968,12 @@ impl App {
                 {
                     c.apply_receipt(&ids, status);
                 }
-                return store_task(&self.store, move |s| {
-                    s.apply_receipt(&chat, &ids, status).map(|_| ())
-                });
+                return Task::batch([
+                    timed,
+                    store_task(&self.store, move |s| {
+                        s.apply_receipt(&chat, &ids, status).map(|_| ())
+                    }),
+                ]);
             }
             Event::ContactName { jid, name, source } => {
                 let jid = self.lid_map.normalize(&jid);
@@ -2423,6 +2463,7 @@ impl App {
                     ids: vec![id],
                     status,
                     participant: None,
+                    timestamp: 0,
                 });
             }
             Done::MediaSent { chat, id, result } => match result {
@@ -2443,6 +2484,7 @@ impl App {
                             ids: vec![id],
                             status: ReceiptStatus::Sent,
                             participant: None,
+                            timestamp: 0,
                         }),
                     ]);
                 }
@@ -2453,6 +2495,7 @@ impl App {
                         ids: vec![id],
                         status: ReceiptStatus::Failed,
                         participant: None,
+                        timestamp: 0,
                     });
                 }
             },
@@ -2478,6 +2521,7 @@ impl App {
             Done::Poster { chat, id, result } => return self.on_poster(chat, id, result),
             Done::ViewerImage { id, result } => self.on_viewer_image(id, result),
             Done::Info(d) => return self.on_info(*d),
+            Done::MsgInfo { chat, id, rows } => self.on_msg_info(chat, id, rows),
             Done::ViewerSaved(r) => match r {
                 Ok(Some(p)) => {
                     let name = p
@@ -2718,6 +2762,63 @@ impl App {
                 ));
             }
             ScreenshotTarget::Drop => v.push(ui(Ui::Drop(drop::DropMsg::Hovered))),
+            ScreenshotTarget::MessageInfo | ScreenshotTarget::GroupMessageInfo => {
+                // Receipts as they would arrive, then the panel.
+                let group = target == ScreenshotTarget::GroupMessageInfo;
+                let needle = if group {
+                    "Yo llevo las bebidas"
+                } else {
+                    "Llevo yo el café"
+                };
+                if let Some(m) = c.messages.iter().find(|m| {
+                    m.from_me && matches!(&m.content, Content::Text(t) if t.contains(needle))
+                }) {
+                    let (chat, id, ts) = (c.chat.clone(), m.id.clone(), m.timestamp);
+                    let receipt = |status, participant: Option<&str>, at: i64| {
+                        Task::done(Message::Net(net::Event::Receipt {
+                            chat: chat.clone(),
+                            ids: vec![id.clone()],
+                            status,
+                            participant: participant.map(str::to_string),
+                            timestamp: ts + at,
+                        }))
+                    };
+                    let steps = if group {
+                        vec![
+                            receipt(
+                                ReceiptStatus::Delivered,
+                                Some("34677777777@s.whatsapp.net"),
+                                4,
+                            ),
+                            receipt(ReceiptStatus::Read, Some("34677777777@s.whatsapp.net"), 95),
+                            receipt(
+                                ReceiptStatus::Delivered,
+                                Some("34688888888@s.whatsapp.net"),
+                                7,
+                            ),
+                            receipt(ReceiptStatus::Read, Some("34688888888@s.whatsapp.net"), 210),
+                            receipt(
+                                ReceiptStatus::Delivered,
+                                Some("34699999999@s.whatsapp.net"),
+                                40,
+                            ),
+                        ]
+                    } else {
+                        vec![
+                            receipt(ReceiptStatus::Delivered, None, 3),
+                            receipt(ReceiptStatus::Read, None, 75),
+                        ]
+                    };
+                    let open = ui(Ui::MessageInfo(id.clone()));
+                    v.push(
+                        Task::batch(steps).chain(
+                            Task::future(tokio::time::sleep(Duration::from_millis(500)))
+                                .discard()
+                                .chain(open),
+                        ),
+                    );
+                }
+            }
             ScreenshotTarget::Emoji => {
                 v.push(ui(Ui::Emoji("\u{1F602}")));
                 v.push(ui(Ui::Emoji("\u{2764}\u{FE0F}")));

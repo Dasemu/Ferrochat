@@ -138,9 +138,18 @@ click jumps to the original, loading the cache around it when needed.
 | Clear chat | `chat_actions().clear_chat(deleteStarred = !keep, deleteMedia = false)` | asks first ("Keep starred messages" ticked by default); sent first, applied here once the phone has it |
 | Delete chat | `chat_actions().delete_chat(deleteMedia = false)` | asks first; sent first, applied once the phone has it; list memberships are left to the phone |
 | Send video / GIF | `Client::upload(MediaType::Video)` + `VideoMessage` (`seconds`, `width`, `height`, `jpegThumbnail`) | only `.mp4` / `.m4v` go as videos: the `ferrochat-player` helper reads the size, duration and first frame (muted, then stopped) before the preview opens; a file it can't read goes as a document with a note. A `.gif` picked, pasted or dropped is converted by the same helper mode as the drawer (`--gif-to-mp4`, §2.5) and sent as a GIF (`gifPlayback`, no `gifAttribution` source). GIFs also loop in the viewer. Other containers (`.mov`, `.webm`, `.mkv`) stay documents |
-| Forward | `send_message_with_options` with the body rebuilt from the cached content and passed through `MessageExt::prepare_for_forward` (`convert::build_forward`) | up to 5 chats (1 when "forwarded many times"); each copy is a new message with our own id, shown and cached at once and sent in order. Media is relayed from the same CDN blob (`directPath`, `mediaKey`, hashes; `url` built on `mmg.whatsapp.net`), never re-uploaded. Quote, mentions and `messageSecret` are dropped like the official client. Not offered for deleted, view-once, unsupported, call or media without a key, nor for our own pending / failed messages |
+| Re-upload expired media | `media_reupload().request(MediaReuploadRequest)` (the "media retry" receipt; `participant` only for others' group messages) | a download answered 404 / 410 by the CDN (`Error::MediaExpired`, typical for old history) asks the sender's phone to upload the blob again, points the cached message at the new `directPath` (`Store::set_media_ref`) and tries once more; `NotFound` / errors leave the placeholder with "no longer available". Applies to photos, videos, voice notes, documents and posters, not to statuses |
+| Forward | `send_message_with_options` with the body rebuilt from the cached content and passed through `MessageExt::prepare_for_forward` (`convert::build_forward`) | up to 5 chats (1 when "forwarded many times"); each copy is a new message with our own id, shown and cached at once and sent in order. Media is relayed from the same CDN blob (`directPath`, `mediaKey`, hashes; `url` built on `mmg.whatsapp.net`), never re-uploaded by us; media older than 14 days (`forward::STALE_MEDIA_SECS`) is first refreshed with one re-upload request per source (best effort: on failure the old blob is relayed). Quote, mentions and `messageSecret` are dropped like the official client. Not offered for deleted, view-once, unsupported, call or media without a key, nor for our own pending / failed messages |
 | Sticker | `upload(MediaType::Sticker)` + `stickerMessage` | §2.5 |
 | GIF | `upload(MediaType::Video)` + `videoMessage { gifPlayback: true, gifAttribution }` | §2.5 |
+
+Message info: the menu of our own messages opens a "Message info" panel
+(`app/msg_info.rs`, `ui/msg_info.rs`) with sent / delivered / read / played
+times, and in groups who has read it and who has only received it. Times
+come from the receipts seen arriving (`receipt_times`, schema 9: one row per
+message, participant and status, first time kept; only our messages). Older
+messages, and receipts that arrived while Ferrochat was closed, show the
+status without a time ("Time not recorded").
 
 Forwarded mark: `contextInfo.isForwarded` / `forwardingScore` is kept per
 message (cache column `forwarded`, schema 8: the score, NULL = not

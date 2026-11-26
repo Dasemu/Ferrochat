@@ -497,8 +497,9 @@ pub(super) async fn fetch_sticker(
     client: net::ClientHandle,
     mref: MediaRef,
     shelf: Shelf,
+    origin: Option<super::media_fetch::MediaOrigin>,
 ) -> Result<Fetched, String> {
-    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+    let bytes = super::media_fetch::download(&client, &mref, origin.as_ref()).await?;
     let key = mref.cache_key();
     tokio::task::spawn_blocking(move || {
         let (item, still, anim) = sticker_parts(&bytes, key)?;
@@ -1040,8 +1041,15 @@ impl App {
         let Some(helper) = video::helper_path() else {
             return Task::none();
         };
-        // (media, inline thumbnail, width, height, seconds)
-        type Wanted = (MediaRef, Option<Vec<u8>>, u32, u32, u32);
+        // (media, inline thumbnail, width, height, seconds, re-upload origin)
+        type Wanted = (
+            MediaRef,
+            Option<Vec<u8>>,
+            u32,
+            u32,
+            u32,
+            super::media_fetch::MediaOrigin,
+        );
         let wanted: Vec<Wanted> = self
             .open
             .iter()
@@ -1055,15 +1063,20 @@ impl App {
                     height,
                     seconds,
                     ..
-                } if r.file_length <= shelf::MAX_GIF_BYTES => {
-                    Some((r.clone(), thumbnail.clone(), *width, *height, *seconds))
-                }
+                } if r.file_length <= shelf::MAX_GIF_BYTES => Some((
+                    r.clone(),
+                    thumbnail.clone(),
+                    *width,
+                    *height,
+                    *seconds,
+                    self.media_origin(m),
+                )),
                 _ => None,
             })
             .collect();
         let shelf = self.shelf();
         let mut tasks = Vec::new();
-        for (mref, thumb, w, h, secs) in wanted {
+        for (mref, thumb, w, h, secs, origin) in wanted {
             let key = mref.cache_key();
             if self.gif_inflight >= MAX_GIF_DECODES {
                 break;
@@ -1076,7 +1089,7 @@ impl App {
             let k = key.clone();
             tasks.push(Task::perform(
                 async move {
-                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
+                    let bytes = super::media_fetch::download(&client, &mref, Some(&origin)).await?;
                     crate::media::detached("gif-decode", move || {
                         let valid = k.len() == 64 && k.bytes().all(|b| b.is_ascii_hexdigit());
                         let name = if valid {
