@@ -56,6 +56,10 @@ automatic check off in Settings; it only asks GitHub for the latest release.
 |---|---|---|
 | ![](docs/screenshots/reply.png) | ![](docs/screenshots/reactions.png) | ![](docs/screenshots/chat-search.png) |
 
+| Select messages | Forward |
+|---|---|
+| ![](docs/screenshots/select.png) | ![](docs/screenshots/forward.png) |
+
 ## Features
 
 * QR-code pairing as a linked device (codes refresh automatically, reload
@@ -73,6 +77,8 @@ automatic check off in Settings; it only asks GitHub for the latest release.
 * Replies (quoted message, click to jump, reply bar), reactions (badge, who
   reacted, hover picker, send and remove), edit (15 min) and delete for me /
   for everyone, "Edited" marker.
+* Forward messages to up to five chats at once, from the message menu or by
+  selecting several messages; "Forwarded" / "Forwarded many times" marks.
 * Typing and recording indicators, online / last seen, and our own throttled
   "typing…" presence.
 * Search in the chat list (chats and cached messages) and inside a chat, with

@@ -137,8 +137,15 @@ click jumps to the original, loading the cache around it when needed.
 | Mark as read / unread | `chat_actions().mark_chat_as_read` with the newest message as `messageRange` | optimistic, reverted on failure; reading a chat that was marked unread by hand (here or on the phone, since start-up) also sends `read = true` |
 | Clear chat | `chat_actions().clear_chat(deleteStarred = !keep, deleteMedia = false)` | asks first ("Keep starred messages" ticked by default); sent first, applied here once the phone has it |
 | Delete chat | `chat_actions().delete_chat(deleteMedia = false)` | asks first; sent first, applied once the phone has it; list memberships are left to the phone |
+| Forward | `send_message_with_options` with the body rebuilt from the cached content and passed through `MessageExt::prepare_for_forward` (`convert::build_forward`) | up to 5 chats (1 when "forwarded many times"); each copy is a new message with our own id, shown and cached at once and sent in order. Media is relayed from the same CDN blob (`directPath`, `mediaKey`, hashes; `url` built on `mmg.whatsapp.net`), never re-uploaded. Quote, mentions and `messageSecret` are dropped like the official client. Not offered for deleted, view-once, unsupported, call or media without a key, nor for our own pending / failed messages |
 | Sticker | `upload(MediaType::Sticker)` + `stickerMessage` | §2.5 |
 | GIF | `upload(MediaType::Video)` + `videoMessage { gifPlayback: true, gifAttribution }` | §2.5 |
+
+Forwarded mark: `contextInfo.isForwarded` / `forwardingScore` is kept per
+message (cache column `forwarded`, schema 8: the score, NULL = not
+forwarded) and shown as "Forwarded", or "Forwarded many times" with a double
+arrow from score 5 (the library jumps to the 127 sentinel there). A forward
+of a forward carries the source score plus one.
 
 Mentions: `contextInfo.mentionedJid` is kept per message (cache column
 `mentions`, schema 6). An "@<digits>" in the text is shown as the name of

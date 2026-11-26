@@ -968,6 +968,7 @@ fn incoming(chat: &str, id: &str, ts: i64) -> crate::net::Message {
         expires_at: None,
         reply: None,
         edited: false,
+        forwarded: None,
         mentions: Vec::new(),
         reactions: Vec::new(),
     }

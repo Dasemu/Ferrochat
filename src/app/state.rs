@@ -1190,6 +1190,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }
@@ -1917,6 +1918,7 @@ mod mention_tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: vec![LID.into()],
             reactions: Vec::new(),
         };
@@ -1953,6 +1955,7 @@ mod read_state_tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         };

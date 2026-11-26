@@ -23,6 +23,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("migration_5.sql"),
     include_str!("migration_6.sql"),
     include_str!("migration_7.sql"),
+    include_str!("migration_8.sql"),
 ];
 
 mod social;
@@ -188,7 +189,7 @@ impl Store {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited, mentions
+                    reply, edited, mentions, forwarded
              FROM messages
              WHERE chat_id = ?1 AND kind IN (SELECT value FROM json_each(?2))
              ORDER BY ts DESC, id DESC LIMIT ?3",
@@ -232,8 +233,8 @@ impl Store {
             let mut insert = tx.prepare_cached(
                 "INSERT INTO messages
                     (chat_id, id, sender, sender_name, from_me, ts, kind, content, thumb, status,
-                     expires_at, reply, edited, search, mentions)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                     expires_at, reply, edited, search, mentions, forwarded)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             )?;
             let mut react = tx.prepare_cached(
                 "INSERT INTO reactions (chat_id, msg_id, reactor, emoji, ts)
@@ -281,6 +282,7 @@ impl Store {
                             m.edited,
                             search_text(&m.content),
                             encode_mentions(&m.mentions),
+                            m.forwarded,
                         ])?;
                         new_ids.push(m.id.clone());
                     }
@@ -372,7 +374,7 @@ impl Store {
         let (ts, id) = before.unwrap_or((i64::MAX, ""));
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited, mentions
+                    reply, edited, mentions, forwarded
              FROM messages
              WHERE chat_id = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
              ORDER BY ts DESC, id DESC LIMIT ?4",
@@ -391,7 +393,7 @@ impl Store {
         let conn = self.lock()?;
         let mut st = conn.prepare_cached(
             "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status, expires_at,
-                    reply, edited, mentions
+                    reply, edited, mentions, forwarded
              FROM messages WHERE chat_id = ?1 AND id = ?2",
         )?;
         let mut m = st.query_row(params![chat, id], row_to_message).optional()?;
@@ -407,7 +409,7 @@ impl Store {
         let mut st = conn.prepare_cached(
             "SELECT c.id, c.name, c.unread, c.last_ts, c.pinned, c.archived, c.mute_end,
                     m.chat_id, m.id, m.sender, m.sender_name, m.from_me, m.ts, m.content,
-                    m.thumb, m.status, m.expires_at, m.reply, m.edited, m.mentions
+                    m.thumb, m.status, m.expires_at, m.reply, m.edited, m.mentions, m.forwarded
              FROM chats c
              LEFT JOIN messages m ON m.rowid = (
                 SELECT rowid FROM messages WHERE chat_id = c.id ORDER BY ts DESC, id DESC LIMIT 1
@@ -785,7 +787,7 @@ impl Store {
     ) -> Result<Window> {
         let conn = self.lock()?;
         let cols = "chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                    expires_at, reply, edited, mentions";
+                    expires_at, reply, edited, mentions, forwarded";
         let mut older = conn
             .prepare_cached(&format!(
                 "SELECT {cols} FROM messages
@@ -827,7 +829,7 @@ impl Store {
         let mut rows = conn
             .prepare_cached(
                 "SELECT chat_id, id, sender, sender_name, from_me, ts, content, thumb, status,
-                        expires_at, reply, edited, mentions
+                        expires_at, reply, edited, mentions, forwarded
                  FROM messages
                  WHERE chat_id = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3))
                  ORDER BY ts ASC, id ASC LIMIT ?4",
@@ -1084,6 +1086,7 @@ fn row_to_message_at(r: &rusqlite::Row<'_>, o: usize) -> rusqlite::Result<Messag
             .get::<_, Option<String>>(o + 12)?
             .map(|j| decode_mentions(&j))
             .unwrap_or_default(),
+        forwarded: r.get(o + 13)?,
     })
 }
 
@@ -1161,6 +1164,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         }
@@ -1531,6 +1535,33 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_mark_round_trips_and_old_rows_read_as_not_forwarded() {
+        let conn = Connection::open_in_memory().unwrap();
+        for (i, sql) in MIGRATIONS.iter().take(7).enumerate() {
+            conn.execute_batch(sql).unwrap();
+            conn.pragma_update(None, "user_version", i as i64 + 1)
+                .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO messages (chat_id, id, sender, from_me, ts, kind, content, status)
+             VALUES ('c', 'old', 'c', 0, 1, 'text', '{\"Text\":\"hi\"}', 3);",
+        )
+        .unwrap();
+        let s = Store::init(conn).unwrap();
+        assert_eq!(s.schema_version().unwrap(), MIGRATIONS.len() as i64);
+        let mut m = msg("c", "new", 2, false, "fwd");
+        m.forwarded = Some(4);
+        s.insert_messages(&[m]).unwrap();
+        let page = s.load_messages("c", None, 10).unwrap();
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].forwarded, None);
+        assert_eq!(page[1].forwarded, Some(4));
+        assert_eq!(s.message("c", "new").unwrap().unwrap().forwarded, Some(4));
+        let row = s.chat_rows().unwrap().remove(0);
+        assert_eq!(row.last.unwrap().forwarded, Some(4));
+    }
+
+    #[test]
     fn migration_7_keeps_old_mutes_as_always() {
         let conn = Connection::open_in_memory().unwrap();
         for (i, sql) in MIGRATIONS.iter().take(6).enumerate() {
@@ -1687,6 +1718,7 @@ mod tests {
             expires_at: None,
             reply: None,
             edited: false,
+            forwarded: None,
             mentions: Vec::new(),
             reactions: Vec::new(),
         };
