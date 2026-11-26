@@ -11,6 +11,7 @@
 pub mod call;
 pub mod convert;
 pub mod fake;
+pub mod giphy;
 pub mod social;
 pub mod types;
 pub mod whatsapp;

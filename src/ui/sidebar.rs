@@ -367,7 +367,7 @@ fn menu(app: &App) -> El<'_> {
         )
         .width(Length::Fill)
         .padding([10, 20])
-        .style(theme::chat_row(t, false));
+        .style(theme::menu_item(t));
         match msg {
             Some(m) => b.on_press(m).into(),
             None => b.into(),
@@ -399,15 +399,7 @@ fn menu(app: &App) -> El<'_> {
         .width(220),
     )
     .padding([8, 0])
-    .style(move |th: &iced::Theme| {
-        let mut s = theme::rounded(p.bg_elevated, 6.0)(th);
-        s.shadow = iced::Shadow {
-            color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-            offset: iced::Vector::new(0.0, 2.0),
-            blur_radius: 10.0,
-        };
-        s
-    });
+    .style(theme::popup(t, 6.0));
     container(card)
         .width(Length::Fill)
         .align_x(Alignment::End)
@@ -719,7 +711,7 @@ pub fn context_menu(app: &App) -> Option<El<'_>> {
         )
         .width(Length::Fill)
         .padding([9, 18])
-        .style(theme::chat_row(t, false))
+        .style(theme::menu_item(t))
         .on_press(Message::Ui(on))
         .into()
     };
@@ -852,15 +844,7 @@ pub fn context_menu(app: &App) -> Option<El<'_>> {
     let y = menu.at.y.min(win.height - h - 8.0).max(8.0);
     let card = container(col.width(w))
         .padding([6, 0])
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 8.0)(th);
-            s.shadow = iced::Shadow {
-                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.4),
-                offset: iced::Vector::new(0.0, 2.0),
-                blur_radius: 10.0,
-            };
-            s
-        });
+        .style(theme::popup(t, 8.0));
     let dismiss = mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
         .on_press(Message::Ui(Ui::CloseSidebarMenu))
         .on_right_press(Message::Ui(Ui::CloseSidebarMenu));
@@ -971,15 +955,7 @@ fn modal<'a>(app: &'a App, body: El<'a>) -> El<'a> {
     let card = container(body)
         .padding(24)
         .width(380)
-        .style(move |th: &iced::Theme| {
-            let mut s = theme::rounded(p.bg_elevated, 12.0)(th);
-            s.shadow = iced::Shadow {
-                color: iced::Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 24.0,
-            };
-            s
-        });
+        .style(theme::rounded(p.bg_elevated, 12.0));
     opaque(
         container(card)
             .center(Length::Fill)

@@ -1,6 +1,7 @@
 //! App state and the single `update` mutation point.
 
 mod actions;
+pub mod anim;
 pub mod call;
 pub mod composer;
 pub mod emoji;
@@ -20,12 +21,20 @@ mod call_flows;
 mod chat_action_flows;
 #[cfg(test)]
 mod flows;
+#[cfg(test)]
+mod image_flows;
 pub mod live;
 pub mod message;
 pub mod nav;
 pub mod paste;
 #[cfg(test)]
+mod paste_flows;
+#[cfg(test)]
 mod perf;
+pub mod picker;
+#[cfg(test)]
+mod picker_flows;
+pub mod pictures;
 #[cfg(test)]
 mod social_flows;
 pub mod state;
@@ -227,8 +236,22 @@ pub struct App {
     pub(crate) emoji_open: bool,
     /// Emoji picker search and recent emoji.
     pub(crate) emoji: emoji::Picker,
+    /// The drawer's GIF and Stickers tabs (`app/picker.rs`).
+    pub(crate) picker: picker::MediaPicker,
+    /// Decoded animations of animated stickers and GIFs (bubbles).
+    pub(crate) anims: ByteLru<String, Arc<anim::Anim>>,
+    /// GIF bubbles whose animation was requested in this run.
+    gif_tried: HashSet<String>,
+    /// GIF decodes running.
+    gif_inflight: usize,
+    /// Shared start time of every animation (they stay in step across
+    /// view rebuilds).
+    pub(crate) anim_epoch: Instant,
     /// Attachment preview (picked or pasted media waiting for "send").
     pub(crate) attach: Option<paste::AttachPreview>,
+    /// Reads the system clipboard for paste-to-send (blocking; a fake in
+    /// tests).
+    pub(crate) read_clipboard: fn() -> paste::Clipboard,
     pub(crate) menu_open: bool,
     pub(crate) qr: Option<image::Handle>,
     pub(crate) images: ByteLru<String, image::Handle>,
@@ -237,7 +260,8 @@ pub struct App {
     pub(crate) posters_tried: HashSet<String>,
     /// A poster extraction is running (one at a time).
     poster_busy: bool,
-    downloading: HashSet<String>,
+    /// Photo / sticker downloads, the preview disk cache, retries.
+    pub(crate) pictures: pictures::Pictures,
     player: Option<Player>,
     pub(crate) voice: Option<VoiceState>,
     voice_cache: ByteLru<String, Arc<Pcm>>,
@@ -255,8 +279,6 @@ pub struct App {
     /// The session store exists but cannot be decrypted; the login screen
     /// offers to discard it.
     pub(crate) session_unreadable: bool,
-    /// Message ids waiting for a download slot (images, auto-download).
-    download_queue: VecDeque<String>,
     /// App-level reconnect backoff after a non-transient refusal.
     offline_attempt: u32,
     /// Calls: the ringing / current call and the logged call ids.
@@ -488,6 +510,11 @@ impl App {
             AuthState::WaitingForQr
         };
         let avatar_dir = (!cfg.mock).then(|| cfg.cache_dir.join("avatars"));
+        let pictures = pictures::Pictures {
+            cache: (!cfg.mock)
+                .then(|| crate::media::picture::PreviewCache::new(cfg.cache_dir.join("previews"))),
+            ..pictures::Pictures::default()
+        };
         let settings = if cfg.mock {
             crate::settings::Settings::default()
         } else {
@@ -502,6 +529,14 @@ impl App {
         let window = App::initial_mode(&cfg, settings.close_to_tray);
         let geom = WindowGeom::initial(cfg.screenshot.is_some());
         let updater = App::new_updater(&cfg);
+        let mut picker = picker::MediaPicker::load(&store);
+        if cfg.mock {
+            let shelf = crate::media::sticker::Shelf::new(picker::mock_shelf_root());
+            let (stickers, gifs) = picker::seed_mock(&shelf);
+            picker.favourites = stickers.iter().take(1).cloned().collect();
+            picker.recent_stickers = stickers;
+            picker.recent_gifs = gifs;
+        }
         let app = Self {
             theme: FerroTheme::new(!cfg.light_theme),
             cfg,
@@ -535,14 +570,20 @@ impl App {
                 recent: recent_emoji,
                 ..Default::default()
             },
+            picker,
+            anims: ByteLru::new(picker::ANIM_BUDGET),
+            gif_tried: HashSet::new(),
+            gif_inflight: 0,
+            anim_epoch: Instant::now(),
             attach: None,
+            read_clipboard: paste::read_clipboard,
             menu_open: false,
             qr: None,
             images: ByteLru::new(IMAGE_BUDGET),
+            pictures,
             thumbs: HashMap::new(),
             posters_tried: HashSet::new(),
             poster_busy: false,
-            downloading: HashSet::new(),
             player: None,
             voice: None,
             voice_cache: ByteLru::new(16 * 1024 * 1024),
@@ -557,7 +598,6 @@ impl App {
             first_frame_logged: false,
             lid_map,
             session_unreadable: false,
-            download_queue: VecDeque::new(),
             offline_attempt: 0,
             hovered: None,
             popup: None,
@@ -634,6 +674,8 @@ impl App {
                     Some((ScreenshotTarget::Video, _)) => 9000,
                     // Encodes a photo after the history loads.
                     Some((ScreenshotTarget::Paste, _)) => 6000,
+                    // Search debounce, mock tiles, GIF frames from the helper.
+                    Some((ScreenshotTarget::Stickers | ScreenshotTarget::Gifs, _)) => 7000,
                     Some((
                         ScreenshotTarget::Emoji
                         | ScreenshotTarget::Viewer
@@ -680,68 +722,7 @@ impl App {
             iced::window::close_requests().map(Message::CloseRequested),
             iced::window::close_events().map(Message::WindowClosed),
             Subscription::run(crate::ext::stream).map(Message::External),
-            iced::event::listen_with(|event, status, id| match event {
-                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
-                    input::set(position);
-                    None
-                }
-                iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
-                iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
-                iced::Event::Window(iced::window::Event::Resized(size)) => {
-                    Some(Message::WindowResized(id, size))
-                }
-                iced::Event::Window(iced::window::Event::Moved(p)) => {
-                    Some(Message::WindowMoved(id, p))
-                }
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
-                    ..
-                }) => Some(Message::Ui(Ui::CloseChat)),
-                // Paste: the composer's text input pastes text itself; this
-                // only looks for a copied image or files (see `app::paste`).
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key,
-                    physical_key,
-                    modifiers,
-                    ..
-                }) if paste::is_paste_shortcut(&key, physical_key, modifiers) => {
-                    Some(Message::Ui(Ui::Paste))
-                }
-                // Space pauses the video viewer, unless a text field took it.
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
-                    ..
-                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::VideoToggle)),
-                // Status viewer: arrows step through the updates.
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight),
-                    ..
-                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(1))),
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
-                    ..
-                }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(-1))),
-                // Image viewer zoom keys (no text field has them then).
-                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
-                    key: iced::keyboard::Key::Character(c),
-                    modifiers,
-                    ..
-                }) if status == iced::event::Status::Ignored && !modifiers.control() => {
-                    match c.as_str() {
-                        "+" | "=" => Some(Message::Ui(Ui::ViewerZoom {
-                            factor: viewer::ZOOM_STEP,
-                            at: iced::Vector::ZERO,
-                        })),
-                        "-" => Some(Message::Ui(Ui::ViewerZoom {
-                            factor: 1.0 / viewer::ZOOM_STEP,
-                            at: iced::Vector::ZERO,
-                        })),
-                        "0" => Some(Message::Ui(Ui::ViewerResetZoom)),
-                        _ => None,
-                    }
-                }
-                _ => None,
-            }),
+            iced::event::listen_with(runtime_event),
         ];
         // Only once the helper runs: the stream takes the receiver on start.
         if let Some(v) = self
@@ -781,7 +762,12 @@ impl App {
 
     /// The only mutation point. Pushes the tray model afterwards.
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        let task = self.update_inner(message);
+        let mut task = self.update_inner(message);
+        self.release_picker();
+        if self.settings_open && matches!(self.picker.key, picker::KeyState::Unknown) {
+            // The GIFs section shows whether a key is saved.
+            task = Task::batch([task, self.load_gif_key()]);
+        }
         self.sync_tray();
         task
     }
@@ -956,10 +942,13 @@ impl App {
             Ui::ToggleEmoji => {
                 self.emoji_open = !self.emoji_open;
                 self.emoji.opened();
+                let load = self.picker_toggled();
                 if !self.emoji_open {
-                    return operation::focus(COMPOSER_ID);
+                    return Task::batch([load, operation::focus(COMPOSER_ID)]);
                 }
+                return load;
             }
+            Ui::Picker(p) => return self.on_picker(p),
             Ui::Emoji(e) => {
                 return self.pick_emoji(e);
             }
@@ -1026,6 +1015,7 @@ impl App {
                 }
             }
             Ui::OpenDocument(id) => return self.open_document(&id),
+            Ui::RetryImage(id) => return self.retry_image(&id),
             Ui::Scrolled {
                 relative_y,
                 offset_y,
@@ -1036,9 +1026,11 @@ impl App {
                     self.popup = None;
                 }
                 self.scroll_y = offset_y;
+                // Photos scrolled into view are fetched first.
+                let visible = self.check_visible();
                 if self.pending_read > 0 && self.reading_chat().is_some() {
                     // Scrolled back down to unread messages: they are read now.
-                    return self.send_pending_reads();
+                    return Task::batch([visible, self.send_pending_reads()]);
                 }
                 if relative_y < 0.02
                     && self
@@ -1046,7 +1038,7 @@ impl App {
                         .as_ref()
                         .is_some_and(|c| c.has_newer && !c.loading)
                 {
-                    return self.load_newer_page();
+                    return Task::batch([visible, self.load_newer_page()]);
                 }
                 if relative_y > 0.98
                     && let Some(c) = &mut self.open
@@ -1057,7 +1049,7 @@ impl App {
                     c.loading = true;
                     let chat = c.chat.clone();
                     let s = self.store.clone();
-                    return blocking(
+                    let older = blocking(
                         move || {
                             s.load_messages(&chat, Some((ts, &id)), PAGE)
                                 .map(|m| (chat, m))
@@ -1072,7 +1064,9 @@ impl App {
                             Err(e) => Message::done(Done::Stored(Err(e.to_string()))),
                         },
                     );
+                    return Task::batch([visible, older]);
                 }
+                return visible;
             }
             Ui::ReloadQr => {
                 self.auth = std::mem::take(&mut self.auth).next(AuthEvent::ReloadQr);
@@ -1153,6 +1147,7 @@ impl App {
             count: unread,
         });
         self.open = Some(conv);
+        self.reset_pictures_for_chat();
         match self.drafts.take(&chat) {
             Some(d) => self.composer.set_text(&d),
             None => self.composer.clear(),
@@ -1208,7 +1203,7 @@ impl App {
     fn add_local(&mut self, msg: ChatMessage) -> Task<Message> {
         self.chats
             .apply_messages(std::slice::from_ref(&msg), Some(&msg.chat), true, None);
-        self.index_thumbs(std::slice::from_ref(&msg));
+        let placeholder = self.index_thumbs(std::slice::from_ref(&msg));
         if let Some(c) = &mut self.open {
             if c.has_newer {
                 // Sending from the middle of old history: continue from the
@@ -1218,6 +1213,7 @@ impl App {
             c.merge(vec![msg.clone()]);
         }
         Task::batch([
+            placeholder,
             store_task(&self.store, move |s| s.insert_messages(&[msg]).map(|_| ())),
             operation::snap_to(CONVERSATION_SCROLL, operation::RelativeOffset::START),
         ])
@@ -1275,7 +1271,12 @@ impl App {
         };
         let id = net::new_message_id();
         let local = self.local_message(&chat, id.clone(), media.local_content(None));
-        let t1 = self.add_local(local);
+        // A photo is shown from the file itself, before and after the upload.
+        let own = match media.kind {
+            net::OutgoingKind::Image { .. } => self.preview_own_photo(&id, media.bytes.clone()),
+            _ => Task::none(),
+        };
+        let t1 = Task::batch([self.add_local(local), own]);
         let Some(client) = self.client.clone() else {
             return t1;
         };
@@ -1293,8 +1294,10 @@ impl App {
     }
 
     /// Ctrl+V: if the composer has focus and the clipboard holds an image or
-    /// copied files (and no text), open the attachment preview. The text
-    /// input pastes text by itself; the clipboard is read off the UI thread.
+    /// copied files (see `paste::classify`), open the attachment preview.
+    /// The composer's `text_editor` pastes text by itself (it captures the
+    /// key event; `runtime_event` still sees it); the clipboard is read off
+    /// the UI thread.
     fn paste(&mut self) -> Task<Message> {
         if self.attach.is_some() || self.editing.is_some() || self.recording_since.is_some() {
             return Task::none();
@@ -1302,14 +1305,15 @@ impl App {
         let Some(chat) = self.open.as_ref().map(|c| c.chat.clone()) else {
             return Task::none();
         };
+        let read = self.read_clipboard;
         operation::is_focused(COMPOSER_ID).then(move |focused| {
             if !focused {
                 return Task::none();
             }
             let chat = chat.clone();
             Task::perform(
-                async {
-                    tokio::task::spawn_blocking(|| paste::stage(paste::read_clipboard()))
+                async move {
+                    tokio::task::spawn_blocking(move || paste::stage(read()))
                         .await
                         .ok()
                         .flatten()
@@ -1331,6 +1335,16 @@ impl App {
         }
         let staged = *staged;
         if let Some(text) = paste::strip_pasted_paths(&self.composer.text(), &staged.pasted_paths) {
+            self.composer.set_text(&text);
+        }
+        // A browser's "Copy image" also offers the image URL as text, which
+        // the composer pasted before the image was read: take it out again.
+        if let Some(pasted) = staged
+            .pasted_text
+            .as_deref()
+            .filter(|_| !staged.items.is_empty())
+            && let Some(text) = paste::strip_pasted_text(&self.composer.text(), pasted)
+        {
             self.composer.set_text(&text);
         }
         if let Some(first) = staged.problems.first() {
@@ -1391,94 +1405,6 @@ impl App {
 
     pub fn find_message(&self, id: &str) -> Option<&ChatMessage> {
         self.open.as_ref().and_then(|c| c.get(id))
-    }
-
-    /// Queues or starts a download, at most [`crate::media::MAX_CONCURRENT_DOWNLOADS`]
-    /// at a time.
-    fn request_media(&mut self, id: &str, max_pixels: u64, urgent: bool) -> Task<Message> {
-        let Some(mref) = self
-            .find_message(id)
-            .and_then(|m| m.content.media())
-            .cloned()
-        else {
-            return Task::none();
-        };
-        let key = mref.cache_key();
-        if self.images.contains(&key) || self.downloading.contains(&key) {
-            return Task::none();
-        }
-        if self.downloading.len() >= crate::media::MAX_CONCURRENT_DOWNLOADS {
-            if !self.download_queue.iter().any(|q| q == id) {
-                if urgent {
-                    self.download_queue.push_front(id.to_string());
-                } else {
-                    self.download_queue.push_back(id.to_string());
-                }
-            }
-            return Task::none();
-        }
-        let Some(client) = self.client.clone() else {
-            return Task::none();
-        };
-        if mref.kind == net::MediaKind::Sticker && mref.file_length > MAX_STICKER_BYTES {
-            // Not a sticker anyone sends: show the placeholder.
-            return Task::none();
-        }
-        self.downloading.insert(key.clone());
-        Task::perform(
-            async move {
-                let r = async {
-                    let bytes = client.download(&mref).await.map_err(|e| e.to_string())?;
-                    if mref.kind == net::MediaKind::Sticker {
-                        // WebP: decode the first frame off the UI thread.
-                        let (w, h, px) = tokio::task::spawn_blocking(move || {
-                            crate::media::image::decode_sticker(&bytes).map_err(|e| e.to_string())
-                        })
-                        .await
-                        .map_err(|e| e.to_string())??;
-                        return Ok(Fetched::Rgba {
-                            width: w,
-                            height: h,
-                            pixels: Arc::new(px),
-                        });
-                    }
-                    let bytes = Arc::new(bytes);
-                    if mref.kind == net::MediaKind::Image {
-                        // Header-only probe: refuse oversized images and
-                        // decompression bombs before iced decodes them.
-                        let probe = bytes.clone();
-                        tokio::task::spawn_blocking(move || {
-                            crate::media::image::check_image_bounds_max(&probe, max_pixels)
-                                .map(|_| ())
-                        })
-                        .await
-                        .map_err(|e| e.to_string())?
-                        .map_err(|e| e.to_string())?;
-                    }
-                    Ok::<_, String>(Fetched::Bytes(bytes))
-                }
-                .await;
-                (key, r)
-            },
-            |(key, result)| Message::done(Done::Downloaded { key, result }),
-        )
-    }
-
-    /// Starts queued downloads while slots are free.
-    fn pump_downloads(&mut self) -> Task<Message> {
-        let mut tasks = Vec::new();
-        while self.downloading.len() < crate::media::MAX_CONCURRENT_DOWNLOADS {
-            let Some(id) = self.download_queue.pop_front() else {
-                break;
-            };
-            let cap = if self.viewer.as_ref().is_some_and(|v| v.id == id) {
-                crate::media::MAX_IMAGE_PIXELS
-            } else {
-                crate::media::MAX_AUTO_IMAGE_PIXELS
-            };
-            tasks.push(self.request_media(&id, cap, false));
-        }
-        Task::batch(tasks)
     }
 
     fn play_voice(&mut self, id: String) -> Task<Message> {
@@ -1642,6 +1568,11 @@ impl App {
         self.chats = ChatList::default();
         self.images.clear();
         self.thumbs.clear();
+        let preview_dir = self.pictures.cache.as_ref().map(|c| c.dir().to_path_buf());
+        self.pictures = pictures::Pictures {
+            cache: self.pictures.cache.take(),
+            ..pictures::Pictures::default()
+        };
         self.avatars.clear();
         self.avatar_none.clear();
         self.reset_live_state();
@@ -1668,8 +1599,9 @@ impl App {
                 if let Err(e) = store.clear() {
                     problems.push(format!("cache: {e}"));
                 }
-                if let Some(dir) = avatar_dir {
-                    // Profile pictures belong to the unlinked account.
+                // Profile pictures and photo previews belong to the
+                // unlinked account.
+                for dir in [avatar_dir, preview_dir].into_iter().flatten() {
                     let _ = std::fs::remove_dir_all(dir);
                 }
                 if !mock {
@@ -1758,12 +1690,12 @@ impl App {
         Task::batch(tasks)
     }
 
-    fn index_thumbs(&mut self, msgs: &[ChatMessage]) {
+    /// Thumbnail handles for video / link bubbles, and blurred placeholders
+    /// (made off the UI thread) for the open chat's photos.
+    fn index_thumbs(&mut self, msgs: &[ChatMessage]) -> Task<Message> {
         for m in msgs {
             let thumb = match &m.content {
-                Content::Image { thumbnail, .. } | Content::Video { thumbnail, .. } => {
-                    thumbnail.as_ref()
-                }
+                Content::Video { thumbnail, .. } => thumbnail.as_ref(),
                 Content::Link { preview, .. } => preview.thumbnail.as_ref(),
                 _ => None,
             };
@@ -1783,6 +1715,14 @@ impl App {
                 .collect();
             self.thumbs.retain(|k, _| keep.contains(k));
         }
+        let open = self.open.as_ref().map(|c| c.chat.clone());
+        let photos: Vec<ChatMessage> = msgs
+            .iter()
+            .filter(|m| Some(&m.chat) == open.as_ref())
+            .filter(|m| matches!(m.content, Content::Image { .. }))
+            .cloned()
+            .collect();
+        self.make_placeholders(&photos)
     }
 
     fn auto_download_images(&mut self) -> Task<Message> {
@@ -1790,12 +1730,7 @@ impl App {
             .open
             .iter()
             .flat_map(|c| c.messages.iter().rev().take(30))
-            .filter(|m| {
-                matches!(
-                    m.content,
-                    Content::Image { media: Some(_), .. } | Content::Sticker { media: Some(_), .. }
-                )
-            })
+            .filter(|m| pictures::auto_fetched(&m.content))
             .map(|m| m.id.clone())
             .collect();
         let mut tasks: Vec<_> = ids
@@ -1803,6 +1738,8 @@ impl App {
             .map(|id| self.request_media(id, crate::media::MAX_AUTO_IMAGE_PIXELS, false))
             .collect();
         tasks.push(self.want_poster());
+        tasks.push(self.want_gif_anims());
+        tasks.push(self.check_visible());
         Task::batch(tasks)
     }
 
@@ -2287,8 +2224,7 @@ impl App {
             true,
             counts.then_some(&fresh),
         );
-        self.index_thumbs(&messages);
-        let mut tasks = Vec::new();
+        let mut tasks = vec![self.index_thumbs(&messages)];
         if !pushed.is_empty() {
             tasks.push(store_task(&self.store, move |s| {
                 s.set_contact_names(&pushed)
@@ -2411,12 +2347,14 @@ impl App {
                 older,
                 has_more,
             } => {
-                self.index_thumbs(&msgs);
+                let placeholders = self.index_thumbs(&msgs);
                 if let Some(c) = &mut self.open
                     && c.chat == chat
                 {
                     if older {
                         c.prepend(msgs, has_more);
+                        // Older photos scrolled into view are fetched now.
+                        return Task::batch([placeholders, self.check_visible()]);
                     } else if c.has_newer {
                         // A jump already placed the window: do not splice
                         // the newest page next to it.
@@ -2434,12 +2372,14 @@ impl App {
                                 CONVERSATION_SCROLL,
                                 operation::RelativeOffset::START,
                             ),
+                            placeholders,
                             self.auto_download_images(),
                             self.send_pending_reads(),
                             Task::batch(scene),
                         ]);
                     }
                 }
+                return placeholders;
             }
             Done::Sent { chat, id, result } => {
                 let status = match &result {
@@ -2458,6 +2398,8 @@ impl App {
             }
             Done::MediaSent { chat, id, result } => match result {
                 Ok(content) => {
+                    // The reference carries the same key now.
+                    self.pictures.local_keys.remove(&id);
                     if let Some(c) = &mut self.open
                         && c.chat == chat
                     {
@@ -2485,30 +2427,16 @@ impl App {
                     });
                 }
             },
-            Done::Downloaded { key, result } => {
-                self.downloading.remove(&key);
-                match result {
-                    Ok(Fetched::Bytes(bytes)) => {
-                        let size = bytes.len();
-                        // Hand the buffer to iced without copying when we hold
-                        // the only reference.
-                        let owned = Arc::try_unwrap(bytes).unwrap_or_else(|a| (*a).clone());
-                        self.images.put(key, image::Handle::from_bytes(owned), size);
-                    }
-                    Ok(Fetched::Rgba {
-                        width,
-                        height,
-                        pixels,
-                    }) => {
-                        let size = pixels.len();
-                        let owned = Arc::try_unwrap(pixels).unwrap_or_else(|a| (*a).clone());
-                        self.images
-                            .put(key, image::Handle::from_rgba(width, height, owned), size);
-                    }
-                    Err(e) => tracing::warn!(error = %e, "media download failed"),
-                }
-                return self.pump_downloads();
-            }
+            Done::Downloaded { id, key, result } => return self.on_downloaded(id, key, result),
+            Done::DiskPreview {
+                id,
+                key,
+                max_pixels,
+                preview,
+            } => return self.on_disk_preview(id, key, max_pixels, preview),
+            Done::Placeholders(list) => self.on_placeholders(list),
+            Done::RetryMedia { id, key } => return self.on_retry_media(id, key),
+            Done::Visible(ids) => return self.on_visible(ids),
             Done::MessagesStored {
                 messages,
                 new_ids,
@@ -2564,6 +2492,7 @@ impl App {
             Done::Prepared(Some(Ok(media))) => return self.send_media(*media),
             Done::Prepared(Some(Err(e))) => self.toast(e),
             Done::Prepared(None) => {}
+            Done::Picker(d) => return self.on_picker_done(*d),
             Done::Staged { chat, staged } => return self.on_staged(chat, staged),
             Done::DocumentOpened(Ok((path, dangerous))) => {
                 if dangerous {
@@ -2616,7 +2545,7 @@ impl App {
                 chat,
                 msgs,
                 has_newer,
-            } => self.on_newer(chat, msgs, has_newer),
+            } => return self.on_newer(chat, msgs, has_newer),
             Done::Located(loc) => return self.on_located(loc),
             Done::PopupAt { id, loc } => self.on_popup_at(id, loc),
             Done::LastMessage { chat, last } => self.chats.set_last(&chat, last.map(|b| *b)),
@@ -2669,6 +2598,7 @@ impl App {
                     Ok(p) => eprintln!("screenshot written to {}", p.display()),
                     Err(e) => eprintln!("screenshot failed: {e}"),
                 }
+                picker::remove_mock_shelf(&self.cfg);
                 return iced::exit();
             }
         }
@@ -2740,6 +2670,24 @@ impl App {
                 v.push(ui(Ui::Emoji("\u{1F1EA}\u{1F1F8}")));
                 v.push(ui(Ui::ToggleEmoji));
             }
+            ScreenshotTarget::Stickers => {
+                // The animated sticker and the GIF above the drawer.
+                if let Some(id) = c
+                    .messages
+                    .iter()
+                    .find(|m| matches!(m.content, Content::Sticker { animated: true, .. }))
+                    .map(|m| m.id.clone())
+                {
+                    v.push(ui(Ui::JumpTo(id)));
+                }
+                v.push(ui(Ui::ToggleEmoji));
+                v.push(ui(Ui::Picker(picker::PickerUi::Tab(picker::Tab::Stickers))));
+            }
+            ScreenshotTarget::Gifs => {
+                v.push(ui(Ui::ToggleEmoji));
+                v.push(ui(Ui::Picker(picker::PickerUi::Tab(picker::Tab::Gifs))));
+                v.push(ui(Ui::Picker(picker::PickerUi::Query("party".into()))));
+            }
             ScreenshotTarget::Info | ScreenshotTarget::GroupInfo => v.push(ui(Ui::ToggleInfo)),
             ScreenshotTarget::Viewer => {
                 if let Some(id) = c
@@ -2790,6 +2738,13 @@ impl App {
         self.geom.size
     }
 
+    /// Whether animated stickers and GIFs play: only while the window is
+    /// focused (an unfocused or hidden window asks for no redraws at all).
+    /// Screenshots capture whatever frame is due.
+    pub fn media_playing(&self) -> bool {
+        self.focused || self.cfg.screenshot.is_some()
+    }
+
     /// Current playback / recording status (for tests).
     pub fn is_recording(&self) -> bool {
         self.recording_since.is_some()
@@ -2831,6 +2786,75 @@ fn save_png(path: &std::path::Path, shot: &iced::window::Screenshot) -> Result<(
         let _ = std::fs::create_dir_all(dir);
     }
     img.save(path).map_err(|e| e.to_string())
+}
+
+/// Window events the app reacts to, whatever the widgets did with them.
+/// Paste is matched even when captured: the composer's `text_editor`
+/// captures Ctrl+V (it pastes text itself), and an image or copied files
+/// must still reach `App::paste`.
+fn runtime_event(
+    event: iced::Event,
+    status: iced::event::Status,
+    id: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+            input::set(position);
+            None
+        }
+        iced::Event::Window(iced::window::Event::Focused) => Some(Message::Focus(true)),
+        iced::Event::Window(iced::window::Event::Unfocused) => Some(Message::Focus(false)),
+        iced::Event::Window(iced::window::Event::Resized(size)) => {
+            Some(Message::WindowResized(id, size))
+        }
+        iced::Event::Window(iced::window::Event::Moved(p)) => Some(Message::WindowMoved(id, p)),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape),
+            ..
+        }) => Some(Message::Ui(Ui::CloseChat)),
+        // Paste: the composer's text input pastes text itself; this
+        // only looks for a copied image or files (see `app::paste`).
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        }) if paste::is_paste_shortcut(&key, physical_key, modifiers) => {
+            Some(Message::Ui(Ui::Paste))
+        }
+        // Space pauses the video viewer, unless a text field took it.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::Space),
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::VideoToggle)),
+        // Status viewer: arrows step through the updates.
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight),
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(1))),
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft),
+            ..
+        }) if status == iced::event::Status::Ignored => Some(Message::Ui(Ui::Arrow(-1))),
+        // Image viewer zoom keys (no text field has them then).
+        iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+            key: iced::keyboard::Key::Character(c),
+            modifiers,
+            ..
+        }) if status == iced::event::Status::Ignored && !modifiers.control() => match c.as_str() {
+            "+" | "=" => Some(Message::Ui(Ui::ViewerZoom {
+                factor: viewer::ZOOM_STEP,
+                at: iced::Vector::ZERO,
+            })),
+            "-" => Some(Message::Ui(Ui::ViewerZoom {
+                factor: 1.0 / viewer::ZOOM_STEP,
+                at: iced::Vector::ZERO,
+            })),
+            "0" => Some(Message::Ui(Ui::ViewerResetZoom)),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -87,7 +87,9 @@ The app follows iced's Elm architecture.
 * **Caches are bounded.** In-memory message windows hold at most N messages
   per open conversation (default 200); older pages are loaded from SQLite on
   scroll, then from the network. Decoded images live in an LRU keyed by
-  media id with a byte budget (default 48 MB).
+  media id with a byte budget (default 48 MB); for chat photos that budget
+  counts display-sized RGBA previews (<= 660 px, decoded in a worker), never
+  full-resolution pictures (`app/pictures.rs`).
 
 ### Startup sequence
 
@@ -254,6 +256,7 @@ widgets or `ui`:
 | `src/app/actions.rs`, `src/app/live.rs` | User actions (reply, react, edit, delete, search, jump, avatars, group receipts) and the pure typing / presence state machines. |
 | `src/app/lists.rs`, `src/app/linkify.rs`, `src/app/input.rs` | Archive / pin / favourites / custom lists, link and mention detection (pure, tested), pointer position for context menus. |
 | `src/app/video.rs`, `src/media/video.rs`, `src/media/video_proto.rs`, `src/bin/ferrochat-player/` | In-app video: viewer state, the helper process wrapper, the wire format and the helper (OpenH264 + symphonia + rodio, `video` feature). |
+| `src/app/picker.rs`, `src/app/anim.rs`, `src/ui/anim_image.rs`, `src/ui/emoji_picker.rs`, `src/media/sticker.rs`, `src/media/gifv.rs`, `src/net/giphy.rs` | Stickers and GIFs (protocol §2.5): the drawer's Emoji / GIF / Stickers tabs, the bounded sticker / GIF shelf, decoded animations played by the self-playing `anim_image` widget (no app tick), the helper's frames and GIF -> MP4 modes, GIPHY search with the user's key. |
 | `src/notify.rs` | Desktop notifications (`notify-rust`), opening files with `xdg-open`, file-name sanitising. |
 
 `src/net/` contains `types.rs` (domain types), `convert.rs` (pure protobuf ↔
@@ -356,7 +359,7 @@ add first.
                                                 image / video / sticker / document / voice) with quote,
                                                 reaction badge and hover actions, floating reaction
                                                 picker and message menu, in-chat search bar, reply /
-                                                edit bar, emoji panel, composer (+, 😊, text, mic ↔
+                                                edit bar, emoji / GIF / sticker drawer, composer (+, 😊, text, mic ↔
                                                 send), image viewer, delete / reactions dialogs
 ```
 
