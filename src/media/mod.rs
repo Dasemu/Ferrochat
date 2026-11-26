@@ -5,6 +5,7 @@ pub mod audio;
 pub mod avatar;
 pub mod gifv;
 pub mod image;
+pub mod picture;
 pub mod sticker;
 pub mod video;
 pub mod video_proto;

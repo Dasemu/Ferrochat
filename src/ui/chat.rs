@@ -819,11 +819,12 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
             ..
         } => {
             let (w, h) = fit(*width, *height, 330.0, 330.0);
-            let handle = media
-                .as_ref()
-                .and_then(|r| app.images.peek(&r.cache_key()))
-                .or_else(|| app.thumbs.get(&msg.id))
-                .cloned();
+            let _ = media;
+            let key = app.image_key(msg);
+            let full = key.as_ref().and_then(|k| app.images.peek(k));
+            // The display-sized preview, else the blurred inline thumbnail
+            // (scaled smoothly) while it loads.
+            let handle = full.or_else(|| app.thumbs.get(&msg.id)).cloned();
             let pic: El<'a> = match handle {
                 Some(handle) => cover(
                     image(handle)
@@ -839,6 +840,41 @@ fn bubble<'a>(app: &'a App, msg: &'a ChatMessage, first: bool, group: bool) -> E
                     .center_y(h)
                     .style(theme::rounded(p.inset_in, 6.0))
                     .into(),
+            };
+            // A spinner when the download takes a while, "Retry" when it
+            // failed. Always the same size: the overlay never moves layout.
+            let overlay: Option<El<'a>> = match (full, &key) {
+                (None, Some(k)) if app.download_failed(k) => Some(
+                    button(
+                        row![
+                            icon(Icon::RotateCcw, 16.0, Color::WHITE),
+                            text("Retry").size(m.text).color(Color::WHITE),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([7, 14])
+                    .style(theme::overlay_pill)
+                    .on_press(Message::Ui(Ui::RetryImage(msg.id.clone())))
+                    .into(),
+                ),
+                (None, Some(k)) => app.download_since(k).map(|since| {
+                    super::spinner::spinner(
+                        since,
+                        crate::app::pictures::SPINNER_DELAY,
+                        40.0,
+                        Color::WHITE,
+                    )
+                    .into()
+                }),
+                _ => None,
+            };
+            let pic: El<'a> = match overlay {
+                Some(o) => iced::widget::stack![pic, container(o).center(Length::Fill)]
+                    .width(w)
+                    .height(h)
+                    .into(),
+                None => pic,
             };
             let pic = button(pic)
                 .padding(0)

@@ -12,6 +12,7 @@ pub mod measure;
 pub mod nav;
 pub mod settings;
 pub mod sidebar;
+pub mod spinner;
 pub mod status;
 pub mod theme;
 pub mod update;
